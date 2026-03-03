@@ -8,7 +8,8 @@ export type WsEventType =
   | 'error'
   | 'thinking'
   | 'alert_triggered'
-  | 'skills_updated';
+  | 'skills_updated'
+  | 'evolution_triggered';
 
 export interface WsEvent {
   type: WsEventType;

@@ -1500,7 +1500,71 @@ or\n\
             "New skill version deployed via evolution"
         );
 
+        // Clean up skill directory — remove temp/cache/backup files
+        let final_skill_dir = self.skills_dir.join(&record.skill_name);
+        self.cleanup_skill_dir(&final_skill_dir, &record.skill_name);
+
         Ok(())
+    }
+
+    /// 清理技能目录：删除非必要文件，只保留 SKILL.rhai/SKILL.py/SKILL.md, meta.yaml, tests/, CHANGELOG.md
+    fn cleanup_skill_dir(&self, skill_dir: &Path, skill_name: &str) {
+        if !skill_dir.exists() {
+            return;
+        }
+
+        // Files/dirs we always keep
+        let keep_files: &[&str] = &["SKILL.rhai", "SKILL.py", "SKILL.md", "meta.yaml", "CHANGELOG.md"];
+        let keep_dirs: &[&str] = &["tests"];
+
+        let entries = match std::fs::read_dir(skill_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if path.is_dir() {
+                if keep_dirs.contains(&name_str.as_ref()) {
+                    continue;
+                }
+                // Remove __pycache__ and other cache dirs
+                if name_str == "__pycache__" || name_str.starts_with('.') {
+                    if std::fs::remove_dir_all(&path).is_ok() {
+                        removed += 1;
+                    }
+                }
+            } else {
+                if keep_files.contains(&name_str.as_ref()) {
+                    continue;
+                }
+                // Remove temp files, .pyc, .bak, .tmp, .orig, swap files
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let should_remove = matches!(ext, "pyc" | "pyo" | "bak" | "tmp" | "orig" | "swp" | "swo")
+                    || name_str.ends_with(".bak")
+                    || name_str.ends_with(".orig")
+                    || name_str.starts_with('.')
+                    || name_str.ends_with('~');
+                if should_remove {
+                    if std::fs::remove_file(&path).is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+
+        if removed > 0 {
+            info!(
+                skill = %skill_name,
+                removed = removed,
+                "🧹 [cleanup] Removed {} non-essential files from skill directory",
+                removed
+            );
+        }
     }
 
     fn restore_previous_version(&self, skill_name: &str) -> Result<()> {

@@ -40,7 +40,8 @@ impl Tool for ToggleManageTool {
     }
 
     fn validate(&self, params: &Value) -> Result<()> {
-        let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+        let action = if action.trim().is_empty() { "list" } else { action };
         match action {
             "list" => Ok(()),
             "set" => {
@@ -61,6 +62,7 @@ impl Tool for ToggleManageTool {
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+        let action = if action.trim().is_empty() { "list" } else { action };
         let toggles_path = ctx.workspace.join("toggles.json");
 
         match action {
@@ -138,6 +140,19 @@ mod tests {
     fn test_toggle_manage_validate_list() {
         let tool = ToggleManageTool;
         assert!(tool.validate(&json!({"action": "list"})).is_ok());
+    }
+
+    #[test]
+    fn test_toggle_manage_validate_list_default_when_missing_action() {
+        let tool = ToggleManageTool;
+        assert!(tool.validate(&json!({})).is_ok());
+    }
+
+    #[test]
+    fn test_toggle_manage_validate_list_default_when_empty_action() {
+        let tool = ToggleManageTool;
+        assert!(tool.validate(&json!({"action": ""})).is_ok());
+        assert!(tool.validate(&json!({"action": "   "})).is_ok());
     }
 
     #[test]

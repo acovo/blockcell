@@ -489,8 +489,10 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
                 let _ = stdout.flush();
 
                 let mut raw_input = String::new();
-                if stdin.lock().read_line(&mut raw_input).unwrap_or(0) == 0 {
-                    break;
+                match stdin.lock().read_line(&mut raw_input) {
+                    Ok(0) => break, // EOF (Ctrl+D)
+                    Ok(_) => {}
+                    Err(_) => continue, // Non-UTF-8 or other read error — skip and re-prompt
                 }
 
                 // After reading a line, check if a confirmation request arrived

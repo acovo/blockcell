@@ -1,6 +1,6 @@
 use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, ConfirmRequest, CoreEvolutionAdapter,
-    MemoryStoreAdapter, MessageBus, ProviderLLMBridge, TaskManager,
+    MemoryStoreAdapter, MessageBus, ProviderLLMBridge, SkillScriptKind, TaskManager,
 };
 #[cfg(feature = "dingtalk")]
 use blockcell_channels::dingtalk::DingTalkChannel;
@@ -1251,6 +1251,20 @@ async fn handle_tools(State(state): State<GatewayState>) -> impl IntoResponse {
 
 /// GET /v1/skills — list skills
 async fn handle_skills(State(state): State<GatewayState>) -> impl IntoResponse {
+    // Load disabled toggles once for all skills
+    let toggles_path = state.paths.toggles_file();
+    let disabled_skills: std::collections::HashSet<String> = std::fs::read_to_string(&toggles_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v.get("skills").and_then(|s| s.as_object()).cloned())
+        .map(|obj| {
+            obj.into_iter()
+                .filter(|(_, v)| v == &serde_json::Value::Bool(false))
+                .map(|(k, _)| k)
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut skills = Vec::new();
 
     // Scan user skills directory
@@ -1263,6 +1277,7 @@ async fn handle_skills(State(state): State<GatewayState>) -> impl IntoResponse {
                 let has_rhai = entry.path().join("SKILL.rhai").exists();
                 let has_py = entry.path().join("SKILL.py").exists();
                 let has_md = entry.path().join("SKILL.md").exists();
+                let enabled = !disabled_skills.contains(&name);
 
                 let mut skill_info = serde_json::json!({
                     "name": name,
@@ -1270,15 +1285,24 @@ async fn handle_skills(State(state): State<GatewayState>) -> impl IntoResponse {
                     "has_rhai": has_rhai,
                     "has_py": has_py,
                     "has_md": has_md,
+                    "enabled": enabled,
                 });
 
                 if meta_path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                        // meta.yaml is simple key-value; try JSON first, fallback to raw text
-                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                            skill_info["meta"] = meta;
-                        } else {
-                            skill_info["meta"] = serde_json::Value::String(content);
+                        // Parse meta.yaml properly via serde_yaml, then convert to JSON value
+                        if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
+                            // Expose triggers at top-level for easy frontend access
+                            if let Some(triggers) = parsed.get("triggers") {
+                                skill_info["triggers"] = triggers.clone();
+                            }
+                            if let Some(desc) = parsed.get("description") {
+                                skill_info["description"] = desc.clone();
+                            }
+                            if let Some(always) = parsed.get("always") {
+                                skill_info["always"] = always.clone();
+                            }
+                            skill_info["meta"] = parsed;
                         }
                     }
                 }
@@ -1304,13 +1328,33 @@ async fn handle_skills(State(state): State<GatewayState>) -> impl IntoResponse {
                 let has_rhai = entry.path().join("SKILL.rhai").exists();
                 let has_py = entry.path().join("SKILL.py").exists();
                 let has_md = entry.path().join("SKILL.md").exists();
-                skills.push(serde_json::json!({
+                let enabled = !disabled_skills.contains(&name);
+                let mut skill_info = serde_json::json!({
                     "name": name,
                     "source": "builtin",
                     "has_rhai": has_rhai,
                     "has_py": has_py,
                     "has_md": has_md,
-                }));
+                    "enabled": enabled,
+                });
+                let meta_path = entry.path().join("meta.yaml");
+                if meta_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                        if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
+                            if let Some(triggers) = parsed.get("triggers") {
+                                skill_info["triggers"] = triggers.clone();
+                            }
+                            if let Some(desc) = parsed.get("description") {
+                                skill_info["description"] = desc.clone();
+                            }
+                            if let Some(always) = parsed.get("always") {
+                                skill_info["always"] = always.clone();
+                            }
+                            skill_info["meta"] = parsed;
+                        }
+                    }
+                }
+                skills.push(skill_info);
             }
         }
     }
@@ -1485,7 +1529,7 @@ async fn handle_skills_search(
     }))
 }
 
-/// GET /v1/evolution — list evolution records
+/// GET /v1/evolution — list evolution records (lightweight: strips heavy fields for list view)
 async fn handle_evolution(State(state): State<GatewayState>) -> impl IntoResponse {
     let records_dir = state.paths.workspace().join("evolution_records");
     let mut records = Vec::new();
@@ -1495,13 +1539,37 @@ async fn handle_evolution(State(state): State<GatewayState>) -> impl IntoRespons
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(record) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(&content) {
+                        // Strip heavy fields not needed for the list view
+                        if let Some(patch) = record.get_mut("patch").and_then(|p| p.as_object_mut()) {
+                            patch.remove("diff");
+                        }
+                        if let Some(ctx) = record.get_mut("context").and_then(|c| c.as_object_mut()) {
+                            ctx.remove("source_snippet");
+                            ctx.remove("tool_schemas");
+                        }
+                        // Strip feedback_history bodies (keep attempt/stage/timestamp only)
+                        if let Some(hist) = record.get_mut("feedback_history").and_then(|h| h.as_array_mut()) {
+                            for entry in hist.iter_mut() {
+                                if let Some(obj) = entry.as_object_mut() {
+                                    obj.remove("previous_code");
+                                    obj.remove("feedback");
+                                }
+                            }
+                        }
                         records.push(record);
                     }
                 }
             }
         }
     }
+
+    // Sort by updated_at descending
+    records.sort_by(|a, b| {
+        let ta = a.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        let tb = b.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        tb.cmp(&ta)
+    });
 
     let count = records.len();
     Json(serde_json::json!({
@@ -1704,6 +1772,38 @@ async fn handle_evolution_trigger(
         .await
     {
         Ok(evolution_id) => {
+            // Auto-disable the skill while it evolves so the old broken version won't run
+            let toggles_path = state.paths.toggles_file();
+            if let Ok(content) = std::fs::read_to_string(&toggles_path) {
+                if let Ok(mut store) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let skill_enabled = store
+                        .get("skills")
+                        .and_then(|s| s.get(&req.skill_name))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true); // absent = enabled
+                    if skill_enabled {
+                        if store.get("skills").is_none() {
+                            store["skills"] = serde_json::json!({});
+                        }
+                        store["skills"][&req.skill_name] = serde_json::json!(false);
+                        let _ = std::fs::write(
+                            &toggles_path,
+                            serde_json::to_string_pretty(&store).unwrap_or_default(),
+                        );
+                    }
+                }
+            } else {
+                // toggles file doesn't exist yet — create it with the skill disabled
+                let store = serde_json::json!({ "skills": { &req.skill_name: false }, "tools": {} });
+                if let Some(parent) = toggles_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(
+                    &toggles_path,
+                    serde_json::to_string_pretty(&store).unwrap_or_default(),
+                );
+            }
+
             // Broadcast WS event so WebUI refreshes immediately without waiting for 10s poll
             let event = serde_json::json!({
                 "type": "evolution_triggered",
@@ -1797,28 +1897,34 @@ async fn handle_evolution_test(
     State(state): State<GatewayState>,
     Json(req): Json<EvolutionTestRequest>,
 ) -> impl IntoResponse {
-    // Check if the skill exists (has SKILL.rhai or SKILL.md)
+    // Locate the skill directory (user skills take precedence over builtin)
     let skill_dir = state.paths.skills_dir().join(&req.skill_name);
     let builtin_dir = state.paths.builtin_skills_dir().join(&req.skill_name);
 
-    let exists = skill_dir.exists() || builtin_dir.exists();
-    if !exists {
+    let base_dir = if skill_dir.exists() {
+        skill_dir
+    } else if builtin_dir.exists() {
+        builtin_dir
+    } else {
         return Json(serde_json::json!({
-            "error": format!("Skill '{}' not found", req.skill_name),
+            "status": "failed",
+            "error": format!("技能 '{}' 未找到", req.skill_name),
         }));
-    }
+    };
 
-    // Create a fresh pool for this test execution
+    let has_py = base_dir.join("SKILL.py").exists();
+    let has_rhai = base_dir.join("SKILL.rhai").exists();
+
     let test_pool = match blockcell_providers::ProviderPool::from_config(&state.config) {
         Ok(p) => p,
         Err(e) => {
             return Json(serde_json::json!({
+                "status": "failed",
                 "error": format!("No LLM provider configured: {}", e),
             }));
         }
     };
 
-    // Create a temporary AgentRuntime to execute the test synchronously
     let tool_registry = ToolRegistry::with_defaults();
     let mut runtime = match AgentRuntime::new(
         state.config.clone(),
@@ -1829,52 +1935,205 @@ async fn handle_evolution_test(
         Ok(r) => r,
         Err(e) => {
             return Json(serde_json::json!({
+                "status": "failed",
                 "error": format!("Failed to create test runtime: {}", e),
             }));
         }
     };
 
-    // Wire up memory store if available
     if let Some(store) = state.memory_store.clone() {
         runtime.set_memory_store(store);
     }
 
-    // Build the test prompt
-    let test_prompt = format!(
-        "[Skill Test] Please use skill `{}` to process the following input:\n{}",
-        req.skill_name, req.input
-    );
-
-    let inbound = InboundMessage {
-        channel: "webui_test".to_string(),
-        sender_id: "webui_test".to_string(),
-        chat_id: format!("test_{}", chrono::Utc::now().timestamp_millis()),
-        content: test_prompt,
-        media: vec![],
-        metadata: serde_json::json!({
-            "skill_test": true,
-            "skill_name": req.skill_name,
-        }),
-        timestamp_ms: chrono::Utc::now().timestamp_millis(),
-    };
-
-    // Execute synchronously and return the real result
     let start = std::time::Instant::now();
-    match runtime.process_message(inbound).await {
-        Ok(response) => {
-            let duration_ms = start.elapsed().as_millis() as u64;
-            Json(serde_json::json!({
+
+    if has_py || has_rhai {
+        // Rhai / Python 技能：SKILL.py / SKILL.rhai 是独立脚本，通过 stdin 接收 JSON 参数并返回结果。
+        // 步骤：
+        //   1. 读取 SKILL.md + meta.yaml，了解技能的参数规格
+        //   2. 用轻量 LLM 调用，把用户自然语言输入解析为符合技能参数规格的 JSON
+        //   3. 把该 JSON 作为 stdin 传给脚本执行
+
+        let skill_md = std::fs::read_to_string(base_dir.join("SKILL.md")).unwrap_or_default();
+        let meta_yaml = std::fs::read_to_string(base_dir.join("meta.yaml")).unwrap_or_default();
+
+        // Step 1: 从 meta.yaml 解析参数默认值，构建 defaults map
+        // 结构: parameters: { field: { type, default, description, ... } }
+        let param_defaults: serde_json::Map<String, serde_json::Value> = {
+            let mut defaults = serde_json::Map::new();
+            if let Ok(yaml_val) = serde_yaml::from_str::<serde_yaml::Value>(&meta_yaml) {
+                if let Some(params) = yaml_val.get("parameters").and_then(|v| v.as_mapping()) {
+                    for (k, v) in params {
+                        if let (Some(key), Some(def)) = (
+                            k.as_str(),
+                            v.get("default"),
+                        ) {
+                            // convert serde_yaml::Value → serde_json::Value
+                            if let Ok(json_val) = serde_json::to_value(def) {
+                                defaults.insert(key.to_string(), json_val);
+                            }
+                        }
+                    }
+                }
+            }
+            defaults
+        };
+
+        // Step 2: LLM 解析用户输入为 JSON 参数
+        let parse_system = "You are a parameter extraction assistant. \
+            Given a skill's SKILL.md specification and meta.yaml, extract ALL parameters \
+            (including optional ones with their default values) from the user request. \
+            Output ONLY a valid JSON object. No explanation, no markdown, no code fences.";
+
+        let parse_user = format!(
+            "## Skill: {}\n\n## SKILL.md\n{}\n\n## meta.yaml\n{}\n\n\
+            ## User Request\n{}\n\n\
+            Extract ALL parameters. For parameters not mentioned by the user, use the default \
+            values from meta.yaml. Output only the complete JSON parameter object:",
+            req.skill_name, skill_md, meta_yaml, req.input
+        );
+
+        use blockcell_core::types::ChatMessage;
+        let parse_messages = vec![
+            ChatMessage::system(parse_system),
+            ChatMessage::user(&parse_user),
+        ];
+
+        // 复用已有的 provider pool 做轻量解析
+        let parse_pool = match blockcell_providers::ProviderPool::from_config(&state.config) {
+            Ok(p) => p,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "status": "failed",
+                    "error": format!("No LLM provider: {}", e),
+                }));
+            }
+        };
+
+        let parsed_json = if let Some((pidx, p)) = parse_pool.acquire() {
+            match p.chat(&parse_messages, &[]).await {
+                Ok(resp) => {
+                    parse_pool.report(pidx, blockcell_providers::CallResult::Success);
+                    let text = resp.content.unwrap_or_default();
+                    // 去掉可能的 markdown code fences
+                    let clean = text
+                        .trim()
+                        .trim_start_matches("```json")
+                        .trim_start_matches("```")
+                        .trim_end_matches("```")
+                        .trim()
+                        .to_string();
+                    // 解析为 JSON object，用 meta.yaml defaults 补全缺失字段
+                    if let Ok(serde_json::Value::Object(mut obj)) =
+                        serde_json::from_str::<serde_json::Value>(&clean)
+                    {
+                        for (k, v) in &param_defaults {
+                            obj.entry(k).or_insert_with(|| v.clone());
+                        }
+                        serde_json::Value::Object(obj).to_string()
+                    } else {
+                        // LLM 没返回合法 JSON object：用纯默认值 + 原始输入作为 query
+                        let mut fallback = param_defaults.clone();
+                        fallback.insert("query".to_string(), serde_json::Value::String(req.input.clone()));
+                        serde_json::Value::Object(fallback).to_string()
+                    }
+                }
+                Err(e) => {
+                    parse_pool.report(
+                        pidx,
+                        blockcell_providers::ProviderPool::classify_error(&format!("{}", e)),
+                    );
+                    // fallback: defaults + 原始输入作为 query
+                    let mut fallback = param_defaults.clone();
+                    fallback.insert("query".to_string(), serde_json::Value::String(req.input.clone()));
+                    serde_json::Value::Object(fallback).to_string()
+                }
+            }
+        } else {
+            // 无可用 provider：defaults + 原始输入
+            let mut fallback = param_defaults.clone();
+            fallback.insert("query".to_string(), serde_json::Value::String(req.input.clone()));
+            serde_json::Value::Object(fallback).to_string()
+        };
+
+        // Step 2: 用解析后的 JSON 参数执行脚本
+        let script_kind = if has_py {
+            SkillScriptKind::Python
+        } else {
+            SkillScriptKind::Rhai
+        };
+        let inbound = InboundMessage {
+            channel: "webui_test".to_string(),
+            sender_id: "webui_test".to_string(),
+            chat_id: format!("test_{}", chrono::Utc::now().timestamp_millis()),
+            content: parsed_json,
+            media: vec![],
+            metadata: serde_json::json!({
+                "skill_test": true,
+                "skill_name": req.skill_name,
+            }),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        match runtime
+            .execute_skill_script(&req.skill_name, &inbound, script_kind)
+            .await
+        {
+            Ok(output) => Json(serde_json::json!({
+                "status": "completed",
+                "skill_name": req.skill_name,
+                "result": output,
+                "duration_ms": start.elapsed().as_millis() as u64,
+                "dispatch": if has_py { "python" } else { "rhai" },
+            })),
+            Err(e) => Json(serde_json::json!({
+                "status": "failed",
+                "skill_name": req.skill_name,
+                "error": format!("{}", e),
+            })),
+        }
+    } else {
+        // 纯 MD 技能：没有脚本文件，完全由 LLM 根据 SKILL.md 说明书执行逻辑。
+        // 强制注入 SKILL.md 内容到 prompt，不依赖 match_skill trigger 匹配。
+        let skill_md = match std::fs::read_to_string(base_dir.join("SKILL.md")) {
+            Ok(c) => c,
+            Err(_) => {
+                return Json(serde_json::json!({
+                    "status": "failed",
+                    "error": format!("技能 '{}' 缺少 SKILL.md 文件", req.skill_name),
+                }));
+            }
+        };
+
+        let prompt = format!(
+            "[技能说明 - {}]\n\n{}\n\n---\n\n{}",
+            req.skill_name, skill_md, req.input
+        );
+        let inbound = InboundMessage {
+            channel: "webui_test".to_string(),
+            sender_id: "webui_test".to_string(),
+            chat_id: format!("test_{}", chrono::Utc::now().timestamp_millis()),
+            content: prompt,
+            media: vec![],
+            metadata: serde_json::json!({
+                "skill_test": true,
+                "skill_name": req.skill_name,
+            }),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        match runtime.process_message(inbound).await {
+            Ok(response) => Json(serde_json::json!({
                 "status": "completed",
                 "skill_name": req.skill_name,
                 "result": response,
-                "duration_ms": duration_ms,
-            }))
+                "duration_ms": start.elapsed().as_millis() as u64,
+                "dispatch": "llm_md",
+            })),
+            Err(e) => Json(serde_json::json!({
+                "status": "failed",
+                "skill_name": req.skill_name,
+                "error": format!("{}", e),
+            })),
         }
-        Err(e) => Json(serde_json::json!({
-            "status": "failed",
-            "skill_name": req.skill_name,
-            "error": format!("{}", e),
-        })),
     }
 }
 
@@ -1922,13 +2181,34 @@ async fn handle_evolution_test_suggest(
         context.push_str(&format!("\n\n## SKILL.py (preview)\n{}", py_preview));
     }
 
-    let system_prompt = "You are a test case generation assistant. Based on the provided skill description, generate a specific, ready-to-use test input.\n\
+    // 提取 triggers 列表，注入到 system prompt 要求生成的建议必须包含 trigger 关键词
+    let triggers: Vec<String> = serde_yaml::from_str::<serde_json::Value>(&meta_yaml)
+        .ok()
+        .and_then(|v| v.get("triggers").and_then(|t| t.as_array()).cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+
+    let trigger_rule = if triggers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n6. CRITICAL: The test input MUST contain one of these trigger keywords (these are the exact phrases that activate this skill): [{}]. Without a trigger keyword, the skill will NOT be activated in real chat.",
+            triggers.iter().take(5).map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ")
+        )
+    };
+
+    let system_prompt = format!(
+        "You are a test case generation assistant. Based on the provided skill description, generate a specific, ready-to-use test input.\n\
         Requirements:\n\
         1. Only output the test input text itself, no explanations, titles, or formatting\n\
         2. The test input should be natural language a user would actually say\n\
         3. Choose the most core functionality scenario of the skill\n\
         4. Input should be specific, including necessary parameters (e.g. city name, stock ticker)\n\
-        5. Output in English";
+        5. Output in the same language as the skill's trigger keywords (Chinese if triggers are Chinese){}",
+        trigger_rule
+    );
 
     let user_prompt = format!(
         "Based on the following skill information, generate an appropriate test input:\n\n{}\n\nOutput the test input text directly:",
@@ -1948,7 +2228,7 @@ async fn handle_evolution_test_suggest(
     };
 
     let messages = vec![
-        ChatMessage::system(system_prompt),
+        ChatMessage::system(&system_prompt),
         ChatMessage::user(&user_prompt),
     ];
 
@@ -2070,7 +2350,7 @@ async fn handle_evolution_summary(State(state): State<GatewayState>) -> impl Int
                     if let Ok(record) = serde_json::from_str::<serde_json::Value>(&content) {
                         let status = record.get("status").and_then(|s| s.as_str()).unwrap_or("");
                         match status {
-                            "Completed" => skill_completed += 1,
+                            "Completed" | "Observing" | "Deployed" => skill_completed += 1,
                             "Failed" | "RolledBack" | "AuditFailed" | "CompileFailed"
                             | "DryRunFailed" | "TestFailed" => skill_failed += 1,
                             _ => skill_active += 1,

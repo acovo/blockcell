@@ -75,9 +75,45 @@ impl Tool for MessageTool {
             .map(|p| resolve_media_path(&ctx.workspace, p))
             .collect::<Result<Vec<String>>>()?;
 
+        // Auto-copy files that exist but are outside the workspace into workspace/media/.
+        // This allows sending desktop/Downloads files without requiring the LLM to manually copy them.
+        let media_dir = ctx.workspace.join("media");
+        let mut final_media_paths: Vec<String> = Vec::with_capacity(resolved_media_paths.len());
         for path in &resolved_media_paths {
-            if !Path::new(path).exists() {
+            let p = Path::new(path);
+            if !p.exists() {
                 return Err(Error::Tool(format!("Media file not found: {}", path)));
+            }
+            // Check if already inside workspace
+            let in_workspace = p
+                .canonicalize()
+                .ok()
+                .and_then(|abs| ctx.workspace.canonicalize().ok().map(|ws| abs.starts_with(ws)))
+                .unwrap_or(false);
+            if in_workspace {
+                final_media_paths.push(path.clone());
+            } else {
+                // Copy to workspace/media/<filename>
+                if let Err(e) = std::fs::create_dir_all(&media_dir) {
+                    return Err(Error::Tool(format!("Failed to create media dir: {}", e)));
+                }
+                let filename = p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file".to_string());
+                let dest = media_dir.join(&filename);
+                if let Err(e) = std::fs::copy(p, &dest) {
+                    return Err(Error::Tool(format!("Failed to copy media file {}: {}", path, e)));
+                }
+                final_media_paths.push(dest.to_string_lossy().into_owned());
+            }
+        }
+
+        // Rewrite original paths in content to their copied workspace paths.
+        // This fixes markdown image refs like ![alt](/Users/apple/Desktop/x.png) → new path.
+        let mut rewritten_content = content.to_string();
+        for (original, final_path) in resolved_media_paths.iter().zip(final_media_paths.iter()) {
+            if original != final_path {
+                rewritten_content = rewritten_content.replace(original.as_str(), final_path.as_str());
             }
         }
 
@@ -86,8 +122,8 @@ impl Tool for MessageTool {
             Error::Tool("No outbound message channel available. Message delivery is not configured.".to_string())
         })?;
 
-        let mut outbound = OutboundMessage::new(channel, chat_id, content);
-        outbound.media = resolved_media_paths.clone();
+        let mut outbound = OutboundMessage::new(channel, chat_id, &rewritten_content);
+        outbound.media = final_media_paths.clone();
         outbound_tx.send(outbound).await.map_err(|e| {
             Error::Tool(format!("Failed to send message: {}", e))
         })?;
@@ -96,7 +132,7 @@ impl Tool for MessageTool {
             channel = channel,
             chat_id = chat_id,
             content_len = content.len(),
-            media_count = resolved_media_paths.len(),
+            media_count = final_media_paths.len(),
             "Message sent via outbound_tx"
         );
 
@@ -105,8 +141,8 @@ impl Tool for MessageTool {
             "channel": channel,
             "chat_id": chat_id,
             "content_length": content.len(),
-            "media_count": resolved_media_paths.len(),
-            "media": resolved_media_paths
+            "media_count": final_media_paths.len(),
+            "media": final_media_paths
         }))
     }
 }

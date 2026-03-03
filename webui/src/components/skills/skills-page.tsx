@@ -9,6 +9,7 @@ import {
 } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { useT } from '@/lib/i18n';
+import { wsManager } from '@/lib/ws';
 
 type Tab = 'installed' | 'community' | 'external';
 
@@ -68,6 +69,13 @@ function InstalledSkillsTab({ onInstalledNamesChange }: { onInstalledNamesChange
   }
 
   useEffect(() => { load(); }, []);
+
+  useEffect(() => {
+    const off = wsManager.on('evolution_triggered', () => {
+      getToggles().then((tg) => setToggles(tg.skills ?? {})).catch(() => {});
+    });
+    return off;
+  }, []);
 
   async function handleToggle(name: string) {
     const current = isEnabled(name);

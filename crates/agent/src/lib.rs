@@ -13,5 +13,5 @@ pub use context::ContextBuilder;
 pub use health::HealthChecker;
 pub use intent::{IntentCategory, IntentClassifier};
 pub use memory_adapter::MemoryStoreAdapter;
-pub use runtime::{AgentRuntime, ConfirmRequest};
+pub use runtime::{AgentRuntime, ConfirmRequest, SkillScriptKind};
 pub use task_manager::TaskManager;

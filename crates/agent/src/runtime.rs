@@ -140,7 +140,7 @@ fn is_im_channel(channel: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkillScriptKind {
+pub enum SkillScriptKind {
     Rhai,
     Python,
 }
@@ -1324,6 +1324,7 @@ impl AgentRuntime {
                     if tool_call.name == "web_search" || tool_call.name == "web_fetch" {
                         wants_forced_answer = true;
                     }
+                    // Check message tool has media BEFORE execution (for message_tool_sent_media flag only)
                     if tool_call.name == "message" {
                         let has_media = tool_call
                             .arguments
@@ -1339,11 +1340,11 @@ impl AgentRuntime {
 
                     // Collect media paths from tool results for WebUI display
                     if let Ok(ref rv) = serde_json::from_str::<serde_json::Value>(&result) {
-                        // Look for output_path / path / file_path fields that are image/audio/video
                         let media_exts = [
                             "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "mp3", "wav", "m4a",
                             "mp4", "webm", "mov",
                         ];
+                        // Scalar fields: output_path, path, file_path, etc.
                         for key in &[
                             "output_path",
                             "path",
@@ -1355,6 +1356,17 @@ impl AgentRuntime {
                                 let ext = p.rsplit('.').next().unwrap_or("").to_lowercase();
                                 if media_exts.contains(&ext.as_str()) {
                                     collected_media.push(p.to_string());
+                                }
+                            }
+                        }
+                        // Array field: "media" (returned by message tool after auto-copy)
+                        if let Some(arr) = rv.get("media").and_then(|v| v.as_array()) {
+                            for mv in arr {
+                                if let Some(p) = mv.as_str() {
+                                    let ext = p.rsplit('.').next().unwrap_or("").to_lowercase();
+                                    if media_exts.contains(&ext.as_str()) {
+                                        collected_media.push(p.to_string());
+                                    }
                                 }
                             }
                         }
@@ -2133,8 +2145,8 @@ impl AgentRuntime {
         }
     }
 
-    /// Execute a skill script directly (for cron skill jobs).
-    async fn execute_skill_script(
+    /// Execute a skill script directly (for cron skill jobs and WebUI skill tests).
+    pub async fn execute_skill_script(
         &mut self,
         skill_name: &str,
         msg: &InboundMessage,
@@ -2341,10 +2353,14 @@ impl AgentRuntime {
             ))
         })?;
 
+        // Write stdin in a separate task so it doesn't block wait_with_output.
+        // The task drops stdin after writing, sending EOF to the Python process.
+        let stdin_content = msg.content.clone();
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(msg.content.as_bytes()).await.map_err(|e| {
-                blockcell_core::Error::Skill(format!("Failed writing stdin: {}", e))
-            })?;
+            tokio::spawn(async move {
+                let _ = stdin.write_all(stdin_content.as_bytes()).await;
+                // stdin dropped here → EOF sent to child
+            });
         }
 
         let output = tokio::time::timeout(

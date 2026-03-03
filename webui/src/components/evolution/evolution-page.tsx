@@ -8,11 +8,12 @@ import {
 import {
   getEvolution, getSkills, getTools,
   triggerEvolution, deleteEvolution, testSkill, getTestSuggestion, getEvolutionSummary,
-  searchSkills,
+  searchSkills, getEvolutionDetail,
   type EvolutionRecord, type EvolutionSummary,
 } from '@/lib/api';
 import { useT } from '@/lib/i18n';
 import { wsManager } from '@/lib/ws';
+import { MarkdownContent } from '@/components/chat/markdown-content';
 
 type Tab = 'overview' | 'skills' | 'test';
 
@@ -29,6 +30,12 @@ function statusColor(status: string): string {
     case 'TestFailed': case 'RolledBack': case 'Blocked': return 'text-red-400';
     default: return 'text-muted-foreground';
   }
+}
+
+function patchDiffToMarkdown(diff: string): string {
+  if (!diff) return '';
+  if (diff.includes('```')) return diff;
+  return `\n\n\`\`\`diff\n${diff}\n\`\`\`\n`;
 }
 
 function statusIcon(status: string) {
@@ -149,6 +156,7 @@ export function EvolutionPage() {
 
   // Test & Evolve form (merged)
   const [testSkillName, setTestSkillName] = useState('');
+  const [testSkillTriggers, setTestSkillTriggers] = useState<string[]>([]);
   const [testInput, setTestInput] = useState('');
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<any>(null);
@@ -239,12 +247,15 @@ export function EvolutionPage() {
     setTestResult(null);
     setShowEvolveForm(false);
     setTab('test');
+    // Set triggers from skills list
+    const found = skills.find((s: any) => s.name === skillName);
+    setTestSkillTriggers(found?.triggers ?? []);
     // Auto-load suggestion
     setLoadingSuggestion(true);
     getTestSuggestion(skillName).then(res => {
       if (res.suggestion) setTestInput(res.suggestion);
     }).catch(() => {}).finally(() => setLoadingSuggestion(false));
-  }, []);
+  }, [skills]);
 
   const handleDelete = useCallback(async (id: string) => {
     await deleteEvolution(id);
@@ -257,6 +268,9 @@ export function EvolutionPage() {
     setTestResult(null);
     setShowEvolveForm(false);
     setEvolveDesc('');
+    // 从 skills 数组中读取该技能的 triggers
+    const found = skills.find((s: any) => s.name === name);
+    setTestSkillTriggers(found?.triggers ?? []);
     if (!name) return;
     setLoadingSuggestion(true);
     try {
@@ -269,7 +283,7 @@ export function EvolutionPage() {
     } finally {
       setLoadingSuggestion(false);
     }
-  }, []);
+  }, [skills]);
 
   const handleTest = useCallback(async () => {
     if (!testSkillName.trim() || !testInput.trim()) return;
@@ -589,6 +603,27 @@ export function EvolutionPage() {
                     ))}
                   </select>
                 </div>
+                {/* Triggers hint — 选技能后展示触发关键字，方便用户自定义输入 */}
+                {testSkillName && testSkillTriggers.length > 0 && (
+                  <div className="rounded-lg border border-cyber/20 bg-cyber/5 px-3 py-2">
+                    <p className="text-[10px] text-cyber/70 font-medium mb-1.5">
+                      触发关键字 <span className="text-muted-foreground font-normal">— 真实对话中，输入需包含以下关键字之一才能激活此技能</span>
+                    </p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {testSkillTriggers.map((kw: string) => (
+                        <button
+                          key={kw}
+                          type="button"
+                          onClick={() => setTestInput(prev => prev ? `${kw} ${prev}` : kw)}
+                          className="px-2 py-0.5 text-[11px] rounded-md bg-cyber/10 text-cyber border border-cyber/20 hover:bg-cyber/20 transition-colors font-mono"
+                          title="点击插入到输入框开头"
+                        >
+                          {kw}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div>
                   <label className="text-xs text-muted-foreground mb-1 block">
                     {t('evolution.testInput')}
@@ -946,6 +981,23 @@ function SkillRecordCard({
 }) {
   const [showCode, setShowCode] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [detail, setDetail] = useState<EvolutionRecord | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const detailFetched = useRef(false);
+
+  useEffect(() => {
+    if (expanded && !detailFetched.current) {
+      detailFetched.current = true;
+      setDetailLoading(true);
+      getEvolutionDetail(record.id)
+        .then(res => setDetail(res.record as EvolutionRecord))
+        .catch(() => setDetail(record))
+        .finally(() => setDetailLoading(false));
+    }
+  }, [expanded, record.id, record]);
+
+  const displayRecord = detail ?? record;
+  const shouldShowDetailLoading = expanded && (!detailFetched.current || detailLoading);
 
   return (
     <div className="border border-border rounded-xl bg-card overflow-hidden transition-all">
@@ -989,28 +1041,37 @@ function SkillRecordCard({
       {/* Expanded detail */}
       {expanded && (
         <div className="border-t border-border px-4 py-3 space-y-3 text-xs">
+          {shouldShowDetailLoading ? (
+            <div className="flex items-center gap-2 py-4 text-muted-foreground">
+              <Loader2 size={14} className="animate-spin" />
+              <span className="text-[11px]">Loading...</span>
+            </div>
+          ) : (
+            <>
           {/* Trigger info */}
           <DetailSection title={t('evolution.triggerInfo')}>
             <div className="grid grid-cols-2 gap-2">
-              <KV label={t('evolution.id')} value={record.id} />
-              <KV label={t('evolution.version')} value={record.context?.current_version || '—'} />
-              <KV label={t('evolution.created')} value={formatTime(record.created_at)} />
-              <KV label={t('evolution.updated')} value={formatTime(record.updated_at)} />
+              <KV label={t('evolution.id')} value={displayRecord.id} />
+              <KV label={t('evolution.version')} value={displayRecord.context?.current_version || '—'} />
+              <KV label={t('evolution.created')} value={formatTime(displayRecord.created_at)} />
+              <KV label={t('evolution.updated')} value={formatTime(displayRecord.updated_at)} />
             </div>
-            {record.context?.error_stack && (
+            {displayRecord.context?.error_stack && (
               <div className="mt-2">
                 <span className="text-muted-foreground">{t('evolution.errorStack')}:</span>
                 <pre className="mt-1 p-2 rounded bg-muted/50 text-[10px] font-mono whitespace-pre-wrap max-h-32 overflow-y-auto">
-                  {record.context.error_stack}
+                  {displayRecord.context.error_stack}
                 </pre>
               </div>
             )}
           </DetailSection>
 
           {/* Patch */}
-          {record.patch && (
+          {displayRecord.patch && (
             <DetailSection title={t('evolution.patch')}>
-              <p className="text-muted-foreground mb-1">{record.patch.explanation}</p>
+              <div className="text-muted-foreground mb-1 text-[11px]">
+                <MarkdownContent content={displayRecord.patch.explanation} />
+              </div>
               <button
                 onClick={() => setShowCode(!showCode)}
                 className="flex items-center gap-1 text-[10px] text-rust hover:underline"
@@ -1019,27 +1080,27 @@ function SkillRecordCard({
                 {showCode ? t('evolution.hideCode') : t('evolution.showCode')}
               </button>
               {showCode && (
-                <pre className="mt-1 p-2 rounded bg-muted/50 text-[10px] font-mono whitespace-pre-wrap max-h-48 overflow-y-auto">
-                  {record.patch.diff}
-                </pre>
+                <div className="mt-1 p-2 rounded bg-muted/50 text-[10px] max-h-72 overflow-y-auto">
+                  <MarkdownContent content={patchDiffToMarkdown(displayRecord.patch.diff)} />
+                </div>
               )}
             </DetailSection>
           )}
 
           {/* Audit */}
-          {record.audit && (
+          {displayRecord.audit && (
             <DetailSection title={t('evolution.audit')}>
               <div className="flex items-center gap-2 mb-1">
-                {record.audit.passed
+                {displayRecord.audit.passed
                   ? <CheckCircle size={12} className="text-cyber" />
                   : <XCircle size={12} className="text-red-400" />}
-                <span className={record.audit.passed ? 'text-cyber' : 'text-red-400'}>
-                  {record.audit.passed ? t('evolution.auditPassed') : t('evolution.auditFailed')}
+                <span className={displayRecord.audit.passed ? 'text-cyber' : 'text-red-400'}>
+                  {displayRecord.audit.passed ? t('evolution.auditPassed') : t('evolution.auditFailed')}
                 </span>
               </div>
-              {record.audit.issues?.length > 0 && (
+              {displayRecord.audit.issues?.length > 0 && (
                 <div className="space-y-1">
-                  {record.audit.issues.map((issue, i) => (
+                  {displayRecord.audit.issues.map((issue, i) => (
                     <div key={i} className="flex items-start gap-1.5">
                       <AlertTriangle size={10} className={
                         issue.severity === 'critical' ? 'text-red-400 mt-0.5' :
@@ -1056,24 +1117,24 @@ function SkillRecordCard({
           )}
 
           {/* Shadow test */}
-          {record.shadow_test && (
+          {displayRecord.shadow_test && (
             <DetailSection title={t('evolution.shadowTest')}>
               <div className="flex items-center gap-2 mb-1">
-                {record.shadow_test.passed
+                {displayRecord.shadow_test.passed
                   ? <CheckCircle size={12} className="text-cyber" />
                   : <XCircle size={12} className="text-red-400" />}
-                <span className={record.shadow_test.passed ? 'text-cyber' : 'text-red-400'}>
-                  {record.shadow_test.passed ? t('evolution.testPassed') : t('evolution.testFailed')}
+                <span className={displayRecord.shadow_test.passed ? 'text-cyber' : 'text-red-400'}>
+                  {displayRecord.shadow_test.passed ? t('evolution.testPassed') : t('evolution.testFailed')}
                 </span>
-                {record.shadow_test.test_cases_run != null && (
+                {displayRecord.shadow_test.test_cases_run != null && (
                   <span className="text-[10px] text-muted-foreground ml-auto">
-                    {record.shadow_test.test_cases_passed}/{record.shadow_test.test_cases_run} passed
+                    {displayRecord.shadow_test.test_cases_passed}/{displayRecord.shadow_test.test_cases_run} passed
                   </span>
                 )}
               </div>
-              {record.shadow_test.errors?.length > 0 && (
+              {displayRecord.shadow_test.errors?.length > 0 && (
                 <div className="space-y-0.5 mt-1">
-                  {record.shadow_test.errors.map((err, i) => (
+                  {displayRecord.shadow_test.errors.map((err, i) => (
                     <div key={i} className="flex items-start gap-1.5">
                       <AlertTriangle size={10} className="text-red-400 mt-0.5 shrink-0" />
                       <span className="text-[10px] text-red-400 font-mono">{err}</span>
@@ -1085,18 +1146,18 @@ function SkillRecordCard({
           )}
 
           {/* Rollout */}
-          {record.rollout && (
+          {displayRecord.rollout && (
             <DetailSection title={t('evolution.rollout')}>
               <div className="flex items-center gap-2 mb-1">
                 <span className="text-muted-foreground">{t('evolution.stage')}:</span>
-                <span className="font-medium">{record.rollout.current_stage + 1} / {record.rollout.stages.length}</span>
+                <span className="font-medium">{displayRecord.rollout.current_stage + 1} / {displayRecord.rollout.stages.length}</span>
               </div>
               <div className="flex gap-1">
-                {record.rollout.stages.map((stage, i) => (
+                {displayRecord.rollout.stages.map((stage, i) => (
                   <div
                     key={i}
                     className={`flex-1 h-1.5 rounded-full ${
-                      i <= record.rollout!.current_stage ? 'bg-cyber' : 'bg-muted'
+                      i <= displayRecord.rollout!.current_stage ? 'bg-cyber' : 'bg-muted'
                     }`}
                     title={`${stage.percentage}% — ${stage.duration_minutes}min`}
                   />
@@ -1106,10 +1167,10 @@ function SkillRecordCard({
           )}
 
           {/* Feedback history */}
-          {record.feedback_history?.length > 0 && (
+          {displayRecord.feedback_history?.length > 0 && (
             <DetailSection title={t('evolution.feedbackHistory')}>
               <div className="space-y-2">
-                {record.feedback_history.map((fb, i) => (
+                {displayRecord.feedback_history.map((fb, i) => (
                   <div key={i} className="border border-border rounded-lg p-2 bg-muted/30">
                     <div className="flex items-center gap-2 mb-1">
                       <RotateCcw size={10} className="text-muted-foreground" />
@@ -1122,6 +1183,8 @@ function SkillRecordCard({
                 ))}
               </div>
             </DetailSection>
+          )}
+            </>
           )}
         </div>
       )}
