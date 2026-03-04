@@ -8,7 +8,7 @@ use blockcell_tools::{
 };
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
@@ -142,6 +142,83 @@ fn is_im_channel(channel: &str) -> bool {
         channel,
         "wecom" | "feishu" | "lark" | "telegram" | "slack" | "discord" | "dingtalk" | "whatsapp"
     )
+}
+
+const CORE_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "exec",
+    "web_search",
+    "web_fetch",
+    "message",
+    "memory_query",
+    "memory_upsert",
+    "spawn",
+    "list_tasks",
+    "cron",
+    "toggle_manage",
+];
+
+fn normalize_path_for_check(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(seg) => normalized.push(seg),
+        }
+    }
+    normalized
+}
+
+fn canonical_or_normalized(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| normalize_path_for_check(path))
+}
+
+fn is_path_within_base(base: &Path, candidate: &Path) -> bool {
+    let base_norm = canonical_or_normalized(base);
+    let candidate_norm = canonical_or_normalized(candidate);
+    candidate_norm.starts_with(&base_norm)
+}
+
+fn tool_result_indicates_error(result: &str) -> bool {
+    if result.starts_with("Tool error:")
+        || result.starts_with("Error:")
+        || result.starts_with("Validation error:")
+        || result.starts_with("Config error:")
+        || result.starts_with("Permission denied:")
+    {
+        return true;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(result) {
+        if value.get("error").is_some() {
+            return true;
+        }
+        if value.get("status").and_then(|v| v.as_str()) == Some("error") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn should_supplement_tool_schema(result: &str) -> bool {
+    let lower = result.to_ascii_lowercase();
+    lower.contains("unknown tool:")
+        || lower.contains("validation error:")
+        || lower.contains("config error:")
+        || lower.contains("missing required parameter")
+        || lower.contains("' is required for")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1174,25 +1251,6 @@ impl AgentRuntime {
 
         tool_names.sort();
         tool_names.dedup();
-        // Core tools always get full schemas; others get lightweight (name+description only).
-        // When the LLM tries to call a lightweight tool, the dynamic supplement mechanism
-        // (below in the tool call loop) will inject the full schema and retry.
-        const CORE_TOOLS: &[&str] = &[
-            "read_file",
-            "write_file",
-            "edit_file",
-            "list_dir",
-            "exec",
-            "web_search",
-            "web_fetch",
-            "message",
-            "memory_query",
-            "memory_upsert",
-            "spawn",
-            "list_tasks",
-            "cron",
-        ];
-
         let mut tools = if tool_names.is_empty() {
             // Chat intent: no tools
             vec![]
@@ -1406,9 +1464,7 @@ impl AgentRuntime {
                     }
 
                     // Track tool failures for fallback hint injection
-                    let is_error = result.starts_with("Tool error:")
-                        || result.starts_with("Error:")
-                        || result.contains("failed");
+                    let is_error = tool_result_indicates_error(&result);
                     if is_error {
                         let count = tool_fail_counts.entry(tool_call.name.clone()).or_insert(0);
                         *count += 1;
@@ -1419,9 +1475,7 @@ impl AgentRuntime {
 
                     // Dynamic tool supplement: if tool was not found or validation failed
                     // (e.g. lightweight schema had no params), inject full schema and retry.
-                    let needs_supplement = result.contains("Unknown tool:")
-                        || result.contains("Permission denied:")
-                        || result.contains("validation failed");
+                    let needs_supplement = should_supplement_tool_schema(&result);
                     if needs_supplement {
                         if let Some(schema) = self.tool_registry.get(&tool_call.name) {
                             // Check if we need to upgrade from lightweight to full schema
@@ -1767,21 +1821,15 @@ impl AgentRuntime {
 
     /// Check if a resolved path is inside the safe workspace directory.
     fn is_path_safe(&self, resolved: &std::path::Path) -> bool {
-        let workspace = self.paths.workspace();
-        // Canonicalize both if possible, otherwise use starts_with on the raw paths
-        let ws = workspace.canonicalize().unwrap_or(workspace);
-        let rp = resolved
-            .canonicalize()
-            .unwrap_or_else(|_| resolved.to_path_buf());
-        rp.starts_with(&ws)
+        is_path_within_base(&self.paths.workspace(), resolved)
     }
 
     /// Check whether a resolved path falls within an already-authorized directory.
     fn is_path_authorized(&self, resolved: &std::path::Path) -> bool {
-        let rp = resolved
-            .canonicalize()
-            .unwrap_or_else(|_| resolved.to_path_buf());
-        self.authorized_dirs.iter().any(|dir| rp.starts_with(dir))
+        let rp = canonical_or_normalized(resolved);
+        self.authorized_dirs
+            .iter()
+            .any(|dir| rp.starts_with(canonical_or_normalized(dir.as_path())))
     }
 
     /// Record a directory as authorized so future accesses within it are auto-approved.
@@ -1789,15 +1837,14 @@ impl AgentRuntime {
         // If the path is a directory, authorize it directly.
         // If it's a file, authorize its parent directory.
         let dir = if resolved.is_dir() {
-            resolved
-                .canonicalize()
-                .unwrap_or_else(|_| resolved.to_path_buf())
+            resolved.to_path_buf()
         } else {
             resolved
                 .parent()
-                .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+                .map(Path::to_path_buf)
                 .unwrap_or_else(|| resolved.to_path_buf())
         };
+        let dir = canonical_or_normalized(&dir);
         if self.authorized_dirs.insert(dir.clone()) {
             info!(dir = %dir.display(), "Directory authorized for future access");
         }
@@ -2332,15 +2379,11 @@ impl AgentRuntime {
                         } else {
                             workspace.join(p)
                         };
-                        if let Ok(canonical) = resolved.canonicalize() {
-                            if let Ok(ws_canonical) = workspace.canonicalize() {
-                                if !canonical.starts_with(&ws_canonical) {
-                                    return Err(blockcell_core::Error::Tool(format!(
-                                        "Path '{}' is outside workspace — blocked in skill script",
-                                        p
-                                    )));
-                                }
-                            }
+                        if !is_path_within_base(&workspace, &resolved) {
+                            return Err(blockcell_core::Error::Tool(format!(
+                                "Path '{}' is outside workspace — blocked in skill script",
+                                p
+                            )));
                         }
                     }
                 }
@@ -2961,5 +3004,59 @@ async fn run_subagent_task(
                 let _ = tx.send(notification).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_core_tools_contains_toggle_manage() {
+        assert!(CORE_TOOLS.contains(&"toggle_manage"));
+    }
+
+    #[test]
+    fn test_path_within_base_allows_normal_child_path() {
+        let base = PathBuf::from("/tmp/workspace");
+        let candidate = base.join("skills/new/SKILL.py");
+        assert!(is_path_within_base(&base, &candidate));
+    }
+
+    #[test]
+    fn test_path_within_base_blocks_nonexistent_traversal() {
+        let base = PathBuf::from("/tmp/workspace");
+        let candidate = base.join("../../etc/passwd");
+        assert!(!is_path_within_base(&base, &candidate));
+    }
+
+    #[test]
+    fn test_tool_result_indicates_error_for_json_error_field() {
+        let result = r#"{"error":"Permission denied: blocked"}"#;
+        assert!(tool_result_indicates_error(result));
+    }
+
+    #[test]
+    fn test_tool_result_indicates_error_does_not_use_failed_substring() {
+        let result = "Task succeeded, previous attempt failed but recovered.";
+        assert!(!tool_result_indicates_error(result));
+    }
+
+    #[test]
+    fn test_should_supplement_tool_schema_for_validation_error() {
+        let result = "Error: Validation error: Missing required parameter: path";
+        assert!(should_supplement_tool_schema(result));
+    }
+
+    #[test]
+    fn test_should_supplement_tool_schema_for_config_error() {
+        let result = "Error: Config error: 'enabled' (boolean) is required for 'set' action";
+        assert!(should_supplement_tool_schema(result));
+    }
+
+    #[test]
+    fn test_should_supplement_tool_schema_ignores_permission_denied() {
+        let result = "Error: Tool error: Permission denied: path blocked";
+        assert!(!should_supplement_tool_schema(result));
     }
 }
