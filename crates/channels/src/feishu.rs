@@ -955,6 +955,54 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
     }
 }
 
+/// Reply to a specific message in a Feishu group chat.
+/// Uses the `/im/v1/messages/{parent_id}/reply` endpoint so the reply is visually
+/// quoted in the conversation. Falls back to `send_message` on error.
+pub async fn send_reply_message(
+    config: &Config,
+    parent_message_id: &str,
+    text: &str,
+) -> Result<()> {
+    crate::rate_limit::feishu_limiter().acquire().await;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Channel(format!("Failed to build HTTP client: {}", e)))?;
+
+    let token = get_cached_token(config).await?;
+
+    #[derive(Serialize)]
+    struct ReplyRequest {
+        msg_type: String,
+        content: String,
+    }
+
+    let content = serde_json::json!({ "text": text }).to_string();
+    let request = ReplyRequest {
+        msg_type: "text".to_string(),
+        content,
+    };
+
+    let url = format!(
+        "{}/im/v1/messages/{}/reply",
+        FEISHU_OPEN_API, parent_message_id
+    );
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| Error::Channel(format!("Failed to send Feishu reply: {}", e)))?;
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(Error::Channel(format!("Feishu reply API error: {}", body)));
+    }
+    Ok(())
+}
+
 async fn do_send_message(client: &Client, token: &str, chat_id: &str, text: &str) -> Result<()> {
     #[derive(Serialize)]
     struct SendMessageRequest<'a> {

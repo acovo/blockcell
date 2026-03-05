@@ -66,7 +66,12 @@ impl ChannelManager {
                         }
                     }
                     if !msg.content.is_empty() {
-                        crate::telegram::send_message(&self.config, &msg.chat_id, &msg.content).await?;
+                        let reply_to = msg.metadata
+                            .get("reply_to_message_id")
+                            .and_then(|v| v.as_i64());
+                        crate::telegram::send_message_reply(
+                            &self.config, &msg.chat_id, &msg.content, reply_to,
+                        ).await?;
                     }
                 }
             }
@@ -93,7 +98,16 @@ impl ChannelManager {
                         }
                     }
                     if !msg.content.is_empty() {
-                        crate::feishu::send_message(&self.config, &msg.chat_id, &msg.content).await?;
+                        let reply_to = msg.metadata
+                            .get("reply_to_message_id")
+                            .and_then(|v| v.as_str());
+                        if let Some(parent_id) = reply_to {
+                            crate::feishu::send_reply_message(
+                                &self.config, parent_id, &msg.content,
+                            ).await?;
+                        } else {
+                            crate::feishu::send_message(&self.config, &msg.chat_id, &msg.content).await?;
+                        }
                     }
                 }
             }
@@ -188,7 +202,16 @@ impl ChannelManager {
                         }
                     }
                     if !msg.content.is_empty() {
-                        crate::lark::send_message(&self.config, &msg.chat_id, &msg.content).await?;
+                        let reply_to = msg.metadata
+                            .get("reply_to_message_id")
+                            .and_then(|v| v.as_str());
+                        if let Some(parent_id) = reply_to {
+                            crate::lark::send_reply_message(
+                                &self.config, parent_id, &msg.content,
+                            ).await?;
+                        } else {
+                            crate::lark::send_message(&self.config, &msg.chat_id, &msg.content).await?;
+                        }
                     }
                 }
             }

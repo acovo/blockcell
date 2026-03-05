@@ -538,7 +538,7 @@ pub async fn send_message(config: &Config, chat_id: &str, text: &str) -> Result<
 
     let chunks = split_message(text, 4096);
     for (i, chunk) in chunks.iter().enumerate() {
-        do_send_message(&client, &url, chat_id, chunk).await?;
+        do_send_message(&client, &url, chat_id, chunk, None).await?;
         if i + 1 < chunks.len() {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -546,12 +546,53 @@ pub async fn send_message(config: &Config, chat_id: &str, text: &str) -> Result<
     Ok(())
 }
 
-async fn do_send_message(client: &Client, url: &str, chat_id: &str, text: &str) -> Result<()> {
+/// Send a message to a Telegram chat, quoting a specific message when `reply_to_message_id` is set.
+/// Only the first chunk of a long message carries the reply reference.
+pub async fn send_message_reply(
+    config: &Config,
+    chat_id: &str,
+    text: &str,
+    reply_to_message_id: Option<i64>,
+) -> Result<()> {
+    crate::rate_limit::telegram_limiter().acquire().await;
+    let mut builder = Client::builder().timeout(Duration::from_secs(30));
+    if let Some(proxy) = config.channels.telegram.proxy.as_deref() {
+        if let Ok(p) = Proxy::all(proxy) {
+            builder = builder.proxy(p);
+        }
+    }
+    let client = builder.build().unwrap_or_else(|_| Client::new());
+    let url = format!(
+        "{}/bot{}/sendMessage",
+        TELEGRAM_API_BASE, config.channels.telegram.token
+    );
+
+    let chunks = split_message(text, 4096);
+    for (i, chunk) in chunks.iter().enumerate() {
+        // Only quote-reply the first chunk; subsequent chunks are plain follow-ups
+        let reply_id = if i == 0 { reply_to_message_id } else { None };
+        do_send_message(&client, &url, chat_id, chunk, reply_id).await?;
+        if i + 1 < chunks.len() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    Ok(())
+}
+
+async fn do_send_message(
+    client: &Client,
+    url: &str,
+    chat_id: &str,
+    text: &str,
+    reply_to_message_id: Option<i64>,
+) -> Result<()> {
     #[derive(Serialize)]
     struct SendMessageRequest {
         chat_id: String,
         text: String,
         parse_mode: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_to_message_id: Option<i64>,
     }
 
     // Try MarkdownV2 first; fall back to plain text if Telegram rejects the formatting.
@@ -560,6 +601,7 @@ async fn do_send_message(client: &Client, url: &str, chat_id: &str, text: &str) 
         chat_id: chat_id.to_string(),
         text: escaped,
         parse_mode: "MarkdownV2".to_string(),
+        reply_to_message_id,
     };
 
     let response = client
@@ -583,12 +625,16 @@ async fn do_send_message(client: &Client, url: &str, chat_id: &str, text: &str) 
             chat_id: chat_id.to_string(),
             text: text.to_string(),
             parse_mode: String::new(),
+            reply_to_message_id: None,
         };
         // Send without parse_mode by using a plain JSON body
-        let plain_body = serde_json::json!({
+        let mut plain_body = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
         });
+        if let Some(rid) = reply_to_message_id {
+            plain_body["reply_to_message_id"] = serde_json::json!(rid);
+        }
         let retry = client
             .post(url)
             .json(&plain_body)
@@ -599,7 +645,7 @@ async fn do_send_message(client: &Client, url: &str, chat_id: &str, text: &str) 
             let err = retry.text().await.unwrap_or_default();
             return Err(Error::Channel(format!("Telegram API error (plain): {}", err)));
         }
-        let _ = plain_request; // suppress unused warning
+        let _ = plain_request; // suppress unused warning (fields used for serde only)
         return Ok(());
     }
 

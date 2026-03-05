@@ -1768,6 +1768,7 @@ impl AgentRuntime {
                 let mut outbound =
                     OutboundMessage::new(&msg.channel, &msg.chat_id, &final_response);
                 outbound.media = collected_media.clone();
+                outbound.metadata = extract_reply_metadata(&msg);
                 let _ = tx.send(outbound).await;
             }
         }
@@ -3044,6 +3045,67 @@ async fn run_subagent_task(
                 let _ = tx.send(notification).await;
             }
         }
+    }
+}
+
+/// Build outbound metadata containing reply-to information from an inbound message.
+/// Only applies to group chats — single/DM chats return Null so no quoting is added.
+fn extract_reply_metadata(msg: &InboundMessage) -> serde_json::Value {
+    match msg.channel.as_str() {
+        "telegram" => {
+            // Telegram group/supergroup chat_ids are negative integers
+            let is_group = msg.chat_id.parse::<i64>().unwrap_or(0) < 0;
+            if is_group {
+                if let Some(mid) = msg.metadata.get("message_id") {
+                    return serde_json::json!({ "reply_to_message_id": mid });
+                }
+            }
+            serde_json::Value::Null
+        }
+        "feishu" | "lark" => {
+            // Feishu/Lark open-chat (group) IDs start with "oc_"
+            if msg.chat_id.starts_with("oc_") {
+                if let Some(mid) = msg.metadata.get("message_id").and_then(|v| v.as_str()) {
+                    return serde_json::json!({ "reply_to_message_id": mid });
+                }
+            }
+            serde_json::Value::Null
+        }
+        "discord" => {
+            // Discord server messages carry a non-empty guild_id; DMs do not
+            let in_guild = msg.metadata
+                .get("guild_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .is_some();
+            if in_guild {
+                if let Some(mid) = msg.metadata.get("message_id").and_then(|v| v.as_str()) {
+                    return serde_json::json!({ "reply_to_message_id": mid });
+                }
+            }
+            serde_json::Value::Null
+        }
+        "slack" => {
+            // Slack channels: reply in-thread using the original message ts
+            if let Some(ts) = msg.metadata.get("ts").and_then(|v| v.as_str()) {
+                return serde_json::json!({ "thread_ts": ts });
+            }
+            serde_json::Value::Null
+        }
+        "dingtalk" => {
+            // DingTalk group chats have conversation_type "2"
+            let is_group = msg.metadata
+                .get("conversation_type")
+                .and_then(|v| v.as_str())
+                == Some("2");
+            if is_group {
+                if let Some(mid) = msg.metadata.get("msg_id").and_then(|v| v.as_str()) {
+                    return serde_json::json!({ "reply_to_message_id": mid });
+                }
+            }
+            serde_json::Value::Null
+        }
+        _ => serde_json::Value::Null,
     }
 }
 

@@ -623,6 +623,52 @@ pub async fn send_message(config: &Config, chat_id: &str, text: &str) -> Result<
     Ok(())
 }
 
+/// Reply to a specific message in a Lark group chat.
+/// Uses the `/im/v1/messages/{parent_id}/reply` endpoint so the reply is visually
+/// quoted in the conversation.
+pub async fn send_reply_message(
+    config: &Config,
+    parent_message_id: &str,
+    text: &str,
+) -> Result<()> {
+    crate::rate_limit::lark_limiter().acquire().await;
+
+    let token = get_cached_token(config).await?;
+
+    #[derive(Serialize)]
+    struct ReplyRequest {
+        msg_type: String,
+        content: String,
+    }
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Channel(format!("Failed to build HTTP client: {}", e)))?;
+
+    let content = serde_json::json!({ "text": text }).to_string();
+    let response = client
+        .post(format!(
+            "{}/im/v1/messages/{}/reply",
+            LARK_OPEN_API, parent_message_id
+        ))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&ReplyRequest {
+            msg_type: "text".to_string(),
+            content,
+        })
+        .send()
+        .await
+        .map_err(|e| Error::Channel(format!("Lark send_reply_message request failed: {}", e)))?;
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(Error::Channel(format!("Lark reply API error: {}", body)));
+    }
+
+    Ok(())
+}
+
 /// Upload a local file to Lark and return the `file_key`.
 /// `file_type` must be one of: image / opus / mp4 / pdf / doc / xls / ppt / stream
 pub async fn upload_lark_file(
