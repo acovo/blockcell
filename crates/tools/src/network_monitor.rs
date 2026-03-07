@@ -51,7 +51,7 @@ impl Tool for NetworkMonitorTool {
 
         ToolSchema {
             name: "network_monitor",
-            description: "Network monitoring and diagnostics. Ping hosts, trace routes, scan ports, check SSL certificates (expiry, issuer, chain), query DNS records, perform WHOIS lookups, and check HTTP endpoint health with timing. All operations use standard system tools (ping, traceroute, openssl, dig, whois, curl).",
+            description: "Network diagnostics. You MUST provide `action`. action='ping'|'traceroute'|'dns_lookup'|'whois'|'http_check'|'ssl_check': requires `host`, plus action-specific optional fields like `count`, `timeout`, `record_type`, or `url`. action='port_scan': requires `host`, optional `ports`, `port_range`, and `concurrent`. action='bandwidth': optional `url`. Use action-specific fields only with the matching action.",
             parameters: json!({
                 "type": "object",
                 "properties": Value::Object(props),

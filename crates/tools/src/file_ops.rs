@@ -24,7 +24,7 @@ impl Tool for FileOpsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "file_ops",
-            description: "File operations: delete, rename, move, copy files/directories, and compress/decompress archives (zip/tar.gz). Also supports reading PDF files.",
+            description: "Multi-action file utility. You MUST provide `action`. action='delete': requires `path`, optional `recursive` for directories. action='rename'|'move'|'copy': requires `path` and `destination`. action='compress': requires `destination` and either `path` or `paths`, optional `format`. action='decompress': requires `path`, optional `destination`. action='read_pdf': requires `path`. action='file_info': requires `path`.",
             parameters: json!({
                 "type": "object",
                 "properties": {

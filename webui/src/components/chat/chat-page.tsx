@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useState } from 'react';
 import { Send, Loader2, Paperclip, X, FileAudio, Upload, Square } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAgentStore, useChatStore } from '@/lib/store';
@@ -19,7 +19,13 @@ interface PendingFile {
 }
 
 export function ChatPage() {
-  const { messages, sessions, currentSessionId, setMessages, addMessage, isLoading, setLoading } = useChatStore();
+  const messages = useChatStore((s) => s.messages);
+  const sessions = useChatStore((s) => s.sessions);
+  const currentSessionId = useChatStore((s) => s.currentSessionId);
+  const setMessages = useChatStore((s) => s.setMessages);
+  const addMessage = useChatStore((s) => s.addMessage);
+  const isLoading = useChatStore((s) => s.isLoading);
+  const setLoading = useChatStore((s) => s.setLoading);
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const t = useT();
   const [input, setInput] = useState('');
@@ -27,6 +33,7 @@ export function ChatPage() {
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [uploading, setUploading] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  const hasMessages = messages.length > 0;
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -88,9 +95,22 @@ export function ChatPage() {
           reasoning: m.reasoning_content || undefined,
           timestamp: Date.now() - (data.messages.length - i) * 1000,
         }));
+      const currentState = useChatStore.getState();
+      if (currentState.currentSessionId !== sessionId) {
+        return;
+      }
+      if (currentState.messages.length > 0) {
+        return;
+      }
       setMessages(uiMessages);
     } catch {
-      if (selectedAgentRef.current === agentId && currentSessionRef.current === sessionId) {
+      const currentState = useChatStore.getState();
+      if (
+        selectedAgentRef.current === agentId &&
+        currentSessionRef.current === sessionId &&
+        currentState.currentSessionId === sessionId &&
+        currentState.messages.length === 0
+      ) {
         setMessages([]);
       }
     }
@@ -197,10 +217,6 @@ export function ChatPage() {
       timestamp: Date.now(),
     });
 
-    // Derive chat_id from session — use the session ID directly so the
-    // runtime saves history under the same key shown in the sessions list.
-    // The session_file() helper on the server normalises ':' → '_', so
-    // "ws_1234567890" and "ws:1234567890" both map to the same file.
     const chatId = currentSessionId.replace(/_/g, ':');
 
     // Send via WebSocket
@@ -240,7 +256,7 @@ export function ChatPage() {
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto px-4 py-6">
         <div className="max-w-3xl mx-auto space-y-4">
-          {messages.length === 0 && (
+          {!hasMessages && (
             <div className="flex flex-col items-center pt-8 pb-4 text-muted-foreground">
               <div className="mb-3">
                 <BlockcellLogo size="md" />

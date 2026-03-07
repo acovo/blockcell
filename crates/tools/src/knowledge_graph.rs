@@ -49,7 +49,7 @@ impl Tool for KnowledgeGraphTool {
 
         ToolSchema {
             name: "knowledge_graph",
-            description: "Lightweight knowledge graph backed by SQLite. Store entities (nodes) with types, properties, and tags. Create typed relations (edges) between entities. Search entities with full-text search, find shortest paths, extract subgraphs, and export to JSON/DOT/Mermaid. Each graph is stored in a separate SQLite file in the workspace. Use graph_name to manage multiple graphs.",
+            description: "SQLite-backed knowledge graph. You MUST provide `action`. entity actions: `add_entity` requires `entity_type` and `name`; `get_entity`|`delete_entity` require `entity_id`; `update_entity` requires `entity_id` plus fields to change; `search_entities`/`query` usually require `query`; `merge_entity` requires identifying entity fields. relation actions: `add_relation` requires `source_id`, `target_id`, and `relation_type`; `get_relations` usually requires `entity_id`; `delete_relation` requires `relation_id`. graph actions: `find_path` requires `source_id` and `target_id`; `subgraph` requires `entity_id`; `stats` needs no extra params; `export` optional `format`. Optional `graph_name` selects the graph database.",
             parameters: json!({
                 "type": "object",
                 "properties": Value::Object(props),

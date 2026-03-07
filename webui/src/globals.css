@@ -115,3 +115,59 @@
 .prose th {
   @apply bg-muted font-medium;
 }
+
+.prose-blockcell {
+  @apply text-foreground/95;
+}
+
+.prose-blockcell :where(p, ul, ol, blockquote, table, pre) {
+  @apply my-2.5;
+}
+
+.prose-blockcell :where(ul, ol) {
+  @apply pl-5;
+}
+
+.prose-blockcell :where(ul) {
+  list-style-type: disc;
+}
+
+.prose-blockcell :where(ol) {
+  list-style-type: decimal;
+}
+
+.prose-blockcell :where(li > p) {
+  @apply my-1;
+}
+
+.prose-blockcell :where(a) {
+  @apply decoration-rust/50 underline-offset-2 transition-colors;
+}
+
+.prose-blockcell :where(strong) {
+  @apply font-semibold;
+}
+
+.prose-blockcell :where(hr) {
+  @apply border-border/70;
+}
+
+.prose-blockcell :where(blockquote p:last-child) {
+  @apply mb-0;
+}
+
+.prose-blockcell :where(code):not(:where(pre code)) {
+  @apply border border-border/60 bg-muted/80 text-rust;
+}
+
+.prose-blockcell :where(thead) {
+  @apply bg-muted/80;
+}
+
+.prose-blockcell :where(tbody tr:nth-child(even)) {
+  @apply bg-muted/30;
+}
+
+.prose-blockcell :where(img) {
+  @apply shadow-sm;
+}

@@ -1,4 +1,5 @@
 use super::*;
+use blockcell_core::{resolve_session_key_from_id, session_file_stem, session_id_from_file_stem, session_title_from_id};
 // ---------------------------------------------------------------------------
 // P0: Session management endpoints
 // ---------------------------------------------------------------------------
@@ -9,6 +10,24 @@ struct SessionInfo {
     name: String,
     updated_at: String,
     message_count: usize,
+}
+
+fn session_file_stems(sessions_dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(sessions_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -27,7 +46,8 @@ pub(super) async fn handle_sessions_list(
         Ok(agent_id) => agent_id,
         Err(err) => return Json(serde_json::json!({ "error": err })),
     };
-    let sessions_dir = state.paths.for_agent(&agent_id).sessions_dir();
+    let agent_paths = state.paths.for_agent(&agent_id);
+    let sessions_dir = agent_paths.sessions_dir();
     let limit = params.limit;
     let cursor = params.cursor;
 
@@ -49,11 +69,13 @@ pub(super) async fn handle_sessions_list(
                 if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
-                let file_name = path
+                let file_stem = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_string();
+
+                let session_id = session_id_from_file_stem(&file_stem);
 
                 let updated_at = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
@@ -73,14 +95,15 @@ pub(super) async fn handle_sessions_list(
                     .unwrap_or(0);
 
                 let name = meta
-                    .get(&file_name)
+                    .get(&file_stem)
+                    .or_else(|| meta.get(&session_id))
                     .and_then(|v| v.get("name"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
-                    .unwrap_or_else(|| file_name.replace('_', ":"));
+                    .unwrap_or_else(|| session_title_from_id(&session_id));
 
                 sessions.push(SessionInfo {
-                    id: file_name,
+                    id: session_id,
                     name,
                     updated_at,
                     message_count,
@@ -136,8 +159,10 @@ pub(super) async fn handle_session_get(
                 .into_response()
         }
     };
-    let session_key = session_id.replace('_', ":");
-    let session_store = SessionStore::new(state.paths.for_agent(&agent_id));
+    let agent_paths = state.paths.for_agent(&agent_id);
+    let session_stems = session_file_stems(&agent_paths.sessions_dir());
+    let session_key = resolve_session_key_from_id(&session_id, session_stems.iter().map(|s| s.as_str()));
+    let session_store = SessionStore::new(agent_paths);
     match session_store.load(&session_key) {
         Ok(messages) if !messages.is_empty() => {
             let msgs: Vec<serde_json::Value> = messages
@@ -188,8 +213,10 @@ pub(super) async fn handle_session_delete(
         Ok(agent_id) => agent_id,
         Err(err) => return Json(serde_json::json!({ "status": "error", "message": err })),
     };
-    let session_key = session_id.replace('_', ":");
-    let path = state.paths.for_agent(&agent_id).session_file(&session_key);
+    let agent_paths = state.paths.for_agent(&agent_id);
+    let session_stems = session_file_stems(&agent_paths.sessions_dir());
+    let session_key = resolve_session_key_from_id(&session_id, session_stems.iter().map(|s| s.as_str()));
+    let path = agent_paths.session_file(&session_key);
     let session_id_clone = session_id.clone();
     let result = tokio::task::spawn_blocking(move || {
         if path.exists() {
@@ -223,11 +250,12 @@ pub(super) async fn handle_session_rename(
         Ok(agent_id) => agent_id,
         Err(err) => return Json(serde_json::json!({ "status": "error", "message": err })),
     };
-    let meta_path = state
-        .paths
-        .for_agent(&agent_id)
-        .sessions_dir()
-        .join("_meta.json");
+    let agent_paths = state.paths.for_agent(&agent_id);
+    let session_stems = session_file_stems(&agent_paths.sessions_dir());
+    let session_key = resolve_session_key_from_id(&session_id, session_stems.iter().map(|s| s.as_str()));
+    let file_stem = session_file_stem(&session_key);
+    let normalized_id = session_file_stem(&session_id);
+    let meta_path = agent_paths.sessions_dir().join("_meta.json");
     let name = req.name;
     let session_id_clone = session_id.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -241,7 +269,11 @@ pub(super) async fn handle_session_rename(
         };
 
         meta.insert(
-            session_id_clone.clone(),
+            file_stem,
+            serde_json::json!({ "name": name.clone() }),
+        );
+        meta.insert(
+            normalized_id,
             serde_json::json!({ "name": name.clone() }),
         );
 

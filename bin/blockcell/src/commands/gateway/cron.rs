@@ -58,11 +58,14 @@ fn resolve_cron_skill_payload_kind(paths: &Paths, skill_name: Option<&str>) -> &
 
     let has_rhai = user_dir.join("SKILL.rhai").exists() || builtin_dir.join("SKILL.rhai").exists();
     let has_py = user_dir.join("SKILL.py").exists() || builtin_dir.join("SKILL.py").exists();
+    let has_md = user_dir.join("SKILL.md").exists() || builtin_dir.join("SKILL.md").exists();
 
     if has_rhai {
         "skill_rhai"
     } else if has_py {
         "skill_python"
+    } else if has_md {
+        "skill_markdown"
     } else {
         // Keep backward-compatible behavior when script type is unknown.
         "skill_rhai"
@@ -192,10 +195,10 @@ pub(super) async fn handle_cron_run(
                     "reminder_message": job.payload.message,
                 })
             } else {
-                let kind = if job.payload.kind == "skill_python" {
-                    "python"
-                } else {
-                    "rhai"
+                let kind = match job.payload.kind.as_str() {
+                    "skill_python" => "python",
+                    "skill_markdown" => "markdown",
+                    _ => "rhai",
                 };
                 let mut meta = serde_json::json!({
                     "job_id": job.id,
@@ -207,6 +210,8 @@ pub(super) async fn handle_cron_run(
                 });
                 if kind == "python" {
                     meta["skill_python"] = serde_json::json!(true);
+                } else if kind == "markdown" {
+                    meta["skill_markdown"] = serde_json::json!(true);
                 } else {
                     meta["skill_rhai"] = serde_json::json!(true);
                 }

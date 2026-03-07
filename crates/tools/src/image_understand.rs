@@ -9,10 +9,6 @@ use crate::{Tool, ToolContext, ToolSchema};
 ///
 /// Sends images to vision-capable LLMs (GPT-4o, Claude, Gemini) for:
 /// - Image description and captioning
-/// - Object/scene recognition
-/// - Text extraction with context
-/// - Chart/diagram interpretation
-/// - Comparison of multiple images
 pub struct ImageUnderstandTool;
 
 #[async_trait]
@@ -20,7 +16,7 @@ impl Tool for ImageUnderstandTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "image_understand",
-            description: "Analyze images using multimodal LLM vision. Actions: 'analyze' sends image(s) to a vision LLM with a prompt, 'describe' generates a description/caption, 'compare' compares multiple images, 'extract' extracts structured data from image.",
+            description: "Analyze images using multimodal vision models. You MUST provide `action`. action='describe': requires `path`, optional `provider`, `model`, `detail`, `max_tokens`. action='analyze'|'extract': requires `path`; `prompt` is recommended and usually needed for precise results; optional `provider`, `model`, `detail`, `max_tokens`. action='compare': requires `paths`, optional `prompt`, `provider`, `model`, `detail`, `max_tokens`.",
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -8,10 +8,6 @@ use crate::{Tool, ToolContext, ToolSchema};
 
 /// Tool for optical character recognition (OCR) — extracting text from images.
 ///
-/// Supports multiple backends:
-/// - Tesseract OCR (local, free, many languages)
-/// - macOS Vision framework (via Python/objc bridge)
-/// - OpenAI Vision API (cloud, multimodal LLM)
 pub struct OcrTool;
 
 #[async_trait]
@@ -19,7 +15,7 @@ impl Tool for OcrTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "ocr",
-            description: "Extract text from images (OCR). Actions: 'recognize' extracts text from an image, 'info' checks available backends.",
+            description: "Extract text from images or PDFs with OCR. You MUST provide `action`. action='info': no extra params. action='recognize': requires `path`, optional `language`, `backend`, `output_path`, `dpi`, and `psm`.",
             parameters: json!({
                 "type": "object",
                 "properties": {

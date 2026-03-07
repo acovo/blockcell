@@ -222,6 +222,35 @@ impl ContextBuilder {
         })
     }
 
+    pub fn resolve_active_skill_by_name(
+        &self,
+        skill_name: &str,
+        disabled_skills: &HashSet<String>,
+    ) -> Option<ActiveSkillContext> {
+        if skill_name.is_empty() {
+            return None;
+        }
+        if disabled_skills.contains(skill_name) {
+            return None;
+        }
+        let manager = self.skill_manager.as_ref()?;
+        let skill = manager.get(skill_name)?;
+        if !skill.available {
+            return None;
+        }
+        let prompt_md = skill.load_md()?;
+        Some(ActiveSkillContext {
+            name: skill.name.clone(),
+            prompt_md,
+            tools: skill.meta.effective_tools(),
+            fallback_message: skill
+                .meta
+                .fallback
+                .as_ref()
+                .and_then(|fallback| fallback.message.clone()),
+        })
+    }
+
     pub fn skill_manager(&self) -> Option<&SkillManager> {
         self.skill_manager.as_ref()
     }

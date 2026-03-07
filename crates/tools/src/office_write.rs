@@ -16,7 +16,7 @@ impl Tool for OfficeWriteTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "office_write",
-            description: "Generate Office documents: PPTX presentations, DOCX documents, XLSX spreadsheets. Creates properly formatted files from structured data using Python.",
+            description: "Generate Office documents. You MUST provide `action`. action='info': no extra params. action='create_pptx': requires `slides`, optional `title`, `output_path`, and `style`. action='create_docx': requires `sections`, optional `title`, `output_path`, and `style`. action='create_xlsx': requires `sheets`, optional `title`, `output_path`, and `style`.",
             parameters: json!({
                 "type": "object",
                 "properties": {

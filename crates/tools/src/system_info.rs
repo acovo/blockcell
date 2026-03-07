@@ -418,7 +418,7 @@ impl Tool for CapabilityEvolveTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "capability_evolve",
-            description: "Manage dynamic evolved tools: request new ones, execute existing ones, check status, or list all. Evolved tools are generated, compiled, validated, and hot-loaded at runtime.",
+            description: "Manage dynamically evolved tools. You MUST provide `action`. action='list': no extra params. action='request': requires `capability_id` and `description`, optional `provider_type`. action='status': requires `capability_id`. action='execute': requires `capability_id` and usually `input` containing the evolved tool's JSON input.",
             parameters: json!({
                 "type": "object",
                 "properties": {

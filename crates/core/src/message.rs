@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::session_key::build_session_key;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundMessage {
     pub channel: String,
@@ -17,7 +19,7 @@ pub struct InboundMessage {
 
 impl InboundMessage {
     pub fn session_key(&self) -> String {
-        format!("{}:{}", self.channel, self.chat_id)
+        build_session_key(&self.channel, &self.chat_id)
     }
 
     pub fn cli(content: &str) -> Self {

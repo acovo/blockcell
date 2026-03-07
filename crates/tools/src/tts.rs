@@ -19,7 +19,7 @@ impl Tool for TtsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "tts",
-            description: "Convert text to speech audio. Actions: 'speak' generates audio file from text, 'list_voices' lists available voices, 'info' checks available backends.",
+            description: "Convert text to speech audio. You MUST provide `action`. action='info': no extra params. action='list_voices': optional `language` and `backend`. action='speak': requires `text`, optional `output_path`, `voice`, `backend`, `speed`, and `format`.",
             parameters: json!({
                 "type": "object",
                 "properties": {

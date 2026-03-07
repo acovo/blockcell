@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::session_file_stem;
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub base: PathBuf,
@@ -52,7 +54,7 @@ impl Paths {
     }
 
     pub fn session_file(&self, session_key: &str) -> PathBuf {
-        let safe_key = session_key.replace([':', '/', '\\'], "_");
+        let safe_key = session_file_stem(session_key);
         self.sessions_dir().join(format!("{}.jsonl", safe_key))
     }
 

@@ -276,6 +276,26 @@ impl SkillEvolution {
         &self.skills_dir
     }
 
+    fn is_openclaw_import_description(description: &str) -> bool {
+        description.contains("Convert the following OpenClaw-compatible skill into a Blockcell")
+    }
+
+    fn trigger_rules_prompt() -> &'static str {
+        "## meta.yaml trigger rules\n\
+- Generate `triggers` as a concise YAML string list.\n\
+- Generate **4 to 8** triggers total. Do not output fewer than 4 or more than 8.\n\
+- Each trigger should be **2 to 8 Chinese characters** or **1 to 3 English words**.\n\
+- Prefer **Chinese natural-language triggers** when the skill is mainly for Chinese users. Add **0 to 2 English triggers** only when the capability is commonly searched in English or the skill name itself is English.\n\
+- Include **1 exact skill-name trigger** or a very close stable alias.\n\
+- Include **2 to 4 user-intent triggers** that reflect how users actually ask for this capability in chat.\n\
+- Include **1 to 2 narrow synonyms or aliases** only when they are genuinely equivalent in meaning. Do not pad with weak variants.\n\
+- Avoid overly broad or generic triggers such as `查询`, `工具`, `助手`, `分析`, `处理`, `搜索`, `生成`, `数据`, `信息`, `market`, `crypto` unless the phrase is paired with the skill's specific domain intent.\n\
+- Avoid triggers that overlap too broadly with unrelated skills. Triggers must be specific enough to activate this skill but not so specific that normal user wording would never match.\n\
+- Prefer wording that matches **actual user utterances**, not taxonomy labels. Good triggers sound like something a user would really type.\n\
+- Do not include punctuation, full sentences, repeated variants, or explanation text in `triggers`.\n\
+- Keep triggers accurate and conservative. Do **not** over-expand with speculative synonyms.\n\n"
+    }
+
     /// Get the evolution records directory path.
     pub fn records_dir(&self) -> PathBuf {
         self.evolution_db
@@ -948,14 +968,18 @@ impl SkillEvolution {
         // Task description
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!(
-                    "## Task\nCreate or improve a Rhai skill for: {}\n\n",
-                    description
-                ));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Task\nCreate or improve a Blockcell Rhai skill for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
             prompt.push_str(&format!(
-                "## Task\nFix the following issue in Rhai skill '{}':\n\n",
+                "## Task\nFix the following issue in the existing Blockcell Rhai skill '{}'. Preserve the skill's purpose and only change what is necessary to correct the problem.\n\n",
                 context.skill_name
             ));
             prompt.push_str(&format!("Trigger: {:?}\n\n", context.trigger));
@@ -984,6 +1008,8 @@ impl SkillEvolution {
         // Output format — P0-2: always request complete script (never diff)
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE SKILL.rhai file content.\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
+        prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("Output ONLY the Rhai code in a ```rhai code block.\n");
         prompt.push_str(
             "The script must be a valid, self-contained Rhai script with no syntax errors.\n",
@@ -1017,14 +1043,18 @@ impl SkillEvolution {
 
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!(
-                    "## Task\nCreate a SKILL.md for: {}\n\n",
-                    description
-                ));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Task\nCreate or improve a Blockcell SKILL.md for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
             prompt.push_str(&format!(
-                "## Task\nImprove the SKILL.md for skill '{}' to address the following issue:\n\n",
+                "## Task\nFix the existing Blockcell SKILL.md for skill '{}' to address the following issue. Preserve the skill's original scope and intent; only tighten or correct the instructions as needed.\n\n",
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
@@ -1064,6 +1094,7 @@ impl SkillEvolution {
         prompt.push_str("Generate the COMPLETE SKILL.md content.\n");
         prompt.push_str("Output the markdown content in a ```markdown code block.\n");
         prompt.push_str("Also output an updated meta.yaml in a ```yaml code block.\n");
+        prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str(
             "The document must be at least 200 characters, practical, and clearly structured.\n",
         );
@@ -1121,14 +1152,18 @@ impl SkillEvolution {
         // Task description
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!(
-                    "## Original Task\nCreate or improve a Rhai skill for: {}\n\n",
-                    description
-                ));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Original Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Original Task\nCreate or improve a Blockcell Rhai skill for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
             prompt.push_str(&format!(
-                "## Original Task\nFix the following issue in Rhai skill '{}':\n\n",
+                "## Original Task\nFix the following issue in the existing Blockcell Rhai skill '{}'. Keep behavior changes minimal and targeted.\n\n",
                 context.skill_name
             ));
         }
@@ -1166,6 +1201,8 @@ impl SkillEvolution {
         prompt.push_str(
             "Fix ALL the issues listed above and generate the COMPLETE corrected Rhai script.\n",
         );
+        prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
+        prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("Do NOT leave any of the reported issues unfixed.\n");
         prompt.push_str("Output ONLY the corrected Rhai code in a ```rhai code block.\n");
         prompt.push_str(
@@ -1190,14 +1227,18 @@ impl SkillEvolution {
 
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!(
-                    "## Original Task\nCreate/improve SKILL.md for: {}\n\n",
-                    description
-                ));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Original Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Original Task\nCreate or improve a Blockcell SKILL.md for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
             prompt.push_str(&format!(
-                "## Original Task\nImprove SKILL.md for skill '{}'.\n\n",
+                "## Original Task\nFix the existing Blockcell SKILL.md for skill '{}'. Keep the same skill scope and repair only the broken or unclear parts.\n\n",
                 context.skill_name
             ));
         }
@@ -1229,6 +1270,7 @@ impl SkillEvolution {
         prompt.push_str("Fix ALL the issues listed above and generate the COMPLETE corrected SKILL.md content.\n");
         prompt.push_str("Output the markdown content in a ```markdown code block.\n");
         prompt.push_str("Also output an updated meta.yaml in a ```yaml code block.\n");
+        prompt.push_str(Self::trigger_rules_prompt());
 
         Ok(prompt)
     }
@@ -1342,14 +1384,18 @@ or\n\
 
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!(
-                    "## Task\nCreate a SKILL.py for: {}\n\n",
-                    description
-                ));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Task\nCreate or improve a Blockcell SKILL.py for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
             prompt.push_str(&format!(
-                "## Task\nImprove the SKILL.py for skill '{}' to address the following issue:\n\n",
+                "## Task\nFix the existing Blockcell SKILL.py for skill '{}' to address the following issue. Preserve the skill's purpose and change only what is needed to fix it.\n\n",
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
@@ -1367,6 +1413,8 @@ or\n\
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE SKILL.py content.\n");
         prompt.push_str("Output the Python code in a ```python code block.\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
+        prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("The script must be syntactically valid Python.\n");
 
         Ok(prompt)
@@ -1416,14 +1464,18 @@ or\n\
 
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!(
-                    "## Original Task\nCreate/improve SKILL.py for: {}\n\n",
-                    description
-                ));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Original Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Original Task\nCreate or improve a Blockcell SKILL.py for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
             prompt.push_str(&format!(
-                "## Original Task\nImprove SKILL.py for skill '{}'.\n\n",
+                "## Original Task\nFix the existing Blockcell SKILL.py for skill '{}'. Keep the same skill scope and repair only the broken parts.\n\n",
                 context.skill_name
             ));
         }
@@ -1454,6 +1506,8 @@ or\n\
         prompt.push_str("## Instructions\n");
         prompt.push_str("Fix ALL the issues listed above and generate the COMPLETE corrected SKILL.py content.\n");
         prompt.push_str("Output the Python code in a ```python code block.\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
+        prompt.push_str(Self::trigger_rules_prompt());
 
         Ok(prompt)
     }

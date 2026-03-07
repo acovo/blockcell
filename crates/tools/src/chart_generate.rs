@@ -16,7 +16,7 @@ impl Tool for ChartGenerateTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "chart_generate",
-            description: "Generate charts and data visualizations. Creates bar, line, pie, scatter, histogram, heatmap charts as PNG/SVG images or interactive HTML. Uses matplotlib or plotly via Python.",
+            description: "Generate charts and data visualizations. You MUST provide `action`. action='info': no extra params. action='generate': requires `chart_type`; requires `data` unless `chart_type='custom'`; optional `title`, `x_label`, `y_label`, `output_path`, `style`, `backend`, and `custom_script`.",
             parameters: json!({
                 "type": "object",
                 "properties": {

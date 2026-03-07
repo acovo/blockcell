@@ -349,6 +349,7 @@ fn should_supplement_tool_schema(result: &str) -> bool {
 pub enum SkillScriptKind {
     Rhai,
     Python,
+    Markdown,
 }
 
 impl SkillScriptKind {
@@ -356,6 +357,7 @@ impl SkillScriptKind {
         match self {
             SkillScriptKind::Rhai => "rhai",
             SkillScriptKind::Python => "python",
+            SkillScriptKind::Markdown => "markdown",
         }
     }
 }
@@ -1353,6 +1355,13 @@ impl AgentRuntime {
             Some(SkillScriptKind::Python)
         } else if msg
             .metadata
+            .get("skill_markdown")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            Some(SkillScriptKind::Markdown)
+        } else if msg
+            .metadata
             .get("skill_script")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
@@ -1363,6 +1372,7 @@ impl AgentRuntime {
                 .and_then(|v| v.as_str())
             {
                 Some("python") => Some(SkillScriptKind::Python),
+                Some("markdown") => Some(SkillScriptKind::Markdown),
                 _ => Some(SkillScriptKind::Rhai),
             }
         } else {
@@ -1467,7 +1477,6 @@ impl AgentRuntime {
                 .session_store
                 .set_session_name_if_new(&session_key, &msg.content)
             {
-                // If this is a WS chat, notify the client immediately to update the sidebar
                 if msg.channel == "ws" {
                     if let Some(ref event_tx) = self.event_tx {
                         let event = serde_json::json!({
@@ -1488,9 +1497,15 @@ impl AgentRuntime {
         let disabled_tools = load_disabled_toggles(&self.paths, "tools");
         let disabled_skills = load_disabled_toggles(&self.paths, "skills");
 
+        let forced_skill_name = msg
+            .metadata
+            .get("forced_skill_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let active_skill = self
             .context_builder
-            .resolve_active_skill(&msg.content, &disabled_skills);
+            .resolve_active_skill_by_name(forced_skill_name, &disabled_skills)
+            .or_else(|| self.context_builder.resolve_active_skill(&msg.content, &disabled_skills));
         let chat_intents = classifier.classify(&msg.content);
         let is_chat = active_skill.is_none()
             && chat_intents.len() == 1
@@ -2635,6 +2650,7 @@ impl AgentRuntime {
         match kind {
             SkillScriptKind::Rhai => self.execute_skill_rhai(skill_name, msg).await,
             SkillScriptKind::Python => self.execute_skill_python(skill_name, msg).await,
+            SkillScriptKind::Markdown => self.execute_skill_markdown(skill_name, msg).await,
         }
     }
 
@@ -2684,6 +2700,70 @@ impl AgentRuntime {
     ) -> Result<String> {
         let py_path = self.resolve_skill_script_path(skill_name, "SKILL.py")?;
         self.run_python_script(&py_path, skill_name, msg).await
+    }
+
+    /// Execute a SKILL.md script directly.
+    async fn execute_skill_markdown(
+        &mut self,
+        skill_name: &str,
+        msg: &InboundMessage,
+    ) -> Result<String> {
+        let md_path = self.resolve_skill_script_path(skill_name, "SKILL.md")?;
+        self.run_markdown_script(&md_path, skill_name, msg).await
+    }
+
+    /// Helper: run a SKILL.md-only skill by routing the message back through the
+    /// normal LLM pipeline, but forcing skill matching via the skill's first trigger.
+    async fn run_markdown_script(
+        &mut self,
+        md_path: &std::path::Path,
+        skill_name: &str,
+        msg: &InboundMessage,
+    ) -> Result<String> {
+        let skill = self
+            .context_builder
+            .skill_manager()
+            .and_then(|sm| sm.get(skill_name))
+            .ok_or_else(|| {
+                blockcell_core::Error::Skill(format!("Skill '{}' not found", skill_name))
+            })?;
+
+        if !md_path.exists() {
+            return Err(blockcell_core::Error::Skill(format!(
+                "SKILL.md not found for skill '{}'",
+                skill_name
+            )));
+        }
+
+        let trigger = skill
+            .meta
+            .triggers
+            .first()
+            .cloned()
+            .unwrap_or_else(|| skill_name.to_string());
+
+        let mut routed_msg = msg.clone();
+        routed_msg.content = if msg.content.trim().is_empty() {
+            trigger
+        } else {
+            format!("{}\n{}", trigger, msg.content)
+        };
+
+        let metadata = if routed_msg.metadata.is_object() {
+            routed_msg.metadata.as_object_mut()
+        } else {
+            routed_msg.metadata = serde_json::json!({});
+            routed_msg.metadata.as_object_mut()
+        };
+        if let Some(obj) = metadata {
+            obj.remove("skill_script");
+            obj.remove("skill_script_kind");
+            obj.remove("skill_markdown");
+            obj.insert("forced_skill_name".to_string(), serde_json::json!(skill_name));
+        }
+
+        info!(skill = %skill_name, "SKILL.md execution routed through normal LLM skill flow");
+        Box::pin(self.process_message(routed_msg)).await
     }
 
     /// Helper: run a single .rhai script file with tool execution support.

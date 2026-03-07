@@ -16,7 +16,7 @@ impl Tool for CameraCaptureTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "camera_capture",
-            description: "Capture a photo from a connected camera (macOS). Actions: 'list' to list available cameras, 'capture' to take a photo, 'info' to get camera info.",
+            description: "Capture photos from a connected camera on macOS. You MUST provide `action`. action='list'|'info': no extra params. action='capture': optional `device_index`, optional `output_path`, optional `format`; use `device_index` after calling `list`.",
             parameters: json!({
                 "type": "object",
                 "properties": {

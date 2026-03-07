@@ -1,5 +1,5 @@
 use blockcell_core::types::ChatMessage;
-use blockcell_core::{Paths, Result};
+use blockcell_core::{session_file_stem, session_id_from_file_stem, Paths, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -151,7 +151,8 @@ impl SessionStore {
     /// `content` is the user's first message; we take the first ~30 chars as the name.
     pub fn set_session_name_if_new(&self, session_key: &str, content: &str) -> Option<String> {
         let meta_path = self.paths.sessions_dir().join("_meta.json");
-        let file_key = session_key.replace(':', "_");
+        let full = session_file_stem(session_key);
+        let file_key = session_id_from_file_stem(&full);
 
         let mut meta: serde_json::Map<String, serde_json::Value> = if meta_path.exists() {
             std::fs::read_to_string(&meta_path)

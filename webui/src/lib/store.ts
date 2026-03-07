@@ -58,9 +58,9 @@ function nextMsgId() {
 }
 
 function resolveInitialSessionId(agentId: string): string {
-  if (typeof window === 'undefined') return 'ws_default';
+  if (typeof window === 'undefined') return 'default';
   const saved = localStorage.getItem(sessionStorageKey(agentId));
-  return saved || `ws_${agentId}_${Date.now()}`;
+  return saved || `${agentId}_${Date.now()}`;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({

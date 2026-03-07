@@ -12,7 +12,7 @@ impl Tool for EmailTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "email",
-            description: "Send and receive emails via SMTP/IMAP. Supports sending with attachments, reading inbox, searching emails, and parsing attachments. Configure SMTP/IMAP credentials in the agent config or pass them as parameters.",
+            description: "Email via SMTP/IMAP. You MUST provide `action`. action='send': requires mail account credentials plus `from`, `to`, `subject`, and at least one of `body` or `html_body`; optional `cc` and `attachments`. action='list': requires IMAP credentials, optional `folder` and `limit`. action='read': requires IMAP credentials and `uid`, optional `folder` and `save_attachments_to`. action='search': requires IMAP credentials and `query`, optional `folder`.",
             parameters: json!({
                 "type": "object",
                 "properties": {

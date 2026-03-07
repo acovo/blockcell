@@ -517,7 +517,6 @@ fn default_intent_router_profiles() -> HashMap<String, IntentToolProfileConfig> 
                 (
                     "Organization".to_string(),
                     IntentToolEntryConfig::Tools(vec![
-                        "calendar_api".to_string(),
                         "cron".to_string(),
                         "memory_forget".to_string(),
                         "knowledge_graph".to_string(),

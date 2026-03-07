@@ -11,7 +11,7 @@ impl Tool for ToggleManageTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "toggle_manage",
-            description: "Manage enable/disable state of skills and tools. This tool does NOT run or execute skills — use exec or the skill directly for that. action='list': show current toggle states. action='set': enable or disable a skill/tool by name.",
+            description: "Manage enable/disable state of skills and tools. You MUST provide `action`. action='list': no extra params, returns current toggle states. action='set': requires `category`, `name`, and `enabled`. `category` must be 'skills' or 'tools'. This tool does NOT execute the skill/tool itself.",
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -10,10 +10,44 @@ import { useAgentStore } from '@/lib/store';
 export function MarkdownContent({ content }: { content: string }) {
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   return (
-    <div className="prose prose-sm dark:prose-invert max-w-none">
+    <div className="prose prose-sm dark:prose-invert max-w-none prose-blockcell">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
+          h1({ children }) {
+            return <h1 className="mt-1 mb-3 text-base font-semibold text-rust tracking-tight">{children}</h1>;
+          },
+          h2({ children }) {
+            return <h2 className="mt-4 mb-2 text-[0.95rem] font-semibold text-cyber tracking-tight">{children}</h2>;
+          },
+          h3({ children }) {
+            return <h3 className="mt-3 mb-2 text-sm font-semibold text-foreground">{children}</h3>;
+          },
+          p({ children }) {
+            return <p className="my-2 leading-7 text-foreground/95">{children}</p>;
+          },
+          ul({ children }) {
+            return <ul className="my-2 space-y-1">{children}</ul>;
+          },
+          ol({ children }) {
+            return <ol className="my-2 space-y-1">{children}</ol>;
+          },
+          li({ children }) {
+            return <li className="marker:text-rust">{children}</li>;
+          },
+          blockquote({ children }) {
+            return (
+              <blockquote className="my-3 rounded-r-md border-l-4 border-cyber/50 bg-cyber/5 px-4 py-2 text-foreground/90">
+                {children}
+              </blockquote>
+            );
+          },
+          hr() {
+            return <hr className="my-4 border-border/80" />;
+          },
+          strong({ children }) {
+            return <strong className="font-semibold text-rust">{children}</strong>;
+          },
           code({ node, className, children, ...props }) {
             const match = /language-(\w+)/.exec(className || '');
             const codeStr = String(children).replace(/\n$/, '');
@@ -44,6 +78,13 @@ export function MarkdownContent({ content }: { content: string }) {
                 className="max-w-full max-h-[300px] object-contain rounded-lg border border-border my-2"
                 loading="lazy"
               />
+            );
+          },
+          table({ children }) {
+            return (
+              <div className="my-3 overflow-x-auto rounded-lg border border-border/70">
+                <table>{children}</table>
+              </div>
             );
           },
         }}

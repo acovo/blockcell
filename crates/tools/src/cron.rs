@@ -249,7 +249,7 @@ impl Tool for CronTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "cron",
-            description: "Manage scheduled tasks (cron jobs). Use this to set reminders, schedule recurring tasks, or run one-time delayed tasks. The agent's CronService will pick up changes automatically.",
+            description: "Manage scheduled tasks (cron jobs). You MUST provide `action`. action='add': requires `name` + `message` and exactly one schedule field from `delay_seconds`, `at_ms`, `every_seconds`, or `cron_expr`; optional `delete_after_run` and `skill_name`. action='list': no extra params. action='remove': requires `job_id`.",
             parameters: json!({
                 "type": "object",
                 "properties": {

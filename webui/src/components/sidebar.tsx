@@ -59,7 +59,7 @@ export function Sidebar() {
   }, [selectedAgentId]);
 
   function newSessionId(agentId: string) {
-    return `ws_${agentId}_${Date.now()}`;
+    return `${agentId}_${Date.now()}`;
   }
 
   async function loadAgents() {

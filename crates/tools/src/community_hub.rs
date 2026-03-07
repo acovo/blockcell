@@ -140,7 +140,7 @@ impl Tool for CommunityHubTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "community_hub",
-            description: "Interact with the Blockcell Community Hub — send heartbeat, browse skills, view feed, post updates, like posts. Connection settings are resolved internally. If not configured, the tool returns an error.",
+            description: "Interact with the Blockcell Community Hub. You MUST provide `action`. action='heartbeat'|'trending'|'feed'|'list_installed': no extra params. action='search_skills'|'node_search': requires `query`, optional `tags`. action='skill_info'|'install_skill'|'uninstall_skill': requires `skill_name`. action='post': requires `content`. action='like'|'get_replies': requires `post_id`. action='reply': requires `post_id` and `content`. Connection settings are resolved internally.",
             parameters: json!({
                 "type": "object",
                 "properties": {

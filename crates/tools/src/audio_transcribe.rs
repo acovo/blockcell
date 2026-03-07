@@ -18,7 +18,7 @@ impl Tool for AudioTranscribeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "audio_transcribe",
-            description: "Transcribe audio/video files to text. Actions: 'transcribe' converts speech to text, 'info' checks available backends, 'extract_audio' extracts audio track from video.",
+            description: "Transcribe audio/video files. You MUST provide `action`. action='info': no extra params. action='transcribe': requires `path`, optional `output_path`, `language`, `model`, `backend`, and `format`. action='extract_audio': requires `path`, optional `output_path` and `format`.",
             parameters: json!({
                 "type": "object",
                 "properties": {

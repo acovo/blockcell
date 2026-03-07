@@ -45,7 +45,7 @@ impl Tool for EncryptTool {
 
         ToolSchema {
             name: "encrypt",
-            description: "Encryption, hashing, and security utilities. Encrypt/decrypt files with AES-256-GCM, generate secure passwords and keys, compute file/text hashes (SHA-256/SHA-512/MD5), and encode/decode data (Base64/hex/URL). All crypto operations use the system's secure random number generator.",
+            description: "Encryption, hashing, and encoding utilities. You MUST provide `action`. action='encrypt_file'|'decrypt_file': requires `path` and either `password` or `key`, optional `output_path`. action='generate_password': optional `length`, `charset`, `exclude_chars`. action='generate_key': optional `bits`. action='hash_file': requires `path`, optional `algorithm`. action='hash_text': requires `text`, optional `algorithm`. action='encode'|'decode': requires `text`, optional `encoding`. action='checksum_verify': requires `path` and `expected_hash`, optional `algorithm`.",
             parameters: json!({
                 "type": "object",
                 "properties": Value::Object(props),
