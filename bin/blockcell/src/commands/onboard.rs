@@ -67,47 +67,64 @@ const EXAMPLE_CONFIG: &str = r#"{
   "providers": {
     "openrouter": {
       "apiKey": "",
-      "apiBase": "https://openrouter.ai/api/v1"
+      "apiBase": "https://openrouter.ai/api/v1",
+      "apiType": "openai"
     },
     "anthropic": {
       "apiKey": "",
-      "apiBase": "https://api.anthropic.com"
+      "apiBase": "https://api.anthropic.com",
+      "apiType": "anthropic"
     },
     "openai": {
       "apiKey": "",
-      "apiBase": "https://api.openai.com/v1"
+      "apiBase": "https://api.openai.com/v1",
+      "proxy": null,
+      "apiType": "openai_responses"
     },
     "deepseek": {
       "apiKey": "",
-      "apiBase": "https://api.deepseek.com/v1"
+      "apiBase": "https://api.deepseek.com/v1",
+      "apiType": "openai"
     },
     "gemini": {
       "apiKey": "",
-      "apiBase": "https://generativelanguage.googleapis.com"
+      "apiBase": "https://generativelanguage.googleapis.com",
+      "apiType": "openai"
     },
     "kimi": {
       "apiKey": "",
-      "apiBase": "https://api.moonshot.cn/v1"
+      "apiBase": "https://api.moonshot.cn/v1",
+      "apiType": "openai"
     },
     "groq": {
       "apiKey": "",
-      "apiBase": "https://api.groq.com/openai/v1"
+      "apiBase": "https://api.groq.com/openai/v1",
+      "apiType": "openai"
     },
     "zhipu": {
       "apiKey": "",
-      "apiBase": "https://open.bigmodel.cn/api/paas/v4"
+      "apiBase": "https://open.bigmodel.cn/api/paas/v4",
+      "apiType": "openai"
     },
     "ollama": {
       "apiKey": "",
-      "apiBase": "http://localhost:11434"
+      "apiBase": "http://localhost:11434",
+      "apiType": "ollama"
     }
   },
   "agents": {
     "defaults": {
-      "model": "anthropic/claude-sonnet-4-20250514",
       "maxTokens": 8192,
       "temperature": 0.7,
-      "maxToolIterations": 20
+      "maxToolIterations": 20,
+      "modelPool": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-chat",
+          "weight": 1,
+          "priority": 1
+        }
+      ]
     }
   },
   "gateway": {
@@ -268,13 +285,23 @@ pub async fn run(
             json["providers"][prov]["apiKey"] = serde_json::json!(key);
         }
 
-        // Set model
-        if let Some(ref m) = model {
-            json["agents"]["defaults"]["model"] = serde_json::json!(m);
+        let selected_model = if let Some(ref m) = model {
+            m.clone()
         } else {
-            // Set a sensible default model for the provider
-            let default_model = default_model_for_provider(prov);
-            json["agents"]["defaults"]["model"] = serde_json::json!(default_model);
+            default_model_for_provider(prov).to_string()
+        };
+
+        json["agents"]["defaults"]["modelPool"] = serde_json::json!([
+            {
+                "provider": prov,
+                "model": selected_model,
+                "weight": 1,
+                "priority": 1
+            }
+        ]);
+        if let Some(defaults) = json["agents"]["defaults"].as_object_mut() {
+            defaults.remove("model");
+            defaults.remove("provider");
         }
 
         if let Some(parent) = paths.config_file().parent() {
@@ -288,7 +315,9 @@ pub async fn run(
         }
         println!(
             "  ✓ Model: {}",
-            json["agents"]["defaults"]["model"].as_str().unwrap_or("?")
+            json["agents"]["defaults"]["modelPool"][0]["model"]
+                .as_str()
+                .unwrap_or("?")
         );
         println!("✓ Config: {}", paths.config_file().display());
         println!();
@@ -361,7 +390,7 @@ pub async fn run(
     println!();
     println!("Quick setup examples:");
     println!("  blockcell onboard --provider deepseek --api-key sk-xxx --model deepseek-chat");
-    println!("  blockcell onboard --provider kimi --api-key sk-xxx --model moonshot-v1-8k");
+    println!("  blockcell onboard --provider kimi --api-key sk-xxx --model kimi-k2.5");
     println!("  blockcell onboard --provider openai --api-key sk-xxx");
 
     Ok(())
@@ -401,7 +430,7 @@ fn default_model_for_provider(provider: &str) -> &'static str {
         "deepseek" => "deepseek-chat",
         "openai" => "gpt-4o",
         "anthropic" => "claude-sonnet-4-20250514",
-        "kimi" | "moonshot" => "moonshot-v1-8k",
+        "kimi" | "moonshot" => "kimi-k2.5",
         "gemini" => "gemini-1.5-flash",
         "groq" => "llama-3.1-70b-versatile",
         "zhipu" => "glm-4",

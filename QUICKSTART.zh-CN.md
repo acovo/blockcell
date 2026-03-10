@@ -39,7 +39,7 @@ blockcell setup
 
 它会自动创建 `~/.blockcell/`、写入 provider 配置，也可以顺手帮你启用一个外部渠道。
 
-最小示例（`~/.blockcell/config.json`）：
+最小示例（`~/.blockcell/config.json5`）：
 
 ```json
 {

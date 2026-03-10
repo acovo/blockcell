@@ -39,7 +39,7 @@ blockcell setup
 
 That creates `~/.blockcell/`, saves provider settings, and can also enable one external channel for you.
 
-Minimal example (`~/.blockcell/config.json`):
+Minimal example (`~/.blockcell/config.json5`):
 
 ```json
 {

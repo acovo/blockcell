@@ -32,7 +32,7 @@ enum Commands {
         /// API key for the provider
         #[arg(long, name = "api-key")]
         api_key: Option<String>,
-        /// Model name (e.g. deepseek-chat, moonshot-v1-8k)
+        /// Model name (e.g. deepseek-chat, kimi-k2.5)
         #[arg(long)]
         model: Option<String>,
         /// Only update channel configuration, skip provider setup

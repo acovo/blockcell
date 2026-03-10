@@ -16,7 +16,6 @@ pub struct OpenAIResponsesProvider {
     api_base: String,
     model: String,
     max_tokens: u32,
-    temperature: f32,
 }
 
 impl OpenAIResponsesProvider {
@@ -56,7 +55,7 @@ impl OpenAIResponsesProvider {
         api_base: Option<&str>,
         model: &str,
         max_tokens: u32,
-        temperature: f32,
+        _temperature: f32,
         provider_proxy: Option<&str>,
         global_proxy: Option<&str>,
         no_proxy: &[String],
@@ -78,7 +77,6 @@ impl OpenAIResponsesProvider {
             api_base: resolved_base,
             model: model.to_string(),
             max_tokens,
-            temperature,
         }
     }
 
@@ -271,7 +269,6 @@ impl OpenAIResponsesProvider {
             model: self.model.clone(),
             input: Self::build_input(messages),
             tools: Self::build_tools(tools),
-            temperature: self.temperature,
             max_output_tokens: self.max_tokens,
         };
 
@@ -440,7 +437,6 @@ struct ResponsesRequest {
     input: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
-    temperature: f32,
     max_output_tokens: u32,
 }
 
