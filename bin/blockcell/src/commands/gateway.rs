@@ -24,7 +24,7 @@ use blockcell_scheduler::{
 };
 use blockcell_skills::{new_registry_handle, CoreEvolution};
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig};
-use blockcell_storage::{MemoryStore, SessionStore};
+use blockcell_storage::{MemoryStore};
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
     build_tool_registry_for_agent_config, build_tool_registry_with_all_mcp,
