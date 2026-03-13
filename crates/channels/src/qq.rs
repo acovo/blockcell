@@ -3,16 +3,50 @@ use blockcell_core::{Config, Error, InboundMessage, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_SANDBOX_API_BASE: &str = "https://sandbox.api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
+
+// ---------------------------------------------------------------------------
+// Global state for webhook-based channel (shared across all instances)
+// ---------------------------------------------------------------------------
+
+/// Cached token with expiry time
+#[derive(Default)]
+struct CachedToken {
+    token: String,
+    expires_at: u64,
+}
+
+impl CachedToken {
+    fn is_valid(&self) -> bool {
+        if self.token.is_empty() {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now < self.expires_at.saturating_sub(300) // Refresh 5 minutes before expiry
+    }
+}
+
+static DEDUP_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static TOKEN_CACHE: OnceLock<Mutex<HashMap<String, CachedToken>>> = OnceLock::new();
+
+fn dedup_cache() -> &'static Mutex<HashSet<String>> {
+    DEDUP_CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn token_cache() -> &'static Mutex<HashMap<String, CachedToken>> {
+    TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QQEnvironment {
@@ -58,8 +92,6 @@ pub struct QQChannel {
     client: Client,
     inbound_tx: mpsc::Sender<InboundMessage>,
     environment: QQEnvironment,
-    token_cache: Arc<RwLock<Option<(String, u64)>>>,
-    dedup: Arc<RwLock<HashSet<String>>>,
 }
 
 impl QQChannel {
@@ -67,7 +99,7 @@ impl QQChannel {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
-            .expect("Failed to create HTTP client");
+            .unwrap_or_else(|_| Client::new());
 
         let environment = QQEnvironment::from_str(&config.channels.qq.environment);
 
@@ -76,8 +108,6 @@ impl QQChannel {
             client,
             inbound_tx,
             environment,
-            token_cache: Arc::new(RwLock::new(None)),
-            dedup: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -98,24 +128,23 @@ impl QQChannel {
 
     #[allow(dead_code)]
     async fn get_access_token(&self) -> Result<String> {
-        let mut cache = self.token_cache.write().await;
+        let app_id = self.config.channels.qq.app_id.clone();
+        let cache = token_cache();
+        let mut cache_guard = cache.lock().await;
 
-        if let Some((token, expiry)) = cache.as_ref() {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            if now < *expiry {
-                return Ok(token.clone());
+        // Check if we have a valid cached token
+        if let Some(cached) = cache_guard.get(&app_id) {
+            if cached.is_valid() {
+                return Ok(cached.token.clone());
             }
         }
 
+        // Fetch new token
         let response = self
             .client
             .post(QQ_AUTH_URL)
             .json(&json!({
-                "appId": self.config.channels.qq.app_id,
+                "appId": &app_id,
                 "clientSecret": self.config.channels.qq.app_secret,
             }))
             .send()
@@ -138,20 +167,23 @@ impl QQChannel {
             Error::Channel("QQ auth response missing token data".to_string())
         })?;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
             .as_secs();
 
-        let expiry = now + token_data.expires_in - 300; // Refresh 5 minutes before expiry
+        let expires_at = now + token_data.expires_in;
 
-        *cache = Some((token_data.access_token.clone(), expiry));
+        cache_guard.insert(app_id.clone(), CachedToken {
+            token: token_data.access_token.clone(),
+            expires_at,
+        });
 
         Ok(token_data.access_token)
     }
 
-    async fn is_duplicate(&self, msg_id: &str) -> bool {
-        let mut dedup = self.dedup.write().await;
+    async fn is_duplicate(msg_id: &str) -> bool {
+        let mut dedup = dedup_cache().lock().await;
         if dedup.contains(msg_id) {
             return true;
         }
@@ -159,7 +191,7 @@ impl QQChannel {
         // Evict half if at capacity
         if dedup.len() >= 10_000 {
             let to_remove = dedup.len() / 2;
-            for key in dedup.iter().take(to_remove).map(|k| k.clone()).collect::<Vec<_>>() {
+            for key in dedup.iter().take(to_remove).cloned().collect::<Vec<_>>() {
                 dedup.remove(&key);
             }
         }
@@ -233,7 +265,7 @@ impl QQChannel {
     async fn handle_c2c_message(&self, payload: &Value) -> Result<()> {
         let msg_id = Self::extract_message_id(payload);
 
-        if self.is_duplicate(&msg_id).await {
+        if Self::is_duplicate(&msg_id).await {
             debug!("Duplicate C2C message, ignoring: {}", msg_id);
             return Ok(());
         }
@@ -286,7 +318,7 @@ impl QQChannel {
     async fn handle_group_at_message(&self, payload: &Value) -> Result<()> {
         let msg_id = Self::extract_message_id(payload);
 
-        if self.is_duplicate(&msg_id).await {
+        if Self::is_duplicate(&msg_id).await {
             debug!("Duplicate group AT message, ignoring: {}", msg_id);
             return Ok(());
         }
@@ -507,6 +539,17 @@ async fn get_access_token_internal(
     app_id: &str,
     app_secret: &str,
 ) -> Result<String> {
+    let cache = token_cache();
+    let mut cache_guard = cache.lock().await;
+
+    // Check if we have a valid cached token
+    if let Some(cached) = cache_guard.get(app_id) {
+        if cached.is_valid() {
+            return Ok(cached.token.clone());
+        }
+    }
+
+    // Fetch new token
     let response = client
         .post(QQ_AUTH_URL)
         .json(&json!({
@@ -532,6 +575,18 @@ async fn get_access_token_internal(
     let token_data = qq_response.data.ok_or_else(|| {
         Error::Channel("QQ auth response missing token data".to_string())
     })?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let expires_at = now + token_data.expires_in;
+
+    cache_guard.insert(app_id.to_string(), CachedToken {
+        token: token_data.access_token.clone(),
+        expires_at,
+    });
 
     Ok(token_data.access_token)
 }
@@ -661,4 +716,116 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_qq_environment_from_str() {
+        assert_eq!(QQEnvironment::from_str("production"), QQEnvironment::Production);
+        assert_eq!(QQEnvironment::from_str("PRODUCTION"), QQEnvironment::Production);
+        assert_eq!(QQEnvironment::from_str("sandbox"), QQEnvironment::Sandbox);
+        assert_eq!(QQEnvironment::from_str("SANDBOX"), QQEnvironment::Sandbox);
+        assert_eq!(QQEnvironment::from_str("unknown"), QQEnvironment::Production);
+    }
+
+    #[test]
+    fn test_qq_environment_api_base() {
+        assert_eq!(QQEnvironment::Production.api_base(), QQ_API_BASE);
+        assert_eq!(QQEnvironment::Sandbox.api_base(), QQ_SANDBOX_API_BASE);
+    }
+
+    #[test]
+    fn test_extract_message_id() {
+        let payload = json!({"id": "msg123"});
+        assert_eq!(QQChannel::extract_message_id(&payload), "msg123");
+
+        let payload = json!({"msg_id": "msg456"});
+        assert_eq!(QQChannel::extract_message_id(&payload), "msg456");
+
+        // id takes precedence over msg_id
+        let payload = json!({"id": "msg789", "msg_id": "msg000"});
+        assert_eq!(QQChannel::extract_message_id(&payload), "msg789");
+
+        let payload = json!({});
+        assert_eq!(QQChannel::extract_message_id(&payload), "");
+    }
+
+    #[test]
+    fn test_compose_message_content_text_only() {
+        let payload = json!({"content": "Hello World"});
+        let result = QQChannel::compose_message_content(&payload);
+        assert_eq!(result, Some("Hello World".to_string()));
+    }
+
+    #[test]
+    fn test_compose_message_content_empty() {
+        let payload = json!({});
+        let result = QQChannel::compose_message_content(&payload);
+        assert_eq!(result, None);
+
+        let payload = json!({"content": "   "});
+        let result = QQChannel::compose_message_content(&payload);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_compose_message_content_with_image_attachment() {
+        let payload = json!({
+            "content": "Check this image",
+            "attachments": [{
+                "url": "https://example.com/image.png",
+                "content_type": "image/png",
+                "filename": "test.png"
+            }]
+        });
+        let result = QQChannel::compose_message_content(&payload).unwrap();
+        assert!(result.contains("Check this image"));
+        assert!(result.contains("[IMAGE:https://example.com/image.png]"));
+    }
+
+    #[test]
+    fn test_compose_message_content_image_only() {
+        let payload = json!({
+            "content": "",
+            "attachments": [{
+                "url": "https://example.com/photo.jpg",
+                "content_type": "image/jpeg",
+                "filename": "photo.jpg"
+            }]
+        });
+        let result = QQChannel::compose_message_content(&payload).unwrap();
+        assert_eq!(result, "[IMAGE:https://example.com/photo.jpg]");
+    }
+
+    #[test]
+    fn test_cached_token_is_valid() {
+        // Empty token is invalid
+        let token = CachedToken::default();
+        assert!(!token.is_valid());
+
+        // Token expiring in 10 minutes is valid
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let token = CachedToken {
+            token: "test_token".to_string(),
+            expires_at: now + 600, // 10 minutes
+        };
+        assert!(token.is_valid());
+
+        // Token expired 1 minute ago is invalid
+        let token = CachedToken {
+            token: "test_token".to_string(),
+            expires_at: now + 200, // Will be invalid due to 300s margin
+        };
+        assert!(!token.is_valid());
+    }
 }
