@@ -625,11 +625,16 @@ pub async fn run(
         });
 
         // Split outbound: channel messages go to ChannelManager, CLI messages go to printer
+        // Note: "cli" messages are already printed via streaming events (token + message_done),
+        // so we skip them here to avoid duplicate output.
         let (printer_tx, mut printer_rx) = mpsc::channel(100);
         let outbound_dispatch_handle = tokio::spawn(async move {
             while let Some(msg) = outbound_rx.recv().await {
                 match msg.channel.as_str() {
-                    "cli" | "cron" => {
+                    "cli" => {
+                        // Skip: already printed via streaming events
+                    }
+                    "cron" => {
                         let _ = printer_tx.send(msg).await;
                     }
                     _ => {
