@@ -1,3 +1,4 @@
+use anyhow::Context;
 use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, ConfirmRequest, CoreEvolutionAdapter,
     MemoryStoreAdapter, MessageBus, ProviderLLMBridge, SkillScriptKind, TaskManager,
@@ -24,14 +25,13 @@ use blockcell_scheduler::{
 };
 use blockcell_skills::{new_registry_handle, CoreEvolution};
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig};
-use blockcell_storage::{MemoryStore};
+use blockcell_storage::MemoryStore;
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
     build_tool_registry_for_agent_config, build_tool_registry_with_all_mcp,
     CapabilityRegistryHandle, CoreEvolutionHandle, EventEmitterHandle, MemoryStoreHandle,
     ToolRegistry,
 };
-use anyhow::Context;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -790,9 +790,12 @@ fn parse_env_assignment(line: &str) -> Option<(String, String)> {
 }
 
 fn ensure_and_load_gateway_env(paths: &Paths) -> anyhow::Result<()> {
-    paths
-        .ensure_dirs()
-        .with_context(|| format!("failed to create blockcell dirs at {}", paths.base.display()))?;
+    paths.ensure_dirs().with_context(|| {
+        format!(
+            "failed to create blockcell dirs at {}",
+            paths.base.display()
+        )
+    })?;
 
     let env_path = paths.env_file();
     if !env_path.exists() {

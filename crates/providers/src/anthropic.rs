@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use blockcell_core::types::{ChatMessage, LLMResponse, StreamChunk, ToolCallAccumulator, ToolCallRequest};
+use blockcell_core::types::{
+    ChatMessage, LLMResponse, StreamChunk, ToolCallAccumulator, ToolCallRequest,
+};
 use blockcell_core::{Error, Result};
 use futures::StreamExt;
 use reqwest::Client;
@@ -543,7 +545,9 @@ impl Provider for AnthropicProvider {
                                 }
 
                                 // 解析 Anthropic 流式事件
-                                if let Ok(event) = serde_json::from_str::<AnthropicStreamEvent>(data) {
+                                if let Ok(event) =
+                                    serde_json::from_str::<AnthropicStreamEvent>(data)
+                                {
                                     match event.event_type.as_str() {
                                         "content_block_delta" => {
                                             if let Some(delta) = &event.delta {
@@ -560,10 +564,16 @@ impl Provider for AnthropicProvider {
                                                     }
                                                     "input_json_delta" => {
                                                         // 工具调用参数增量 - 使用 event.index 直接定位
-                                                        if let (Some(partial), Some(idx)) = (&delta.partial_json, event.index) {
+                                                        if let (Some(partial), Some(idx)) =
+                                                            (&delta.partial_json, event.index)
+                                                        {
                                                             // 使用事件的 index 字段直接查找对应的工具
-                                                            if let Some(tool_id) = tool_index_to_id.get(&idx) {
-                                                                if let Some(acc) = tool_calls.get_mut(tool_id) {
+                                                            if let Some(tool_id) =
+                                                                tool_index_to_id.get(&idx)
+                                                            {
+                                                                if let Some(acc) =
+                                                                    tool_calls.get_mut(tool_id)
+                                                                {
                                                                     acc.arguments.push_str(partial);
                                                                     let _ = tx
                                                                         .send(StreamChunk::ToolCallDelta {
@@ -584,18 +594,23 @@ impl Provider for AnthropicProvider {
                                             if let Some(content_block) = &event.content_block {
                                                 match content_block.block_type.as_str() {
                                                     "tool_use" => {
-                                                        if let (Some(id), Some(name), Some(idx)) =
-                                                            (&content_block.id, &content_block.name, event.index)
-                                                        {
+                                                        if let (Some(id), Some(name), Some(idx)) = (
+                                                            &content_block.id,
+                                                            &content_block.name,
+                                                            event.index,
+                                                        ) {
                                                             // 建立 index -> id 映射
-                                                            tool_index_to_id.insert(idx, id.clone());
+                                                            tool_index_to_id
+                                                                .insert(idx, id.clone());
 
                                                             let acc = tool_calls
                                                                 .entry(id.clone())
-                                                                .or_insert_with(|| ToolCallAccumulator {
-                                                                    id: id.clone(),
-                                                                    name: name.clone(),
-                                                                    arguments: String::new(),
+                                                                .or_insert_with(|| {
+                                                                    ToolCallAccumulator {
+                                                                        id: id.clone(),
+                                                                        name: name.clone(),
+                                                                        arguments: String::new(),
+                                                                    }
                                                                 });
                                                             acc.id = id.clone();
                                                             acc.name = name.clone();

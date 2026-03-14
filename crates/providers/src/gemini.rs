@@ -536,7 +536,8 @@ impl Provider for GeminiProvider {
                                 }
 
                                 // 解析 Gemini 流式响应
-                                if let Ok(resp) = serde_json::from_str::<GeminiStreamResponse>(data) {
+                                if let Ok(resp) = serde_json::from_str::<GeminiStreamResponse>(data)
+                                {
                                     // 处理 usage metadata
                                     if let Some(meta) = &resp.usage_metadata {
                                         usage = serde_json::json!({
@@ -578,12 +579,9 @@ impl Provider for GeminiProvider {
                                                         let idx = tool_call_index;
                                                         tool_call_index += 1;
 
-                                                        let args = fc
-                                                            .args
-                                                            .clone()
-                                                            .unwrap_or(Value::Object(
-                                                                serde_json::Map::new(),
-                                                            ));
+                                                        let args = fc.args.clone().unwrap_or(
+                                                            Value::Object(serde_json::Map::new()),
+                                                        );
 
                                                         let _ = tx
                                                             .send(StreamChunk::ToolCallStart {
@@ -593,9 +591,8 @@ impl Provider for GeminiProvider {
                                                             })
                                                             .await;
 
-                                                        let args_str =
-                                                            serde_json::to_string(&args)
-                                                                .unwrap_or_default();
+                                                        let args_str = serde_json::to_string(&args)
+                                                            .unwrap_or_default();
                                                         let _ = tx
                                                             .send(StreamChunk::ToolCallDelta {
                                                                 index: idx,
