@@ -499,7 +499,7 @@ fn default_api_base_for_provider(provider: &str) -> Option<&'static str> {
         "kimi" => Some("https://api.moonshot.cn/v1"),
         "gemini" => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
         "zhipu" => Some("https://open.bigmodel.cn/api/paas/v4"),
-        "minimax" => Some("https://api.minimax.chat/v1"),
+        "minimax" => Some("https://api.minimaxi.com/v1"),
         "ollama" => Some("http://localhost:11434"),
         _ => None,
     }

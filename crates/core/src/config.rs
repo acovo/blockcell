@@ -1388,7 +1388,7 @@ impl Default for Config {
             "minimax".to_string(),
             ProviderConfig {
                 api_key: String::new(),
-                api_base: Some("https://api.minimax.chat/v1".to_string()),
+                api_base: Some("https://api.minimaxi.com/v1".to_string()),
                 proxy: None,
                 api_type: "anthropic".to_string(),
             },

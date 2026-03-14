@@ -25,7 +25,7 @@ const KNOWN_PROVIDERS: KnownProvider[] = [
   { id: 'deepseek',     label: 'DeepSeek',             defaultBase: 'https://api.deepseek.com/v1',                        models: ['deepseek-chat', 'deepseek-reasoner'],                                     keyHint: 'sk-...' },
   { id: 'xai',          label: 'xAI (Grok)',           defaultBase: 'https://api.x.ai/v1',                                models: ['grok-beta', 'grok-vision-beta'],              keyHint: 'xai-...' },
   { id: 'mistral',      label: 'Mistral',              defaultBase: 'https://api.mistral.ai/v1',                          models: ['mistral-large-latest', 'mistral-small-latest'],              keyHint: '...' },
-  { id: 'minimax',      label: 'MiniMax',              defaultBase: 'https://api.minimax.chat/v1',                        models: ['m2.5', 'm2.1'],              keyHint: '...' },
+  { id: 'minimax',      label: 'MiniMax',              defaultBase: 'https://api.minimaxi.com/v1',                        models: ['m2.5', 'm2.1'],              keyHint: '...' },
   { id: 'qwen',         label: 'Qwen (千问)',          defaultBase: 'https://api.qwen.ai/v1',                             models: ['coder-model', 'vision-model'],              keyHint: 'sk-...' },
   { id: 'glm',          label: 'Z.AI (GLM)',           defaultBase: 'https://api.z.ai/v1',                                models: ['glm-4.7', 'glm-5'],              keyHint: '...' },
   { id: 'groq',         label: 'Groq',                 defaultBase: 'https://api.groq.com/openai/v1',                     models: ['llama-3.3-70b-versatile', 'mixtral-8x7b-32768'],              keyHint: 'gsk_...' },
