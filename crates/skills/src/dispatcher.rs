@@ -658,7 +658,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(result.success);
+        assert!(result.success, "weather result: {:?}", result.output);
         assert_eq!(result.output, Value::String("Hello, world".to_string()));
     }
 
@@ -683,7 +683,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(result.success);
+        assert!(result.success, "weather result: {:?}", result.output);
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].tool_name, "read_file");
         assert!(result.tool_calls[0].success);
@@ -707,7 +707,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(result.success);
+        assert!(result.success, "weather result: {:?}", result.output);
         assert_eq!(
             result.output,
             Value::String("Tool failed, using fallback".to_string())
@@ -735,7 +735,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(result.success);
+        assert!(result.success, "weather result: {:?}", result.output);
         assert_eq!(
             result.output,
             Value::String("Using front_camera at 1080p".to_string())
@@ -861,9 +861,66 @@ mod tests {
             })
             .expect("weather skill should execute");
 
-        assert!(result.success);
+        assert!(result.success, "weather result: {:?}", result.output);
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.output["success"].as_bool(), Some(true));
         assert_eq!(result.output["source"].as_str(), Some("wttr.in"));
+    }
+
+    #[test]
+    fn test_weather_skill_script_returns_direct_text_for_tomorrow_query() {
+        let dispatcher = SkillDispatcher::new();
+        let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills/weather/SKILL.rhai");
+        let script = fs::read_to_string(&script_path).expect("read weather skill script");
+
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "ctx".to_string(),
+            serde_json::json!({
+                "user_input": "深圳明天的天气怎么样",
+            }),
+        );
+
+        let result = dispatcher
+            .execute_sync(&script, "深圳明天的天气怎么样", ctx, |name, params| {
+                assert_eq!(name, "web_fetch");
+                let url = params
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                if url.contains("format=j1") {
+                    Ok(serde_json::json!({
+                        "text": r#"{
+                            "current_condition":[{"temp_C":"25","FeelsLikeC":"27","humidity":"61","windspeedKmph":"8","winddir16Point":"SE","weatherDesc":[{"value":"Sunny"}],"uvIndex":"5","visibility":"10","pressure":"1016","localObsDateTime":"2026-03-16 06:40 PM"}],
+                            "weather":[
+                                {"date":"2026-03-16","maxtempC":"28","mintempC":"22","hourly":[{"weatherDesc":[{"value":"Sunny"}]}]},
+                                {"date":"2026-03-17","maxtempC":"29","mintempC":"23","hourly":[{"weatherDesc":[{"value":"Partly cloudy"}]}]},
+                                {"date":"2026-03-18","maxtempC":"27","mintempC":"21","hourly":[{"weatherDesc":[{"value":"Cloudy"}]}]}
+                            ],
+                            "nearest_area":[{"areaName":[{"value":"Shenzhen"}]}]
+                        }"#
+                    }))
+                } else {
+                    Err(Error::Tool(format!("unexpected url: {}", url)))
+                }
+            })
+            .expect("weather skill should execute");
+
+        assert!(result.success, "weather result: {:?}", result.output);
+        assert_eq!(result.output["success"].as_bool(), Some(true));
+        assert!(result.output["display_text"].as_str().is_some());
+        assert!(result.output["display_text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("明天"));
+        assert_eq!(
+            result.output["summary_data"]["forecast"]["date"].as_str(),
+            Some("2026-03-17")
+        );
+        assert_eq!(
+            result.output["summary_data"]["forecast"]["maxtempC"].as_str(),
+            Some("29")
+        );
     }
 }

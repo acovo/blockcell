@@ -3,6 +3,7 @@ pub mod response_cache;
 pub mod capability_adapter;
 pub mod context;
 pub mod health;
+pub mod history_projector;
 pub mod intent;
 pub mod memory_adapter;
 pub mod prompt_skill_executor;

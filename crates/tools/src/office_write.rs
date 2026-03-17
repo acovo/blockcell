@@ -35,14 +35,17 @@ impl Tool for OfficeWriteTool {
                     },
                     "slides": {
                         "type": "array",
+                        "items": { "type": "object" },
                         "description": "For PPTX: array of slides. Each slide: {layout, title, content, bullets, image_path, notes, table}. layout: 'title'|'content'|'two_content'|'blank'|'section'"
                     },
                     "sections": {
                         "type": "array",
+                        "items": { "type": "object" },
                         "description": "For DOCX: array of sections. Each: {heading, level, content, bullets, table, image_path, page_break}"
                     },
                     "sheets": {
                         "type": "array",
+                        "items": { "type": "object" },
                         "description": "For XLSX: array of sheets. Each: {name, headers, rows, column_widths, bold_header}"
                     },
                     "style": {

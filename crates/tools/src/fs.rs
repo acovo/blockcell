@@ -26,7 +26,7 @@ impl Tool for ReadFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "read_file",
-            description: "Read the contents of a file. Supports text files and Office documents (.xlsx, .xls, .docx, .pptx) — binary Office files are automatically parsed and returned as readable text/markdown.",
+            description: "Read the contents of a local file. REQUIRED: always provide string parameter `path`; do not call this tool with `{}`. `path` may be an absolute path, `~/...`, or a workspace-relative file path such as `xhs_feeds.json` or `notes/todo.md`. Supports text files and Office documents (.xlsx, .xls, .docx, .pptx) — binary Office files are automatically parsed and returned as readable text/markdown.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -38,6 +38,10 @@ impl Tool for ReadFileTool {
                 "required": ["path"]
             }),
         }
+    }
+
+    fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
+        Some("- **read_file**: Always pass `path` explicitly. Never call `read_file` with `{}`. Use a concrete file path such as `{\"path\":\"xhs_feeds.json\"}` or `{\"path\":\"/absolute/path/file.md\"}`.".to_string())
     }
 
     fn validate(&self, params: &Value) -> Result<()> {
@@ -96,7 +100,7 @@ impl Tool for WriteFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "write_file",
-            description: "Write content to a file, creating parent directories if needed",
+            description: "Write content to a local file, creating parent directories if needed. REQUIRED: always provide both string parameters `path` and `content`; do not call this tool with `{}` and do not omit either field. `path` may be absolute, `~/...`, or workspace-relative such as `generated/out.html`.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -112,6 +116,10 @@ impl Tool for WriteFileTool {
                 "required": ["path", "content"]
             }),
         }
+    }
+
+    fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
+        Some("- **write_file**: Always pass both `path` and `content`. Never call `write_file` with `{}` or with only one field. Example: `{\"path\":\"generated/out.html\",\"content\":\"<html>...</html>\"}`.".to_string())
     }
 
     fn validate(&self, params: &Value) -> Result<()> {
@@ -157,7 +165,7 @@ impl Tool for EditFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "edit_file",
-            description: "Edit a file by replacing old_text with new_text. old_text must match exactly and appear only once.",
+            description: "Edit a local file by replacing `old_text` with `new_text`. REQUIRED: always provide `path`, `old_text`, and `new_text`; do not call this tool with `{}`. `old_text` must match existing file content exactly and appear only once.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -177,6 +185,10 @@ impl Tool for EditFileTool {
                 "required": ["path", "old_text", "new_text"]
             }),
         }
+    }
+
+    fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
+        Some("- **edit_file**: Always pass `path`, `old_text`, and `new_text`. Never call `edit_file` with `{}`. `old_text` must be an exact unique match from the existing file.".to_string())
     }
 
     fn validate(&self, params: &Value) -> Result<()> {
@@ -244,7 +256,7 @@ impl Tool for ListDirTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "list_dir",
-            description: "List contents of a directory. You must provide the `path` parameter explicitly; do not call this tool with empty arguments and do not assume an implicit current directory.",
+            description: "List contents of a directory. REQUIRED: always provide string parameter `path`; do not call this tool with `{}` and do not assume an implicit current directory. Use `{\"path\":\".\"}` for the current workspace directory, or pass an absolute / `~/...` / workspace-relative directory path explicitly.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -256,6 +268,10 @@ impl Tool for ListDirTool {
                 "required": ["path"]
             }),
         }
+    }
+
+    fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
+        Some("- **list_dir**: Always pass `path` explicitly. Never call `list_dir` with `{}`. For the current workspace directory, use exactly `{\"path\":\".\"}`.".to_string())
     }
 
     fn validate(&self, params: &Value) -> Result<()> {
@@ -311,6 +327,7 @@ impl Tool for ListDirTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PromptContext;
     use serde_json::json;
 
     #[test]
@@ -374,6 +391,43 @@ mod tests {
         let tool = ListDirTool;
         assert!(tool.validate(&json!({"path": "/tmp"})).is_ok());
         assert!(tool.validate(&json!({})).is_err());
+    }
+
+    #[test]
+    fn test_list_dir_prompt_rule_requires_explicit_path_and_current_dir_example() {
+        let tool = ListDirTool;
+        let rule = tool
+            .prompt_rule(&PromptContext {
+                channel: "webui",
+                intents: &[],
+            })
+            .expect("list_dir should expose a prompt rule");
+        assert!(rule.contains("`path`"));
+        assert!(rule.contains("{\"path\":\".\"}"));
+        assert!(rule.contains("`{}`"));
+    }
+
+    #[test]
+    fn test_write_file_prompt_rule_requires_path_and_content() {
+        let tool = WriteFileTool;
+        let rule = tool
+            .prompt_rule(&PromptContext {
+                channel: "webui",
+                intents: &[],
+            })
+            .expect("write_file should expose a prompt rule");
+        assert!(rule.contains("`path`"));
+        assert!(rule.contains("`content`"));
+        assert!(rule.contains("{\"path\":"));
+        assert!(rule.contains("`{}`"));
+    }
+
+    #[test]
+    fn test_read_and_edit_file_schemas_warn_against_empty_args() {
+        let read_schema = ReadFileTool.schema();
+        let edit_schema = EditFileTool.schema();
+        assert!(read_schema.description.contains("do not call this tool with `{}`"));
+        assert!(edit_schema.description.contains("do not call this tool with `{}`"));
     }
 
     #[test]

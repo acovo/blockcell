@@ -6,6 +6,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::history_projector::{HistoryProjectionProfile, HistoryProjector};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionMode {
     Skill,
@@ -515,9 +517,9 @@ impl ContextBuilder {
             .saturating_sub(reserved_output)
             .saturating_sub(safety_margin);
 
-        let compressed = Self::compress_history(history, history_budget);
-        let safe_start = Self::find_safe_history_start(&compressed);
-        for msg in &compressed[safe_start..] {
+        let projected_history = Self::compress_history_for_user(history, user_content, history_budget);
+        let safe_start = Self::find_safe_history_start(&projected_history);
+        for msg in &projected_history[safe_start..] {
             messages.push(msg.clone());
         }
 
@@ -601,157 +603,28 @@ impl ContextBuilder {
 
     /// Compress history by whole rounds so tool chains are never split.
     /// - Prefer keeping the latest 6 complete rounds intact
-    /// - If over budget, degrade intact preservation to 4, then 2, then fully-compressed history
     /// - Older rounds are summarized to `user + final assistant`
-    /// - Within each mode, keep the newest contiguous history that fits
+    #[cfg(test)]
     fn compress_history(history: &[ChatMessage], token_budget: usize) -> Vec<ChatMessage> {
+        Self::compress_history_for_user(history, "", token_budget)
+    }
+
+    fn compress_history_for_user(
+        history: &[ChatMessage],
+        user_input: &str,
+        token_budget: usize,
+    ) -> Vec<ChatMessage> {
         if history.is_empty() || token_budget == 0 {
             return Vec::new();
         }
 
-        let rounds = Self::split_history_into_rounds(history);
-        if rounds.is_empty() {
-            return Vec::new();
-        }
-
-        let mut preserved_candidates = Vec::new();
-        for candidate in [6usize, 4, 2, 0] {
-            let capped = candidate.min(rounds.len());
-            if preserved_candidates.last().copied() != Some(capped) {
-                preserved_candidates.push(capped);
-            }
-        }
-
-        for preserved_count in preserved_candidates {
-            if let Some(compressed) =
-                Self::compress_history_with_preserved_rounds(&rounds, preserved_count, token_budget)
-            {
-                return compressed;
-            }
-        }
-
-        Self::fallback_latest_round(&rounds)
-    }
-
-    fn split_history_into_rounds(history: &[ChatMessage]) -> Vec<Vec<&ChatMessage>> {
-        let mut rounds: Vec<Vec<&ChatMessage>> = Vec::new();
-        let mut current_round: Vec<&ChatMessage> = Vec::new();
-
-        for msg in history {
-            if msg.role == "user" && !current_round.is_empty() {
-                rounds.push(current_round);
-                current_round = Vec::new();
-            }
-            current_round.push(msg);
-        }
-
-        if !current_round.is_empty() {
-            rounds.push(current_round);
-        }
-
-        rounds
-    }
-
-    fn compress_history_with_preserved_rounds(
-        rounds: &[Vec<&ChatMessage>],
-        preserved_count: usize,
-        token_budget: usize,
-    ) -> Option<Vec<ChatMessage>> {
-        let preserved_start = rounds.len().saturating_sub(preserved_count);
-        let mut preserved_messages = Vec::new();
-        let mut preserved_tokens = 0usize;
-
-        for round in &rounds[preserved_start..] {
-            let intact_round = Self::build_intact_round(round);
-            let intact_tokens = Self::estimate_history_tokens(&intact_round);
-            preserved_tokens += intact_tokens;
-            if preserved_tokens > token_budget {
-                return None;
-            }
-            preserved_messages.extend(intact_round);
-        }
-
-        let remaining_budget = token_budget.saturating_sub(preserved_tokens);
-        let mut older_rounds_reversed: Vec<Vec<ChatMessage>> = Vec::new();
-        let mut older_tokens = 0usize;
-
-        for round in rounds[..preserved_start].iter().rev() {
-            let Some(compressed_round) = Self::build_compressed_round(round) else {
-                continue;
-            };
-            let compressed_tokens = Self::estimate_history_tokens(&compressed_round);
-            if older_tokens + compressed_tokens > remaining_budget {
-                break;
-            }
-            older_tokens += compressed_tokens;
-            older_rounds_reversed.push(compressed_round);
-        }
-
-        older_rounds_reversed.reverse();
-
-        let mut result = Vec::new();
-        for round in older_rounds_reversed {
-            result.extend(round);
-        }
-        result.extend(preserved_messages);
-
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    }
-
-    fn build_intact_round(round: &[&ChatMessage]) -> Vec<ChatMessage> {
-        round.iter().map(|msg| Self::trim_chat_message(msg)).collect()
-    }
-
-    fn build_compressed_round(round: &[&ChatMessage]) -> Option<Vec<ChatMessage>> {
-        let user_msg = round.iter().find(|msg| msg.role == "user")?;
-        let final_assistant = round
-            .iter()
-            .rev()
-            .find(|msg| msg.role == "assistant" && msg.tool_calls.is_none())
-            .or_else(|| round.iter().rev().find(|msg| msg.role == "assistant"));
-
-        let user_text = Self::content_text(user_msg);
-        let assistant_text = final_assistant
-            .map(|msg| Self::content_text(msg))
-            .unwrap_or_else(|| "(completed with tool calls)".to_string());
-
-        Some(vec![
-            ChatMessage::user(&Self::trim_text_head_tail(&user_text, 200)),
-            ChatMessage::assistant(&Self::trim_text_head_tail(&assistant_text, 400)),
-        ])
-    }
-
-    fn estimate_history_tokens(messages: &[ChatMessage]) -> usize {
-        messages.iter().map(estimate_message_tokens).sum()
-    }
-
-    fn fallback_latest_round(rounds: &[Vec<&ChatMessage>]) -> Vec<ChatMessage> {
-        let Some(latest_round) = rounds.last() else {
-            return Vec::new();
-        };
-
-        if let Some(compressed_round) = Self::build_compressed_round(latest_round) {
-            return compressed_round;
-        }
-
-        Self::build_intact_round(latest_round)
-    }
-
-    /// Extract text content from a ChatMessage.
-    fn content_text(msg: &ChatMessage) -> String {
-        match &msg.content {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Array(parts) => parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => String::new(),
-        }
+        HistoryProjector::new(history)
+            .project(
+                user_input,
+                HistoryProjectionProfile::Conversation,
+                token_budget,
+            )
+            .messages
     }
 
     /// Find a safe starting index in truncated history to avoid orphaned tool messages.
@@ -812,50 +685,6 @@ impl ContextBuilder {
         }
 
         i
-    }
-
-    fn trim_chat_message(msg: &ChatMessage) -> ChatMessage {
-        let mut out = msg.clone();
-
-        let max_chars = match out.role.as_str() {
-            "tool" => 2400,
-            "system" => 8000,
-            _ => 1400,
-        };
-
-        match &out.content {
-            serde_json::Value::String(s) => {
-                let trimmed = Self::trim_text_head_tail(s, max_chars);
-                out.content = serde_json::Value::String(trimmed);
-            }
-            serde_json::Value::Array(parts) => {
-                let mut new_parts = Vec::with_capacity(parts.len());
-                for part in parts {
-                    if let Some(obj) = part.as_object() {
-                        if let Some(t) = obj.get("type").and_then(|v| v.as_str()) {
-                            if t == "text" {
-                                if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                                    let mut new_obj = obj.clone();
-                                    new_obj.insert(
-                                        "text".to_string(),
-                                        serde_json::Value::String(Self::trim_text_head_tail(
-                                            text, max_chars,
-                                        )),
-                                    );
-                                    new_parts.push(serde_json::Value::Object(new_obj));
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    new_parts.push(part.clone());
-                }
-                out.content = serde_json::Value::Array(new_parts);
-            }
-            _ => {}
-        }
-
-        out
     }
 
     fn trim_text_head_tail(s: &str, max_chars: usize) -> String {

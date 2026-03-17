@@ -47,6 +47,7 @@ impl Tool for DataProcessTool {
                     },
                     "data": {
                         "type": "array",
+                        "items": { "type": "object" },
                         "description": "(write_csv/query/stats/transform) Array of objects (rows)"
                     },
                     "columns": {
@@ -94,6 +95,7 @@ impl Tool for DataProcessTool {
                     },
                     "transform_ops": {
                         "type": "array",
+                        "items": { "type": "object" },
                         "description": "(transform) Array of transform operations: [{\"op\": \"rename\", \"from\": \"old\", \"to\": \"new\"}, {\"op\": \"drop\", \"columns\": [\"col1\"]}, {\"op\": \"fill_null\", \"column\": \"col\", \"value\": \"default\"}, {\"op\": \"dedup\", \"columns\": [\"col1\"]}, {\"op\": \"add_column\", \"name\": \"new_col\", \"value\": \"constant\"}, {\"op\": \"to_number\", \"column\": \"col\"}]"
                     },
                     "output_path": {

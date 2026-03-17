@@ -18,6 +18,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::context::{ActiveSkillContext, ContextBuilder, InteractionMode};
+use crate::history_projector::{HistoryProjectionProfile, HistoryProjector};
 use crate::intent::{IntentCategory, IntentToolResolver};
 use crate::skill_kernel::SkillRunMode;
 use crate::summary_queue::MainSessionSummaryQueue;
@@ -58,6 +59,9 @@ pub struct RuntimeSpawnHandle {
     outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
     provider_pool: Arc<ProviderPool>,
     agent_id: Option<String>,
+    event_tx: Option<broadcast::Sender<String>>,
+    origin_session_key: String,
+    response_cache: crate::response_cache::ResponseCache,
     event_emitter: EventEmitterHandle,
 }
 
@@ -85,12 +89,22 @@ impl SpawnHandle for RuntimeSpawnHandle {
         let paths = self.paths.clone();
         let task_manager = self.task_manager.clone();
         let outbound_tx = self.outbound_tx.clone();
-        let task_str = task.to_string();
+        let normalized_task = normalize_spawn_task(task);
         let task_id_clone = task_id.clone();
         let label_clone = label.to_string();
         let origin_channel = origin_channel.to_string();
         let origin_chat_id = origin_chat_id.to_string();
         let agent_id = self.agent_id.clone();
+        let event_tx = self.event_tx.clone();
+        let session_store = SessionStore::new(self.paths.clone());
+        let origin_history = session_store
+            .load(&self.origin_session_key)
+            .unwrap_or_default();
+        let origin_history_seed = expand_history_stubs_with_cache(
+            &self.response_cache,
+            &self.origin_session_key,
+            &origin_history,
+        );
 
         // Spawn the background task. Task registration (create_task) happens inside
         // run_subagent_task before set_running(), eliminating the race condition.
@@ -100,12 +114,14 @@ impl SpawnHandle for RuntimeSpawnHandle {
             provider_pool,
             task_manager,
             outbound_tx,
-            task_str,
+            normalized_task,
             task_id_clone,
             label_clone,
             origin_channel,
             origin_chat_id,
             agent_id,
+            event_tx,
+            origin_history_seed,
             self.event_emitter.clone(),
         ));
 
@@ -357,30 +373,7 @@ fn persist_script_skill_history(
 }
 
 fn find_recent_skill_name_from_history(history: &[ChatMessage]) -> Option<String> {
-    for message in history.iter().rev() {
-        let Some(tool_calls) = &message.tool_calls else {
-            continue;
-        };
-        for tool_call in tool_calls.iter().rev() {
-            if !matches!(
-                tool_call.name.as_str(),
-                "skill_enter" | "skill_invoke_python" | "skill_invoke_rhai"
-            ) {
-                continue;
-            }
-            if let Some(skill_name) = tool_call
-                .arguments
-                .get("skill_name")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                return Some(skill_name.to_string());
-            }
-        }
-    }
-
-    None
+    HistoryProjector::new(history).analyze("").latest_skill_name
 }
 
 fn is_followup_skill_request(user_input: &str) -> bool {
@@ -476,29 +469,7 @@ fn resolve_cron_deliver_target(msg: &InboundMessage) -> Option<(String, String)>
     Some((channel.to_string(), to.to_string()))
 }
 
-fn split_history_into_rounds_for_planning(
-    history: &[ChatMessage],
-) -> Vec<Vec<&ChatMessage>> {
-    let mut rounds = Vec::new();
-    let mut current = Vec::new();
-
-    for msg in history {
-        if msg.role == "user" && !current.is_empty() {
-            rounds.push(current);
-            current = Vec::new();
-        }
-        current.push(msg);
-    }
-
-    if !current.is_empty() {
-        rounds.push(current);
-    }
-
-    rounds
-}
-
-const SCRIPT_PLANNING_MAX_HISTORY_ROUNDS: usize = 6;
-
+#[cfg(test)]
 fn stringify_chat_message_content(msg: &ChatMessage) -> String {
     match &msg.content {
         serde_json::Value::String(s) => s.clone(),
@@ -511,67 +482,75 @@ fn stringify_chat_message_content(msg: &ChatMessage) -> String {
     }
 }
 
-fn compact_tool_calls_for_script_planning(tool_calls: &[ToolCallRequest]) -> Vec<ToolCallRequest> {
-    tool_calls
+fn expand_history_stubs_with_cache(
+    response_cache: &crate::response_cache::ResponseCache,
+    session_key: &str,
+    history: &[ChatMessage],
+) -> Vec<ChatMessage> {
+    history
         .iter()
-        .map(|tool_call| ToolCallRequest {
-            id: tool_call.id.clone(),
-            name: tool_call.name.clone(),
-            arguments: compact_json_value(&tool_call.arguments, 0),
-            thought_signature: None,
+        .map(|msg| {
+            let content_str = msg.content.as_str().unwrap_or("");
+            if content_str.contains("ref:") {
+                if let Some(ref_pos) = content_str.find("ref:") {
+                    let after = &content_str[ref_pos + 4..];
+                    let ref_id: String = after
+                        .chars()
+                        .take_while(|c| c.is_ascii_hexdigit())
+                        .collect();
+                    if !ref_id.is_empty() {
+                        if let Some(full) = response_cache.recall(session_key, &ref_id) {
+                            let mut expanded = msg.clone();
+                            expanded.content = serde_json::Value::String(full);
+                            return expanded;
+                        }
+                    }
+                }
+            }
+            msg.clone()
         })
         .collect()
 }
 
-fn compact_history_message_for_script_planning(msg: &ChatMessage) -> ChatMessage {
-    let content_limit = match msg.role.as_str() {
-        "tool" => 20_000,
-        "assistant" if msg.tool_calls.is_some() => 1_500,
-        _ => 3_000,
-    };
-
-    ChatMessage {
-        role: msg.role.clone(),
-        content: serde_json::Value::String(truncate_str(
-            &stringify_chat_message_content(msg),
-            content_limit,
-        )),
-        reasoning_content: None,
-        tool_calls: msg
-            .tool_calls
-            .as_ref()
-            .map(|tool_calls| compact_tool_calls_for_script_planning(tool_calls)),
-        tool_call_id: msg.tool_call_id.clone(),
-        name: msg.name.clone(),
+fn parse_spawn_task_forced_skill_request(task: &str) -> Option<(String, String)> {
+    let trimmed = task.trim();
+    if trimmed.is_empty() {
+        return None;
     }
+
+    let regex = Regex::new(
+        r"(?i)(?:使用(?:已安装的)?|用|调用|执行|use|using|run|call)\s*([A-Za-z0-9_.@-]+)\s*(?:技能|skill)\s*[：:\-，,]?\s*(.*)",
+    )
+    .ok()?;
+
+    let captures = regex.captures(trimmed)?;
+    let skill_name = captures.get(1)?.as_str().trim().to_string();
+    if skill_name.is_empty() {
+        return None;
+    }
+    let remainder = captures
+        .get(2)
+        .map(|m| m.as_str().trim())
+        .filter(|text| !text.is_empty())
+        .unwrap_or(trimmed)
+        .to_string();
+
+    Some((skill_name, remainder))
 }
 
-fn collect_recent_history_messages_for_script_planning(
-    history: &[ChatMessage],
-    max_rounds: usize,
-) -> Vec<ChatMessage> {
-    if history.is_empty() || max_rounds == 0 {
-        return Vec::new();
+fn normalize_spawn_task(task: &str) -> String {
+    if let Some((skill_name, user_query)) = parse_spawn_task_forced_skill_request(task) {
+        format!("__SKILL_EXEC__:{}:{}", skill_name, user_query)
+    } else {
+        task.to_string()
     }
-
-    let rounds = split_history_into_rounds_for_planning(history);
-    let start = rounds.len().saturating_sub(max_rounds);
-    let mut collected = Vec::new();
-
-    for round in &rounds[start..] {
-        for msg in round {
-            collected.push(compact_history_message_for_script_planning(msg));
-        }
-    }
-
-    collected
 }
 
 fn build_script_skill_argv_messages(
     user_input: &str,
     skill_name: &str,
     skill_md: &str,
-    recent_history: &[ChatMessage],
+    projected_history: &[ChatMessage],
 ) -> Vec<ChatMessage> {
     let mut messages = vec![
         ChatMessage::system(&format!(
@@ -593,14 +572,14 @@ fn build_script_skill_argv_messages(
         ChatMessage::system(
             "下面如果有最近历史，请直接利用原始消息角色和 tool_call/tool_result 链路推断参数。\
             `argv` 只允许包含传给脚本本身的参数，绝对不要包含 `python3`、`python`、`SKILL.py`、`{baseDir}/SKILL.py` 或任何可执行文件路径。\
-            只允许输出 JSON，不要输出解释。例如：{\"argv\": [\"--query\", \"foo\"]}",
+            只允许输出以下 JSON 格式之一，不要输出解释：\
+            - 执行脚本：{\"argv\": [\"subcommand\", \"arg1\", ...]}\
+            - 无法确定参数，需要澄清：{\"clarify\": \"说明缺少什么\"}\
+            - 用户问题可直接从上下文回答（不需执行脚本）：{\"direct_answer\": \"直接回答内容\"}",
         ),
     ];
 
-    messages.extend(collect_recent_history_messages_for_script_planning(
-        recent_history,
-        SCRIPT_PLANNING_MAX_HISTORY_ROUNDS,
-    ));
+    messages.extend(projected_history.iter().cloned());
 
     messages.push(ChatMessage::user(&format!(
         "[当前用户请求]\n{}\n\n请只输出 JSON。",
@@ -2692,18 +2671,6 @@ impl AgentRuntime {
                                                 .or_default();
                                             acc.id = id.clone();
                                             acc.name = name.clone();
-                                            // 发送 tool_call_start 事件
-                                            if let Some(ref event_tx) = self.event_tx {
-                                                let event = serde_json::json!({
-                                                    "type": "tool_call_start",
-                                                    "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
-                                                    "chat_id": msg.chat_id.clone(),
-                                                    "call_id": id,
-                                                    "tool": name,
-                                                    "params": {},
-                                                });
-                                                let _ = event_tx.send(event.to_string());
-                                            }
                                         }
                                         StreamChunk::ToolCallDelta {
                                             index: _,
@@ -3695,6 +3662,9 @@ impl AgentRuntime {
             outbound_tx: self.outbound_tx.clone(),
             provider_pool: Arc::clone(&self.provider_pool),
             agent_id: resolve_routed_agent_id(&msg.metadata).or_else(|| self.agent_id.clone()),
+            event_tx: self.event_tx.clone(),
+            origin_session_key: msg.session_key(),
+            response_cache: self.response_cache.clone(),
             event_emitter: self.system_event_emitter.clone(),
         });
 
@@ -4377,6 +4347,50 @@ impl AgentRuntime {
         Ok(output_text)
     }
 
+    /// Expand response-cache stubs in session history so argv planning can access
+    /// the full list data. Messages like `[已缓存N条结果，ID: ref:XXXXXXXX]` are
+    /// replaced with the original cached content.
+    fn expand_stubs_in_history(
+        &self,
+        session_key: &str,
+        history: &[ChatMessage],
+    ) -> Vec<ChatMessage> {
+        history
+            .iter()
+            .map(|msg| {
+                let content_str = msg.content.as_str().unwrap_or("");
+                if content_str.contains("ref:") {
+                    // Extract ref_id: look for "ref:" followed by hex chars
+                    if let Some(ref_pos) = content_str.find("ref:") {
+                        let after = &content_str[ref_pos + 4..];
+                        let ref_id: String = after
+                            .chars()
+                            .take_while(|c| c.is_ascii_hexdigit())
+                            .collect();
+                        if !ref_id.is_empty() {
+                            if let Some(full) = self.response_cache.recall(session_key, &ref_id) {
+                                let mut expanded = msg.clone();
+                                expanded.content =
+                                    serde_json::Value::String(full);
+                                return expanded;
+                            }
+                        }
+                    }
+                }
+                msg.clone()
+            })
+            .collect()
+    }
+
+    fn script_planning_history_budget(&self) -> usize {
+        let max_context = self.config.agents.defaults.max_context_tokens as usize;
+        let reserved_output = self.config.agents.defaults.max_tokens as usize;
+        max_context
+            .saturating_sub(reserved_output)
+            .saturating_sub(4_000)
+            .max(4_000)
+    }
+
     /// Script skill dispatch for user-initiated messages.
     ///
     /// The runtime uses `SKILL.md` as the invocation manual, asks the model to
@@ -4421,21 +4435,26 @@ impl AgentRuntime {
             }
         };
 
-        let history_rounds_total = split_history_into_rounds_for_planning(&history).len();
-        let history_rounds_embedded = history_rounds_total.min(SCRIPT_PLANNING_MAX_HISTORY_ROUNDS);
-        let history_messages_embedded = collect_recent_history_messages_for_script_planning(
-            &history,
-            SCRIPT_PLANNING_MAX_HISTORY_ROUNDS,
-        )
-        .len();
-        let argv_messages =
-            build_script_skill_argv_messages(&msg.content, skill_name, &planning_md, &history);
+        // Expand any response-cache stubs in history so argv planning can access full list data.
+        let expanded_history = self.expand_stubs_in_history(persist_session_key, &history);
+        let history_projection = HistoryProjector::new(&expanded_history).project(
+            &msg.content,
+            HistoryProjectionProfile::ScriptPlanning,
+            self.script_planning_history_budget(),
+        );
+        let argv_messages = build_script_skill_argv_messages(
+            &msg.content,
+            skill_name,
+            &planning_md,
+            &history_projection.messages,
+        );
         info!(
             skill = %skill_name,
             history_messages = history.len(),
-            history_rounds_total = history_rounds_total,
-            history_rounds_embedded = history_rounds_embedded,
-            history_messages_embedded = history_messages_embedded,
+            history_rounds_total = history_projection.rounds_total,
+            history_rounds_embedded = history_projection.rounds_embedded,
+            history_messages_embedded = history_projection.messages_embedded,
+            reference_round = ?history_projection.reference_round,
             llm_messages = argv_messages.len(),
             "Script skill argv planning messages prepared"
         );
@@ -4465,13 +4484,21 @@ impl AgentRuntime {
                 ))
             })?
         };
-        if let Some(clarify) = argv_json
-            .get("clarify")
-            .and_then(|value| value.as_str())
+        // Handle clarify / direct_answer — both short-circuit script execution.
+        let short_circuit = argv_json
+            .get("direct_answer")
+            .and_then(|v| v.as_str())
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let final_response = clarify.to_string();
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                argv_json
+                    .get("clarify")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            });
+        if let Some(answer) = short_circuit {
+            let final_response = answer.to_string();
             let mut updated_history = history;
             updated_history.push(ChatMessage::user(&msg.content));
             updated_history.push(ChatMessage::assistant(&final_response));
@@ -5056,7 +5083,8 @@ fn extract_skill_token(s: &str) -> String {
 }
 
 /// Extract the first JSON object from potentially markdown-wrapped LLM output.
-/// Handles ```json ... ```, ``` ... ```, and bare `{ ... }` patterns.
+/// Handles ```json...```, ```...```, `<tool_call>` XML with `<parameter=argv>`,
+/// bare `{...}` objects, and bare `[...]` arrays (wrapped as `{"argv":[...]}`).  
 fn extract_json_from_text(text: &str) -> String {
     // Try ```json ... ``` blocks first
     if let Some(start) = text.find("```json") {
@@ -5065,13 +5093,30 @@ fn extract_json_from_text(text: &str) -> String {
             return after[..end].trim().to_string();
         }
     }
-    // Try ``` ... ``` blocks containing an object
+    // Try ``` ... ``` blocks containing an object or array
     if let Some(start) = text.find("```") {
         let after = &text[start + 3..];
         if let Some(end) = after.find("```") {
             let candidate = after[..end].trim();
-            if candidate.starts_with('{') {
+            if candidate.starts_with('{') || candidate.starts_with('[') {
+                if candidate.starts_with('[') {
+                    return format!("{{\"argv\": {}}}", candidate);
+                }
                 return candidate.to_string();
+            }
+        }
+    }
+    // Handle <tool_call> XML: extract argv from <parameter=argv>...</parameter>
+    if text.contains("<parameter=argv>") {
+        if let Some(start) = text.find("<parameter=argv>") {
+            let after = &text[start + 16..];
+            let end_tag = after.find("</parameter>").unwrap_or(after.len());
+            let content = after[..end_tag].trim();
+            if content.starts_with('[') {
+                return format!("{{\"argv\": {}}}", content);
+            }
+            if content.starts_with('{') {
+                return content.to_string();
             }
         }
     }
@@ -5080,6 +5125,14 @@ fn extract_json_from_text(text: &str) -> String {
         if let Some(end) = text.rfind('}') {
             if end >= start {
                 return text[start..=end].to_string();
+            }
+        }
+    }
+    // Handle bare JSON arrays (wrap as {"argv": [...]})
+    if let Some(start) = text.find('[') {
+        if let Some(end) = text.rfind(']') {
+            if end >= start {
+                return format!("{{\"argv\": {}}}", &text[start..=end]);
             }
         }
     }
@@ -5193,6 +5246,8 @@ async fn run_subagent_task(
     origin_channel: String,
     origin_chat_id: String,
     agent_id: Option<String>,
+    event_tx: Option<broadcast::Sender<String>>,
+    origin_history_seed: Vec<ChatMessage>,
     event_emitter: EventEmitterHandle,
 ) {
     // Create the task entry first, then immediately mark it running.
@@ -5226,6 +5281,11 @@ async fn run_subagent_task(
 
     // Create a unique session key for this subagent
     let session_key = format!("subagent:{}", task_id);
+    if !origin_history_seed.is_empty() {
+        let _ = sub_runtime
+            .session_store
+            .save(&session_key, &origin_history_seed);
+    }
 
     let mut subagent_metadata = build_subagent_metadata(agent_id.as_deref());
     if !subagent_metadata.is_object() {
@@ -5256,30 +5316,69 @@ async fn run_subagent_task(
             task_manager.set_completed(&task_id, &result).await;
             info!(task_id = %task_id, label = %label, "Subagent completed");
 
-            // Send the sub-agent's result directly to the origin channel.
-            if let Some(tx) = &outbound_tx {
-                let notification = OutboundMessage::new(&origin_channel, &origin_chat_id, &result);
-                let _ = tx.send(notification).await;
-            }
+            deliver_subagent_result_to_origin(
+                &origin_channel,
+                &origin_chat_id,
+                &result,
+                agent_id.as_deref().unwrap_or("default"),
+                outbound_tx.clone(),
+                event_tx.clone(),
+            )
+            .await;
         }
         Err(e) => {
             let err_msg = format!("{}", e);
             task_manager.set_failed(&task_id, &err_msg).await;
             error!(task_id = %task_id, error = %e, "Subagent failed");
 
-            if let Some(tx) = &outbound_tx {
-                let short_id = truncate_str(&task_id, 8);
-                let notification = OutboundMessage::new(
-                    &origin_channel,
-                    &origin_chat_id,
-                    &format!(
-                        "\n❌ 后台任务失败: **{}** (ID: {})\n错误: {}",
-                        label, short_id, err_msg
-                    ),
-                );
-                let _ = tx.send(notification).await;
-            }
+            let short_id = truncate_str(&task_id, 8);
+            let failure_message = format!(
+                "\n❌ 后台任务失败: **{}** (ID: {})\n错误: {}",
+                label, short_id, err_msg
+            );
+            deliver_subagent_result_to_origin(
+                &origin_channel,
+                &origin_chat_id,
+                &failure_message,
+                agent_id.as_deref().unwrap_or("default"),
+                outbound_tx.clone(),
+                event_tx.clone(),
+            )
+            .await;
         }
+    }
+}
+
+async fn deliver_subagent_result_to_origin(
+    origin_channel: &str,
+    origin_chat_id: &str,
+    content: &str,
+    agent_id: &str,
+    outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
+    event_tx: Option<broadcast::Sender<String>>,
+) {
+    if origin_channel == "ws" {
+        if let Some(event_tx) = event_tx {
+            let event = serde_json::json!({
+                "type": "message_done",
+                "agent_id": agent_id,
+                "chat_id": origin_chat_id,
+                "task_id": "",
+                "content": content,
+                "tool_calls": 0,
+                "duration_ms": 0,
+                "media": [],
+                "background_delivery": true,
+                "delivery_kind": "subagent",
+            });
+            let _ = event_tx.send(event.to_string());
+        }
+        return;
+    }
+
+    if let Some(tx) = outbound_tx {
+        let notification = OutboundMessage::new(origin_channel, origin_chat_id, content);
+        let _ = tx.send(notification).await;
     }
 }
 
@@ -5510,6 +5609,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_spawn_task_forces_explicit_skill_request() {
+        let parsed = parse_spawn_task_forced_skill_request(
+            "使用已安装的 xiaohongshu 技能：先获取推荐流 feeds，然后定位第15条笔记",
+        );
+
+        assert_eq!(
+            parsed,
+            Some((
+                "xiaohongshu".to_string(),
+                "先获取推荐流 feeds，然后定位第15条笔记".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn test_subagent_metadata_preserves_route_agent_id() {
         let metadata = build_subagent_metadata(Some("ops"));
 
@@ -5706,6 +5820,30 @@ mod tests {
         assert!(stringify_chat_message_content(tool_result).contains("token-21"));
         assert_eq!(messages.last().map(|msg| msg.role.as_str()), Some("user"));
         assert!(stringify_chat_message_content(messages.last().unwrap()).contains("查看第21条"));
+    }
+
+    #[test]
+    fn test_expand_history_stubs_with_cache_restores_cached_content() {
+        let cache = crate::response_cache::ResponseCache::new();
+        let session_key = "ws:chat-1";
+        let cached_list = (1..=18)
+            .map(|i| {
+                format!(
+                    "{}. 第{}条推荐，包含足够长的标题、作者信息、摘要说明以及若干补充字段，用来模拟小红书推荐流里带隐藏定位字段的大列表返回结果。",
+                    i, i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stub = cache
+            .maybe_cache_and_stub(session_key, &cached_list)
+            .expect("content should be cached");
+        let history = vec![ChatMessage::assistant(&stub)];
+
+        let expanded = expand_history_stubs_with_cache(&cache, session_key, &history);
+
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].content.as_str(), Some(cached_list.as_str()));
     }
 
     #[test]
@@ -6321,5 +6459,27 @@ mod tests {
     fn test_is_sensitive_filename_matches_json5_config() {
         assert!(is_sensitive_filename("config.json5"));
         assert!(is_sensitive_filename("/tmp/.blockcell/config.json5"));
+    }
+
+    #[tokio::test]
+    async fn test_deliver_subagent_result_to_ws_origin_emits_message_done_event() {
+        let (event_tx, mut event_rx) = broadcast::channel::<String>(8);
+
+        deliver_subagent_result_to_origin(
+            "ws",
+            "webui-chat-9",
+            "第15条内容已经整理完成",
+            "default",
+            None,
+            Some(event_tx),
+        )
+        .await;
+
+        let payload = event_rx.recv().await.expect("receive ws event");
+        let json: serde_json::Value = serde_json::from_str(&payload).expect("parse ws event");
+        assert_eq!(json["type"], "message_done");
+        assert_eq!(json["chat_id"], "webui-chat-9");
+        assert_eq!(json["content"], "第15条内容已经整理完成");
+        assert_eq!(json["background_delivery"], true);
     }
 }

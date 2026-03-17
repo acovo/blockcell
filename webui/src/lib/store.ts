@@ -46,6 +46,14 @@ function isValidReminderSessionId(id: string) {
   return id.includes('_') || id.includes(':');
 }
 
+function hasNonEmptyToolParams(params: any) {
+  if (params == null) return false;
+  if (typeof params === 'string') return params.trim().length > 0;
+  if (Array.isArray(params)) return params.length > 0;
+  if (typeof params === 'object') return Object.keys(params).length > 0;
+  return true;
+}
+
 function buildReminderPreview(content?: string) {
   const raw = (content || '').trim();
   if (!raw) return '点击查看提醒';
@@ -443,7 +451,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (lastMsg?.role === 'assistant') {
           state.updateLastAssistantMessage((m) => ({
             ...m,
-            toolCalls: [...(m.toolCalls || []), toolCall],
+            toolCalls: (m.toolCalls || []).some((tc) => tc.id === toolCall.id)
+              ? (m.toolCalls || []).map((tc) =>
+                  tc.id === toolCall.id
+                    ? {
+                        ...tc,
+                        tool: toolCall.tool || tc.tool,
+                        params: hasNonEmptyToolParams(toolCall.params) ? toolCall.params : tc.params,
+                      }
+                    : tc
+                )
+              : [...(m.toolCalls || []), toolCall],
           }));
         } else {
           // No assistant message yet — create one to hold tool calls

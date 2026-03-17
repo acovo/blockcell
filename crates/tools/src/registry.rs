@@ -51,6 +51,7 @@ pub const GLOBAL_CORE_TOOL_NAMES: &[&str] = &[
     "list_skills",
     "cron",
     "toggle_manage",
+    "web_fetch",
 ];
 
 pub fn global_core_tool_names() -> &'static [&'static str] {
@@ -244,8 +245,9 @@ impl ToolRegistry {
     }
 
     /// Get tiered schemas: full schemas for core tools, lightweight (name+description only) for others.
-    /// Core tools get complete parameter schemas; non-core tools get just name+description
-    /// so the LLM knows they exist but we save ~500 tokens per non-core tool.
+    /// Core tools and any tools with required parameters get complete parameter schemas;
+    /// non-core tools without required parameters get just name+description so the LLM
+    /// knows they exist but we save ~500 tokens per low-risk tool.
     /// When the LLM tries to call a lightweight tool, the runtime dynamically supplements
     /// the full schema and retries.
     pub fn get_tiered_schemas(&self, names: &[&str], core_tools: &[&str]) -> Vec<Value> {
@@ -254,8 +256,14 @@ impl ToolRegistry {
             .filter(|(name, _)| names.contains(&name.as_str()))
             .map(|(name, tool)| {
                 let schema = tool.schema();
-                if core_tools.contains(&name.as_str()) {
-                    // Full schema for core tools
+                let has_required_params = schema
+                    .parameters
+                    .get("required")
+                    .and_then(|required| required.as_array())
+                    .is_some_and(|required| !required.is_empty());
+                if core_tools.contains(&name.as_str()) || has_required_params {
+                    // Full schema for core tools and tools that cannot be called safely
+                    // without required parameters present in the model-visible schema.
                     json!({
                         "type": "function",
                         "function": {
@@ -332,6 +340,38 @@ impl Default for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use blockcell_core::Result;
+    use serde_json::json;
+
+    struct NoRequiredTool;
+
+    #[async_trait]
+    impl Tool for NoRequiredTool {
+        fn schema(&self) -> crate::ToolSchema {
+            crate::ToolSchema {
+                name: "no_required_tool",
+                description: "Tool without required parameters",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "optional_value": {
+                            "type": "string",
+                            "description": "Optional value"
+                        }
+                    }
+                }),
+            }
+        }
+
+        fn validate(&self, _params: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn execute(&self, _ctx: ToolContext, _params: Value) -> Result<Value> {
+            Ok(json!({"ok": true}))
+        }
+    }
 
     #[test]
     fn test_registry_new_empty() {
@@ -393,5 +433,85 @@ mod tests {
         reg.register(Arc::new(crate::exec::ExecTool));
         assert!(reg.get("exec").is_some());
         assert_eq!(reg.tool_names().len(), 1);
+    }
+
+    #[test]
+    fn test_tiered_schemas_keep_web_fetch_full_parameters() {
+        let reg = ToolRegistry::with_defaults();
+        let schemas = reg.get_tiered_schemas(&["web_fetch"], global_core_tool_names());
+
+        assert_eq!(schemas.len(), 1);
+        let properties = schemas[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("web_fetch properties should be an object");
+        assert!(properties.contains_key("url"));
+        assert!(properties.contains_key("extractMode"));
+        assert!(properties.contains_key("maxChars"));
+    }
+
+    #[test]
+    fn test_tiered_schemas_keep_required_param_tools_full() {
+        let reg = ToolRegistry::with_defaults();
+        let schemas = reg.get_tiered_schemas(&["write_file"], global_core_tool_names());
+
+        assert_eq!(schemas.len(), 1);
+        let properties = schemas[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("write_file properties should be an object");
+        assert!(properties.contains_key("path"));
+        assert!(properties.contains_key("content"));
+    }
+
+    #[test]
+    fn test_tiered_schemas_still_keep_no_required_tools_lightweight() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoRequiredTool));
+        let schemas = reg.get_tiered_schemas(&["no_required_tool"], global_core_tool_names());
+
+        assert_eq!(schemas.len(), 1);
+        let properties = schemas[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("no_required_tool properties should be an object");
+        assert!(properties.is_empty());
+    }
+
+    fn assert_no_array_without_items(value: &Value, path: &str) {
+        match value {
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("array") {
+                    assert!(
+                        map.contains_key("items"),
+                        "array schema missing items at {}",
+                        path
+                    );
+                }
+                for (key, child) in map {
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{}.{}", path, key)
+                    };
+                    assert_no_array_without_items(child, &child_path);
+                }
+            }
+            Value::Array(items) => {
+                for (idx, child) in items.iter().enumerate() {
+                    assert_no_array_without_items(child, &format!("{}[{}]", path, idx));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_all_tool_schemas_have_valid_array_items() {
+        let reg = ToolRegistry::with_defaults();
+        let schemas = reg.get_tool_schemas();
+
+        for schema in &schemas {
+            let tool_name = schema["function"]["name"].as_str().unwrap_or("unknown");
+            let parameters = &schema["function"]["parameters"];
+            assert_no_array_without_items(parameters, tool_name);
+        }
     }
 }

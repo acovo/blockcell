@@ -7,7 +7,7 @@ use blockcell_core::{Error, Result};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
@@ -275,6 +275,195 @@ impl OpenAIProvider {
             arguments: Value::Object(args),
             thought_signature: None,
         })
+    }
+
+    fn strip_wrapping_quotes(input: &str) -> String {
+        let trimmed = input.trim();
+        if trimmed.len() >= 2 {
+            let bytes = trimmed.as_bytes();
+            let first = bytes[0];
+            let last = bytes[trimmed.len() - 1];
+            if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                return trimmed[1..trimmed.len() - 1].to_string();
+            }
+        }
+        trimmed.to_string()
+    }
+
+    fn parse_native_scalar_value(input: &str) -> Value {
+        let trimmed = input.trim();
+        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+            return parsed;
+        }
+
+        let unquoted = Self::strip_wrapping_quotes(trimmed);
+        if unquoted.eq_ignore_ascii_case("true") {
+            return Value::Bool(true);
+        }
+        if unquoted.eq_ignore_ascii_case("false") {
+            return Value::Bool(false);
+        }
+        if unquoted.eq_ignore_ascii_case("null") {
+            return Value::Null;
+        }
+        if let Ok(parsed) = unquoted.parse::<i64>() {
+            return serde_json::json!(parsed);
+        }
+        if let Ok(parsed) = unquoted.parse::<f64>() {
+            return serde_json::json!(parsed);
+        }
+
+        Value::String(unquoted)
+    }
+
+    fn parse_parameter_block_arguments(raw: &str) -> Option<Map<String, Value>> {
+        let mut args = Map::new();
+        let mut scan = raw;
+
+        loop {
+            let scan_lower = scan.to_lowercase();
+            let Some(param_start) = scan_lower.find("<parameter=") else {
+                break;
+            };
+
+            let after_param = &scan[param_start + "<parameter=".len()..];
+            let Some(param_name_end) = after_param.find('>') else {
+                break;
+            };
+
+            let param_name = after_param[..param_name_end].trim().to_string();
+            if param_name.is_empty() {
+                scan = &after_param[param_name_end + 1..];
+                continue;
+            }
+
+            let value_str = &after_param[param_name_end + 1..];
+            let value_lower = value_str.to_lowercase();
+            let Some(close_idx) = value_lower.find("</parameter>") else {
+                break;
+            };
+
+            let raw_value = value_str[..close_idx].trim();
+            args.insert(param_name, Self::parse_native_scalar_value(raw_value));
+            scan = &value_str[close_idx + "</parameter>".len()..];
+        }
+
+        if args.is_empty() { None } else { Some(args) }
+    }
+
+    fn parse_loose_argument_map(raw: &str) -> Option<Map<String, Value>> {
+        if raw.contains("://")
+            && !raw.trim_start().starts_with('{')
+            && !raw.contains("=>")
+            && !raw.contains(',')
+            && !raw.starts_with("--")
+        {
+            return None;
+        }
+
+        let trimmed = raw
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .trim();
+        if trimmed.is_empty() {
+            return Some(Map::new());
+        }
+
+        let mut args = Map::new();
+        for pair in trimmed.split(',') {
+            let entry = pair.trim();
+            if entry.is_empty() {
+                continue;
+            }
+
+            let parsed = entry
+                .split_once("=>")
+                .or_else(|| entry.split_once(':'))
+                .or_else(|| entry.split_once('='));
+            let (raw_key, raw_value) = parsed?;
+
+            let key = Self::strip_wrapping_quotes(raw_key.trim());
+            if key.is_empty() {
+                return None;
+            }
+
+            args.insert(key, Self::parse_native_scalar_value(raw_value.trim()));
+        }
+
+        Some(args)
+    }
+
+    fn single_required_string_param_name(tool_name: &str, tools: &[Value]) -> Option<String> {
+        tools.iter().find_map(|tool| {
+            let function = tool.get("function")?;
+            let name = function.get("name")?.as_str()?;
+            if name != tool_name {
+                return None;
+            }
+
+            let parameters = function.get("parameters")?;
+            let required = parameters.get("required")?.as_array()?;
+            if required.len() != 1 {
+                return None;
+            }
+            let param_name = required.first()?.as_str()?.to_string();
+            let param_type = parameters
+                .get("properties")
+                .and_then(|p| p.get(&param_name))
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.as_str());
+            if param_type == Some("string") {
+                Some(param_name)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn parse_native_tool_arguments(
+        tool_name: &str,
+        raw_arguments: &str,
+        tools: &[Value],
+    ) -> std::result::Result<Value, String> {
+        let trimmed = raw_arguments.trim();
+        if trimmed.is_empty() {
+            return Ok(Value::Object(Map::new()));
+        }
+
+        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+            return Ok(parsed);
+        }
+
+        if let Some(args) = Self::parse_parameter_block_arguments(trimmed) {
+            return Ok(Value::Object(args));
+        }
+
+        if let Some(args) = Self::parse_loose_argument_map(trimmed) {
+            return Ok(Value::Object(args));
+        }
+
+        let dash_args = Self::parse_dash_args(trimmed);
+        if dash_args
+            .as_object()
+            .is_some_and(|map| !map.is_empty())
+        {
+            return Ok(dash_args);
+        }
+
+        if let Some(param_name) = Self::single_required_string_param_name(tool_name, tools) {
+            let value = Self::strip_wrapping_quotes(trimmed);
+            if !value.is_empty() {
+                let mut args = Map::new();
+                args.insert(param_name, Value::String(value));
+                return Ok(Value::Object(args));
+            }
+        }
+
+        Err(format!(
+            "unrecognized native tool-call arguments: {}",
+            &trimmed[..truncate_at_char_boundary(trimmed, 200)]
+        ))
     }
 
     fn parse_text_tool_calls(content: &str) -> (String, Vec<ToolCallRequest>) {
@@ -1002,8 +1191,20 @@ impl Provider for OpenAIProvider {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|tc| {
-                    let arguments: Value = serde_json::from_str(&tc.function.arguments)
-                        .unwrap_or(Value::Object(serde_json::Map::new()));
+                    let arguments = Self::parse_native_tool_arguments(
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        tools,
+                    )
+                    .unwrap_or_else(|err| {
+                        warn!(
+                            tool = %tc.function.name,
+                            error = %err,
+                            raw_arguments = %tc.function.arguments,
+                            "Failed to parse native tool-call arguments; falling back to empty object"
+                        );
+                        Value::Object(Map::new())
+                    });
                     ToolCallRequest {
                         id: tc.id,
                         name: tc.function.name,
@@ -1386,6 +1587,58 @@ ls -la
         assert_eq!(args["top_k"], 20);
         assert_eq!(args["query"], "hello");
         assert_eq!(args["verbose"], true);
+    }
+
+    #[test]
+    fn test_parse_native_tool_arguments_recovers_single_required_string_parameter() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch a URL",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string" }
+                    },
+                    "required": ["url"]
+                }
+            }
+        })];
+
+        let parsed = OpenAIProvider::parse_native_tool_arguments(
+            "web_fetch",
+            "https://wttr.in/Shenzhen?format=j1",
+            &tools,
+        )
+        .expect("parse bare url");
+
+        assert_eq!(parsed["url"], "https://wttr.in/Shenzhen?format=j1");
+    }
+
+    #[test]
+    fn test_parse_native_tool_arguments_recovers_loose_map_syntax() {
+        let parsed = OpenAIProvider::parse_native_tool_arguments(
+            "web_fetch",
+            r#"url => "https://example.com", maxChars => 5000"#,
+            &[],
+        )
+        .expect("parse loose map");
+
+        assert_eq!(parsed["url"], "https://example.com");
+        assert_eq!(parsed["maxChars"], 5000);
+    }
+
+    #[test]
+    fn test_parse_native_tool_arguments_reports_unrecognized_payload() {
+        let err = OpenAIProvider::parse_native_tool_arguments(
+            "web_fetch",
+            "just some words without structure",
+            &[],
+        )
+        .expect_err("should reject unrecognized payload");
+
+        assert!(err.contains("unrecognized native tool-call arguments"));
     }
 
     #[test]
