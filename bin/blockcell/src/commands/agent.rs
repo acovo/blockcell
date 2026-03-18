@@ -1066,7 +1066,6 @@ fn read_line_with_command_picker(
                         // Submit the input
                         if showing_picker {
                             clear_suggestions(prev_visible_limit, &input, stdout);
-                            prev_visible_limit = 0;
                         }
                         let _ = terminal::disable_raw_mode();
                         println!();
