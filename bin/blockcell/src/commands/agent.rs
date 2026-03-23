@@ -529,6 +529,17 @@ pub async fn run(
             }));
         }
 
+        #[cfg(feature = "weixin")]
+        for listener in blockcell_channels::account::weixin_listener_configs(&config) {
+            let weixin = Arc::new(
+                blockcell_channels::weixin::WeixinChannel::new(listener.config, inbound_tx.clone()),
+            );
+            let shutdown_rx = shutdown_tx.subscribe();
+            channel_handles.push(tokio::spawn(async move {
+                weixin.run_loop(shutdown_rx).await;
+            }));
+        }
+
         // Create agent runtime with outbound channel (consumes config)
         let tool_registry =
             build_tool_registry_for_agent_config(&config, Some(&mcp_manager)).await?;

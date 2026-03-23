@@ -1,8 +1,9 @@
 use super::*;
 use blockcell_core::config::{parse_json5_value, write_json5_pretty};
 
-const SUPPORTED_OWNER_CHANNELS: [&str; 9] = [
+const SUPPORTED_OWNER_CHANNELS: [&str; 10] = [
     "telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "qq",
+    "weixin",
 ];
 
 fn load_config_or_state(state: &GatewayState) -> Config {

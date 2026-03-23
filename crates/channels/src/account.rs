@@ -1,6 +1,7 @@
 use blockcell_core::config::{
     DingTalkAccountConfig, DiscordAccountConfig, FeishuAccountConfig, LarkAccountConfig,
-    SlackAccountConfig, TelegramAccountConfig, WeComAccountConfig, WhatsAppAccountConfig,
+    SlackAccountConfig, TelegramAccountConfig, WeComAccountConfig, WeixinAccountConfig,
+    WhatsAppAccountConfig,
 };
 #[cfg(feature = "qq")]
 use blockcell_core::config::QQAccountConfig;
@@ -132,6 +133,14 @@ pub(crate) fn qq_account_id(config: &Config) -> Option<String> {
     )
 }
 
+pub(crate) fn weixin_account_id(config: &Config) -> Option<String> {
+    let weixin = &config.channels.weixin;
+    resolve_account_id(
+        &weixin.accounts,
+        |account| account.enabled,
+        |account| !weixin.token.is_empty() && account.token == weixin.token,
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct ListenerConfig {
@@ -426,8 +435,33 @@ pub fn channel_configured(config: &Config, channel: &str) -> bool {
                     account.enabled && !account.app_id.is_empty()
                 })
         }
+        "weixin" => {
+            !config.channels.weixin.token.is_empty()
+                || has_enabled_account(&config.channels.weixin.accounts, |account| {
+                    account.enabled && !account.token.is_empty()
+                })
+        }
         _ => false,
     }
+}
+
+pub fn weixin_listener_configs(config: &Config) -> Vec<ListenerConfig> {
+    scoped_listener_configs(
+        "weixin",
+        config,
+        &config.channels.weixin.accounts,
+        |account| account.enabled && !account.token.is_empty(),
+        |cfg| !cfg.channels.weixin.token.is_empty(),
+        |scoped, account_id, account: &WeixinAccountConfig| {
+            scoped.channels.weixin.enabled = account.enabled;
+            scoped.channels.weixin.token = account.token.clone();
+            scoped.channels.weixin.allow_from = account.allow_from.clone();
+            scoped.channels.weixin.proxy = account.proxy.clone();
+            scoped.channels.weixin.accounts =
+                HashMap::from([(account_id.to_string(), account.clone())]);
+            scoped.channels.weixin.default_account_id = Some(account_id.to_string());
+        },
+    )
 }
 
 pub fn listener_labels(config: &Config, channel: &str) -> Vec<String> {
@@ -455,6 +489,7 @@ pub fn listener_labels(config: &Config, channel: &str) -> Vec<String> {
         "wecom" => wecom_listener_configs(config),
         "lark" => lark_scoped_configs(config),
         "qq" => qq_listener_configs(config),
+        "weixin" => weixin_listener_configs(config),
         _ => Vec::new(),
     }
     .into_iter()

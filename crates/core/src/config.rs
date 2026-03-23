@@ -951,6 +951,41 @@ pub struct QQAccountConfig {
     pub allow_from: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WeixinAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+/// 微信 (WeChat) iLink Bot channel configuration.
+/// Uses long-polling based message reception via iLink Bot API.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WeixinConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// iLink Bot API token (Bearer token)
+    #[serde(default)]
+    pub token: String,
+    /// Allowlist of sender user IDs. Empty = allow all.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    /// HTTP proxy for API requests
+    #[serde(default)]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub accounts: HashMap<String, WeixinAccountConfig>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
+}
+
 /// 企业微信 (WeCom / WeChat Work) channel configuration.
 /// Supports both callback mode (webhook) and polling mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1058,6 +1093,8 @@ pub struct ChannelsConfig {
     pub lark: LarkConfig,
     #[serde(default)]
     pub qq: QQConfig,
+    #[serde(default)]
+    pub weixin: WeixinConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1673,6 +1710,7 @@ impl Config {
             "wecom" => self.channels.wecom.enabled,
             "lark" => self.channels.lark.enabled,
             "qq" => self.channels.qq.enabled,
+            "weixin" => self.channels.weixin.enabled,
             _ => false,
         }
     }

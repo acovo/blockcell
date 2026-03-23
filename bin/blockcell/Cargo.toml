@@ -42,9 +42,10 @@ zip = { workspace = true }
 urlencoding = { workspace = true }
 rhai = { workspace = true }
 crossterm = "0.28"
+qrcode = "0.14"
 
 [features]
-default = ["telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "qq"]
+default = ["telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "qq", "weixin"]
 telegram = ["blockcell-channels/telegram"]
 whatsapp = ["blockcell-channels/whatsapp"]
 feishu = ["blockcell-channels/feishu"]
@@ -54,3 +55,4 @@ dingtalk = ["blockcell-channels/dingtalk"]
 wecom = ["blockcell-channels/wecom"]
 lark = ["blockcell-channels/lark"]
 qq = ["blockcell-channels/qq"]
+weixin = ["blockcell-channels/weixin"]

@@ -246,6 +246,24 @@ impl ChannelManager {
                     cfg.channels.qq.allow_from = acc.allow_from.clone();
                 }
             }
+            "weixin" => {
+                if let Some(acc) = Self::pick_account(
+                    "weixin",
+                    &cfg.channels.weixin.accounts,
+                    req_account,
+                    cfg.channels.weixin.default_account_id.as_deref(),
+                )? {
+                    if !acc.enabled {
+                        return Err(Error::Channel(
+                            "Selected weixin account is disabled".to_string(),
+                        ));
+                    }
+                    cfg.channels.weixin.enabled = acc.enabled;
+                    cfg.channels.weixin.token = acc.token.clone();
+                    cfg.channels.weixin.allow_from = acc.allow_from.clone();
+                    cfg.channels.weixin.proxy = acc.proxy.clone();
+                }
+            }
             _ => {}
         }
         Ok(cfg)
@@ -522,6 +540,25 @@ impl ChannelManager {
                     }
                 }
             }
+            "weixin" => {
+                #[cfg(feature = "weixin")]
+                {
+                    if !msg.content.is_empty() {
+                        let context_token = msg
+                            .metadata
+                            .get("context_token")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        crate::weixin::send_message_with_context(
+                            &send_config,
+                            &msg.chat_id,
+                            &msg.content,
+                            context_token,
+                        )
+                        .await?;
+                    }
+                }
+            }
             "cli" | "cron" | "ws" => {
                 // Internal channels — handled directly, not through external channel dispatch
             }
@@ -543,6 +580,7 @@ impl ChannelManager {
             "wecom" => "corp_id not set",
             "lark" => "app_id not set",
             "qq" => "app_id not set",
+            "weixin" => "token not set",
             _ => "not configured",
         }
     }
@@ -588,6 +626,7 @@ impl ChannelManager {
             "wecom",
             "lark",
             "qq",
+            "weixin",
         ];
 
         channels

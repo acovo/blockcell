@@ -1,9 +1,13 @@
 use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, Paths};
+use qrcode::render::unicode;
+use qrcode::QrCode;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-const SUPPORTED_OWNER_CHANNELS: [&str; 9] = [
+const SUPPORTED_OWNER_CHANNELS: [&str; 10] = [
     "telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "qq",
+    "weixin",
 ];
 
 fn known_account_ids(config: &Config, channel: &str) -> Vec<String> {
@@ -53,12 +57,110 @@ pub async fn login(channel: &str) -> anyhow::Result<()> {
             println!("To start the bridge manually:");
             println!("  cd ~/.blockcell/bridge && npm start");
         }
+        "weixin" => login_weixin().await?,
         _ => {
             println!("Login not supported for channel: {}", channel);
-            println!("Supported channels: whatsapp");
+            println!("Supported channels: whatsapp, weixin");
         }
     }
 
+    Ok(())
+}
+
+async fn login_weixin() -> anyhow::Result<()> {
+    let paths = Paths::new();
+    let mut config = Config::load_or_default(&paths)?;
+
+    if !config.channels.weixin.token.trim().is_empty() {
+        println!("当前已存在 Weixin token；本次扫码会覆盖并重新绑定。\n");
+    }
+
+    const MAX_REFRESHES: u32 = 3;
+    const TOTAL_TIMEOUT_SECS: u64 = 300;
+
+    let mut refresh_count = 0u32;
+
+    loop {
+        let qr = blockcell_channels::weixin::fetch_login_qrcode(&config)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        println!("\nWeixin 扫码登录");
+        println!("================");
+        println!("请使用微信扫码下方二维码完成登录：\n");
+        render_weixin_qr(&qr.qrcode_img_content)?;
+        println!("\n如果终端二维码不可读，也可以复制这个内容：");
+        println!("{}\n", qr.qrcode_img_content);
+        println!("开始轮询扫码状态，最多等待 5 分钟...\n");
+
+        let started_at = Instant::now();
+        loop {
+            if started_at.elapsed() >= Duration::from_secs(TOTAL_TIMEOUT_SECS) {
+                println!("二维码已超时。\n");
+                break;
+            }
+
+            let status = blockcell_channels::weixin::poll_login_status(&config, &qr.qrcode)
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            match status.status.as_str() {
+                "wait" => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                "scaned" => {
+                    println!("已扫码，请在手机上确认登录...");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                "confirmed" => {
+                    let bot_token = status.bot_token.clone().ok_or_else(|| {
+                        anyhow::anyhow!("Weixin 登录成功，但响应里没有 bot_token")
+                    })?;
+
+                    config.channels.weixin.enabled = true;
+                    config.channels.weixin.token = bot_token;
+                    config.save(&paths.config_file())?;
+
+                    println!("\n✓ Weixin 登录成功，token 已保存到：{}", paths.config_file().display());
+                    println!("  {}", paths.config_file().display());
+                    if let Some(bot_id) = status.ilink_bot_id {
+                        println!("  bot_id: {}", bot_id);
+                    }
+                    if let Some(user_id) = status.ilink_user_id {
+                        println!("  user_id: {}", user_id);
+                    }
+                    if let Some(baseurl) = status.baseurl {
+                        println!("  baseurl: {}", baseurl);
+                    }
+                    return Ok(());
+                }
+                "expired" => {
+                    println!("二维码已过期，准备刷新...");
+                    break;
+                }
+                other => {
+                    println!("当前状态：{}", other);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+
+        refresh_count += 1;
+        if refresh_count >= MAX_REFRESHES {
+            anyhow::bail!("Weixin 二维码已过期次数过多，请稍后重试");
+        }
+
+        println!("正在重新获取二维码（{}/{}）...\n", refresh_count, MAX_REFRESHES);
+    }
+}
+
+fn render_weixin_qr(content: &str) -> anyhow::Result<()> {
+    let code = QrCode::new(content.as_bytes())?;
+    let rendered = code
+        .render::<unicode::Dense1x2>()
+        .quiet_zone(true)
+        .build();
+    println!("{}", rendered);
     Ok(())
 }
 
