@@ -138,11 +138,8 @@ fn junk_score(item: &Value) -> f64 {
         score += 1.0;
     }
 
-    // Type priors: short-term notes/summaries are often ephemeral.
+    // Type priors: short-term notes are often ephemeral.
     if item_type == "note" {
-        score += 1.0;
-    }
-    if item_type == "summary" {
         score += 1.0;
     }
 
@@ -368,7 +365,7 @@ impl Tool for MemoryMaintenanceTool {
                 // Query recent short-term memories
                 let query_params = json!({
                     "scope": "short_term",
-                    "days": days,
+                    "time_range_days": days,
                     "top_k": 100
                 });
                 let recent = store.query_json(query_params)?;
@@ -507,6 +504,102 @@ impl Tool for MemoryMaintenanceTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blockcell_core::Config;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use serde_json::json;
+
+    struct CaptureMemoryStore {
+        query_calls: Mutex<Vec<Value>>,
+    }
+
+    impl CaptureMemoryStore {
+        fn new() -> Self {
+            Self {
+                query_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn query_calls(&self) -> Vec<Value> {
+            self.query_calls.lock().expect("query_calls lock").clone()
+        }
+    }
+
+    impl crate::MemoryStoreOps for CaptureMemoryStore {
+        fn upsert_json(&self, _params_json: Value) -> Result<Value> {
+            Ok(json!({}))
+        }
+
+        fn query_json(&self, params_json: Value) -> Result<Value> {
+            self.query_calls
+                .lock()
+                .expect("query_calls lock")
+                .push(params_json.clone());
+            Ok(json!([]))
+        }
+
+        fn soft_delete(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn batch_soft_delete_json(&self, _params_json: Value) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn restore(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn stats_json(&self) -> Result<Value> {
+            Ok(json!({
+                "long_term": 0,
+                "short_term": 0
+            }))
+        }
+
+        fn generate_brief(&self, _long_term_max: usize, _short_term_max: usize) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn generate_brief_for_query(&self, _query: &str, _max_items: usize) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn upsert_session_summary(&self, _session_key: &str, _summary: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_session_summary(&self, _session_key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn maintenance(&self, _recycle_days: i64) -> Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+    }
+
+    fn test_context(memory_store: Arc<dyn crate::MemoryStoreOps + Send + Sync>) -> ToolContext {
+        ToolContext {
+            workspace: PathBuf::from("/tmp/workspace"),
+            builtin_skills_dir: None,
+            active_skill_dir: None,
+            session_key: "cli:test".to_string(),
+            channel: "ghost".to_string(),
+            account_id: None,
+            chat_id: "chat-1".to_string(),
+            config: Config::default(),
+            permissions: blockcell_core::types::PermissionSet::new(),
+            task_manager: None,
+            memory_store: Some(memory_store),
+            outbound_tx: None,
+            spawn_handle: None,
+            capability_registry: None,
+            core_evolution: None,
+            event_emitter: None,
+            channel_contacts_file: None,
+            response_cache: None,
+        }
+    }
 
     #[test]
     fn test_schema() {
@@ -523,5 +616,59 @@ mod tests {
         assert!(tool.validate(&json!({"action": "stats"})).is_ok());
         assert!(tool.validate(&json!({"action": "compact"})).is_ok());
         assert!(tool.validate(&json!({"action": "invalid"})).is_err());
+    }
+
+    #[test]
+    fn test_junk_score_does_not_special_case_removed_summary_type() {
+        let note_item = json!({
+            "source": "tool",
+            "channel": "ghost",
+            "type": "note",
+            "importance": 0.5,
+            "title": "",
+            "content": "short"
+        });
+        let legacy_summary_item = json!({
+            "source": "tool",
+            "channel": "ghost",
+            "type": "summary",
+            "importance": 0.5,
+            "title": "",
+            "content": "short"
+        });
+
+        assert!(junk_score(&note_item) > junk_score(&legacy_summary_item));
+    }
+
+    #[tokio::test]
+    async fn test_memory_maintenance_garden_uses_time_range_days() {
+        let store = Arc::new(CaptureMemoryStore::new());
+        let tool = MemoryMaintenanceTool;
+
+        tool.execute(
+            test_context(store.clone()),
+            json!({
+                "action": "garden",
+                "days": 7,
+                "dry_run": true
+            }),
+        )
+        .await
+        .expect("garden should succeed");
+
+        let calls = store.query_calls();
+        let recent_query = calls
+            .iter()
+            .find(|params| {
+                params.get("scope").and_then(|v| v.as_str()) == Some("short_term")
+                    && params.get("top_k").and_then(|v| v.as_i64()) == Some(100)
+            })
+            .expect("recent short-term query");
+
+        assert_eq!(
+            recent_query.get("time_range_days").and_then(|v| v.as_i64()),
+            Some(7)
+        );
+        assert!(recent_query.get("days").is_none());
     }
 }

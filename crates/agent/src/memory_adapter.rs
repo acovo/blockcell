@@ -1,5 +1,7 @@
 use blockcell_core::Result;
-use blockcell_storage::memory::{MemoryStore, QueryParams, UpsertParams};
+use blockcell_storage::memory::{MemoryStore, QueryParams};
+use blockcell_storage::memory_contract::MemoryUpsertRequest;
+use blockcell_storage::memory_service::MemoryService;
 use blockcell_tools::MemoryStoreOps;
 use serde_json::Value;
 
@@ -37,7 +39,7 @@ impl MemoryStoreAdapter {
 
 impl MemoryStoreOps for MemoryStoreAdapter {
     fn upsert_json(&self, params_json: Value) -> Result<Value> {
-        let params = UpsertParams {
+        let request = MemoryUpsertRequest {
             scope: Self::get_string_or(&params_json, "scope", "short_term"),
             item_type: Self::get_string_or(&params_json, "type", "note"),
             title: Self::get_string(&params_json, "title"),
@@ -55,7 +57,7 @@ impl MemoryStoreOps for MemoryStoreAdapter {
             expires_at: Self::get_string(&params_json, "expires_at"),
         };
 
-        let item = self.store.upsert(params)?;
+        let item = MemoryService::new(self.store.clone()).upsert(request)?;
         serde_json::to_value(item).map_err(|e| {
             blockcell_core::Error::Storage(format!("Failed to serialize memory item: {}", e))
         })
@@ -137,5 +139,35 @@ impl MemoryStoreOps for MemoryStoreAdapter {
 
     fn maintenance(&self, recycle_days: i64) -> Result<(usize, usize)> {
         self.store.maintenance(recycle_days)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blockcell_storage::memory::MemoryStore;
+
+    fn test_store() -> MemoryStore {
+        let db_path = std::env::temp_dir().join(format!(
+            "blockcell-memory-adapter-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        MemoryStore::open(&db_path).expect("open memory store")
+    }
+
+    #[test]
+    fn test_upsert_json_applies_default_short_term_ttl_via_service() {
+        let store = test_store();
+        let adapter = MemoryStoreAdapter::new(store);
+
+        let item = adapter
+            .upsert_json(serde_json::json!({
+                "scope": "short_term",
+                "type": "note",
+                "content": "remember this"
+            }))
+            .expect("upsert_json should succeed");
+
+        assert!(item["expires_at"].as_str().is_some());
     }
 }

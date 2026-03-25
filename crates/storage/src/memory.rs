@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
+pub use crate::memory_contract::MemoryType;
+
 /// 预编译的 FTS5 特殊字符正则，避免每次调用重新编译
 static FTS_SPECIAL_CHARS: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"[*"():^{}]"#).expect("FTS special chars regex is valid"));
@@ -37,59 +39,6 @@ impl std::str::FromStr for MemoryScope {
             "short_term" => Ok(MemoryScope::ShortTerm),
             "long_term" => Ok(MemoryScope::LongTerm),
             _ => Err(format!("Invalid memory scope: {}", s)),
-        }
-    }
-}
-
-/// Type classification of a memory item.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryType {
-    Fact,
-    Preference,
-    Project,
-    Task,
-    Glossary,
-    Contact,
-    Snippet,
-    Policy,
-    Summary,
-    Note,
-}
-
-impl MemoryType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MemoryType::Fact => "fact",
-            MemoryType::Preference => "preference",
-            MemoryType::Project => "project",
-            MemoryType::Task => "task",
-            MemoryType::Glossary => "glossary",
-            MemoryType::Contact => "contact",
-            MemoryType::Snippet => "snippet",
-            MemoryType::Policy => "policy",
-            MemoryType::Summary => "summary",
-            MemoryType::Note => "note",
-        }
-    }
-}
-
-impl std::str::FromStr for MemoryType {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "fact" => Ok(MemoryType::Fact),
-            "preference" => Ok(MemoryType::Preference),
-            "project" => Ok(MemoryType::Project),
-            "task" => Ok(MemoryType::Task),
-            "glossary" => Ok(MemoryType::Glossary),
-            "contact" => Ok(MemoryType::Contact),
-            "snippet" => Ok(MemoryType::Snippet),
-            "policy" => Ok(MemoryType::Policy),
-            "summary" => Ok(MemoryType::Summary),
-            "note" => Ok(MemoryType::Note),
-            _ => Err(format!("Invalid memory type: {}", s)),
         }
     }
 }
@@ -636,10 +585,14 @@ impl MemoryStore {
             idx += 1;
         }
         if let Some(tag_list) = tags {
-            for tag in tag_list {
-                sql.push_str(&format!(" AND tags LIKE '%' || ?{} || '%'", idx));
-                bind_values.push(Box::new(tag.clone()));
-                idx += 1;
+            if !tag_list.is_empty() {
+                let mut tag_conditions = Vec::new();
+                for tag in tag_list {
+                    tag_conditions.push(format!("tags LIKE '%' || ?{} || '%'", idx));
+                    bind_values.push(Box::new(tag.clone()));
+                    idx += 1;
+                }
+                sql.push_str(&format!(" AND ({})", tag_conditions.join(" OR ")));
             }
         }
         if let Some(before) = time_before {
@@ -1271,6 +1224,7 @@ fn compute_daily_expiry(date_str: &str, days: i64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
     use tempfile::TempDir;
 
     fn test_store() -> (MemoryStore, TempDir) {
@@ -1490,5 +1444,82 @@ Language: Chinese
             })
             .unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_canonical_memory_type_rejects_removed_summary_type() {
+        assert!(MemoryType::from_str("summary").is_err());
+    }
+
+    #[test]
+    fn test_batch_delete_tags_matches_any_tag() {
+        let (store, _dir) = test_store();
+
+        let _alpha = store
+            .upsert(UpsertParams {
+                scope: "short_term".to_string(),
+                item_type: "note".to_string(),
+                title: Some("alpha".to_string()),
+                content: "tag alpha".to_string(),
+                summary: None,
+                tags: vec!["alpha".to_string()],
+                source: "user".to_string(),
+                channel: None,
+                session_key: None,
+                importance: 0.2,
+                dedup_key: None,
+                expires_at: None,
+            })
+            .unwrap();
+
+        let _beta = store
+            .upsert(UpsertParams {
+                scope: "short_term".to_string(),
+                item_type: "note".to_string(),
+                title: Some("beta".to_string()),
+                content: "tag beta".to_string(),
+                summary: None,
+                tags: vec!["beta".to_string()],
+                source: "user".to_string(),
+                channel: None,
+                session_key: None,
+                importance: 0.2,
+                dedup_key: None,
+                expires_at: None,
+            })
+            .unwrap();
+
+        let tags = vec!["alpha".to_string(), "beta".to_string()];
+        let deleted = store
+            .batch_soft_delete(None, None, Some(tags.as_slice()), None)
+            .unwrap();
+        assert_eq!(deleted, 2);
+    }
+
+    #[test]
+    fn test_short_term_write_gets_default_ttl_in_service() {
+        use crate::memory_contract::MemoryUpsertRequest;
+        use crate::memory_service::MemoryService;
+
+        let (store, _dir) = test_store();
+        let service = MemoryService::new(store);
+
+        let request = MemoryUpsertRequest {
+            scope: "short_term".to_string(),
+            item_type: "note".to_string(),
+            title: Some("ttl default".to_string()),
+            content: "ttl default content".to_string(),
+            summary: None,
+            tags: vec![],
+            source: "user".to_string(),
+            channel: None,
+            session_key: None,
+            importance: 0.5,
+            dedup_key: None,
+            expires_at: None,
+        };
+
+        let item = service.upsert(request).unwrap();
+        assert!(item.expires_at.is_some());
     }
 }

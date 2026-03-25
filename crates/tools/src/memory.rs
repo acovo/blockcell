@@ -54,7 +54,7 @@ impl Tool for MemoryQueryTool {
                     },
                     "type": {
                         "type": "string",
-                        "enum": ["fact", "preference", "project", "task", "glossary", "contact", "snippet", "policy", "summary", "note"],
+                        "enum": ["fact", "preference", "project", "task", "glossary", "contact", "snippet", "policy", "note", "session_summary"],
                         "description": "Filter by memory type."
                     },
                     "tags": {
@@ -232,15 +232,7 @@ impl Tool for MemoryUpsertTool {
             }
         }
 
-        // Default TTL policy (growth control): tool-generated short_term memories expire in 3 days
-        // unless the caller explicitly sets `expires_in_days`.
-        let effective_expires_in_days = if scope == "short_term" {
-            expires_in_days.or(Some(3))
-        } else {
-            expires_in_days
-        };
-
-        let expires_at = effective_expires_in_days
+        let expires_at = expires_in_days
             .map(|days| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339());
 
         let upsert_params = json!({
@@ -380,7 +372,127 @@ impl Tool for MemoryForgetTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blockcell_core::Config;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use serde_json::json;
+
+    struct CaptureMemoryStore {
+        last_upsert: Mutex<Option<Value>>,
+    }
+
+    impl CaptureMemoryStore {
+        fn new() -> Self {
+            Self {
+                last_upsert: Mutex::new(None),
+            }
+        }
+
+        fn last_upsert(&self) -> Value {
+            self.last_upsert
+                .lock()
+                .expect("last_upsert lock")
+                .clone()
+                .expect("captured upsert params")
+        }
+    }
+
+    impl crate::MemoryStoreOps for CaptureMemoryStore {
+        fn upsert_json(&self, params_json: Value) -> Result<Value> {
+            *self.last_upsert.lock().expect("last_upsert lock") = Some(params_json);
+            Ok(json!({
+                "id": "mem-1",
+                "scope": "short_term",
+                "type": "note",
+                "content": "remember this",
+                "summary": null,
+                "tags": [],
+                "source": "tool",
+                "channel": "cli",
+                "session_key": "cli:test",
+                "importance": 0.5,
+                "created_at": "2026-03-25T00:00:00Z",
+                "updated_at": "2026-03-25T00:00:00Z",
+                "last_accessed_at": null,
+                "access_count": 0,
+                "expires_at": null,
+                "deleted_at": null,
+                "dedup_key": null,
+            }))
+        }
+
+        fn query_json(&self, _params_json: Value) -> Result<Value> {
+            Ok(json!([]))
+        }
+
+        fn soft_delete(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn batch_soft_delete_json(&self, _params_json: Value) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn restore(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn stats_json(&self) -> Result<Value> {
+            Ok(json!({}))
+        }
+
+        fn generate_brief(&self, _long_term_max: usize, _short_term_max: usize) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn generate_brief_for_query(&self, _query: &str, _max_items: usize) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn upsert_session_summary(&self, _session_key: &str, _summary: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_session_summary(&self, _session_key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn maintenance(&self, _recycle_days: i64) -> Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+    }
+
+    fn test_context(memory_store: Arc<dyn crate::MemoryStoreOps + Send + Sync>) -> ToolContext {
+        ToolContext {
+            workspace: PathBuf::from("/tmp/workspace"),
+            builtin_skills_dir: None,
+            active_skill_dir: None,
+            session_key: "cli:test".to_string(),
+            channel: "cli".to_string(),
+            account_id: None,
+            chat_id: "chat-1".to_string(),
+            config: Config::default(),
+            permissions: blockcell_core::types::PermissionSet::new(),
+            task_manager: None,
+            memory_store: Some(memory_store),
+            outbound_tx: None,
+            spawn_handle: None,
+            capability_registry: None,
+            core_evolution: None,
+            event_emitter: None,
+            channel_contacts_file: None,
+            response_cache: None,
+        }
+    }
+
+    fn schema_enum_values(parameters: &Value, field: &str) -> Vec<String> {
+        parameters["properties"][field]["enum"]
+            .as_array()
+            .expect("enum array")
+            .iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect()
+    }
 
     #[test]
     fn test_memory_query_schema() {
@@ -397,6 +509,16 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_query_schema_uses_canonical_types() {
+        let tool = MemoryQueryTool;
+        let schema = tool.schema();
+        let types = schema_enum_values(&schema.parameters, "type");
+
+        assert!(!types.contains(&"summary".to_string()));
+        assert!(types.contains(&"session_summary".to_string()));
+    }
+
+    #[test]
     fn test_memory_upsert_schema() {
         let tool = MemoryUpsertTool;
         let schema = tool.schema();
@@ -404,10 +526,40 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_upsert_schema_uses_allowed_types_only() {
+        let tool = MemoryUpsertTool;
+        let schema = tool.schema();
+        let types = schema_enum_values(&schema.parameters, "type");
+
+        assert!(!types.contains(&"summary".to_string()));
+        assert!(!types.contains(&"session_summary".to_string()));
+    }
+
+    #[test]
     fn test_memory_upsert_validate() {
         let tool = MemoryUpsertTool;
         assert!(tool.validate(&json!({"content": "remember this"})).is_ok());
         assert!(tool.validate(&json!({})).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_memory_upsert_execute_leaves_default_ttl_to_storage_service() {
+        let store = Arc::new(CaptureMemoryStore::new());
+        let tool = MemoryUpsertTool;
+
+        tool.execute(
+            test_context(store.clone()),
+            json!({
+                "content": "remember this",
+                "scope": "short_term",
+                "type": "note"
+            }),
+        )
+        .await
+        .expect("memory_upsert should succeed");
+
+        let captured = store.last_upsert();
+        assert!(captured["expires_at"].is_null());
     }
 
     #[test]

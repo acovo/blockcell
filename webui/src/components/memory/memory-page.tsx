@@ -166,7 +166,7 @@ export function MemoryPage() {
               onChange={(e) => setNewMemory({ ...newMemory, type: e.target.value })}
               className="px-3 py-1.5 text-sm bg-background border border-border rounded-lg outline-none"
             >
-              {['note', 'fact', 'preference', 'project', 'task', 'glossary', 'contact', 'snippet', 'policy', 'summary'].map((tp) => (
+              {['note', 'fact', 'preference', 'project', 'task', 'glossary', 'contact', 'snippet', 'policy'].map((tp) => (
                 <option key={tp} value={tp}>{tp}</option>
               ))}
             </select>
