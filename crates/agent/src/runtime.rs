@@ -905,23 +905,6 @@ fn resolve_effective_tool_names(
         }
     };
 
-    // DEBUG: Log profile tools containing napcat
-    {
-        let napcat_in_profile: Vec<&str> = profile_tools
-            .iter()
-            .filter(|t| t.starts_with("napcat_"))
-            .map(String::as_str)
-            .collect();
-        if !napcat_in_profile.is_empty() {
-            tracing::info!(
-                mode = ?mode,
-                intents = ?intents,
-                napcat_from_profile = ?napcat_in_profile,
-                "DEBUG: NapCatQQ tools from profile"
-            );
-        }
-    }
-
     tool_names.append(&mut profile_tools);
 
     if let Some(skill) = active_skill {
@@ -933,13 +916,6 @@ fn resolve_effective_tool_names(
 
     // Filter napcat tools by config enabled state
     if !config.channels.napcat.enabled {
-        let napcat_count = tool_names.iter().filter(|n| n.starts_with("napcat_")).count();
-        if napcat_count > 0 {
-            tracing::info!(
-                napcat_tools_removed = napcat_count,
-                "DEBUG: Removing napcat tools because config.channels.napcat.enabled=false"
-            );
-        }
         tool_names.retain(|name| !name.starts_with("napcat_"));
     }
 
@@ -2989,22 +2965,6 @@ impl AgentRuntime {
         let available_tools: HashSet<String> =
             self.tool_registry.tool_names().into_iter().collect();
 
-        // DEBUG: Log napcat config and available tools
-        {
-            let napcat_enabled = self.config.channels.napcat.enabled;
-            let napcat_in_registry: Vec<&str> = available_tools
-                .iter()
-                .filter(|t| t.starts_with("napcat_"))
-                .map(String::as_str)
-                .collect();
-            info!(
-                napcat_enabled = napcat_enabled,
-                napcat_tools_in_registry = ?napcat_in_registry,
-                total_available_tools = available_tools.len(),
-                "DEBUG: NapCatQQ tool visibility check"
-            );
-        }
-
         let routed_agent_id = self.agent_id.as_deref();
         let mut tool_names = resolve_effective_tool_names(
             &self.config,
@@ -3014,22 +2974,6 @@ impl AgentRuntime {
             &decision.chat_intents,
             &available_tools,
         );
-
-        // DEBUG: Log resolved tools
-        {
-            let napcat_in_resolved: Vec<&str> = tool_names
-                .iter()
-                .filter(|t| t.starts_with("napcat_"))
-                .map(String::as_str)
-                .collect();
-            info!(
-                mode = ?decision.mode,
-                intents = ?decision.chat_intents,
-                napcat_tools_resolved = ?napcat_in_resolved,
-                total_resolved_tools = tool_names.len(),
-                "DEBUG: Resolved tools for LLM"
-            );
-        }
 
         if tool_names.is_empty() && !matches!(decision.mode, InteractionMode::Chat) {
             tool_names = global_core_tool_names();
@@ -3130,20 +3074,6 @@ impl AgentRuntime {
                 &tool_name_refs,
                 blockcell_tools::registry::global_core_tool_names(),
             );
-
-            // DEBUG: Log actual schemas sent to LLM
-            {
-                let napcat_schemas: Vec<&str> = schemas
-                    .iter()
-                    .filter_map(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
-                    .filter(|n| n.starts_with("napcat_"))
-                    .collect();
-                info!(
-                    napcat_tools_in_schemas = ?napcat_schemas,
-                    total_schemas = schemas.len(),
-                    "DEBUG: Tool schemas sent to LLM"
-                );
-            }
 
             if !disabled_tools.is_empty() {
                 schemas.retain(|schema| {
@@ -3339,13 +3269,6 @@ impl AgentRuntime {
                 let mut wants_forced_answer = false;
                 let mut web_search_thin_results: Vec<String> = Vec::new(); // URLs from thin search results
                 for tool_call in &response.tool_calls {
-                    // DEBUG: Log tool call
-                    info!(
-                        tool_name = %tool_call.name,
-                        tool_id = %tool_call.id,
-                        "DEBUG: LLM requested tool call"
-                    );
-
                     if tool_call.name == "web_search" || tool_call.name == "web_fetch" {
                         wants_forced_answer = true;
                     }
@@ -3367,19 +3290,6 @@ impl AgentRuntime {
                     } else {
                         scoped_tool_denied_result(&tool_call.name)
                     };
-
-                    // DEBUG: Log tool execution result
-                    // Use chars() to safely truncate at UTF-8 character boundaries
-                    let result_preview: String = if result.chars().count() > 200 {
-                        format!("{}... (truncated, {} chars total)", result.chars().take(200).collect::<String>(), result.chars().count())
-                    } else {
-                        result.clone()
-                    };
-                    info!(
-                        tool_name = %tool_call.name,
-                        result_preview = %result_preview,
-                        "DEBUG: Tool execution result"
-                    );
 
                     metrics.record_tool_execution(&tool_call.name, tool_timer.elapsed_ms());
 

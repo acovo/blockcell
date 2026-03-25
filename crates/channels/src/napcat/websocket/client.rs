@@ -745,15 +745,7 @@ impl NapCatWsClient {
                         if let Some(tx) = pending.remove(&echo) {
                             if let Ok(response) = serde_json::from_value::<ApiResponse>(event.clone()) {
                                 let _ = tx.send(response);
-                            } else {
-                                warn!(echo = %echo, "Failed to parse API response");
                             }
-                        } else {
-                            warn!(
-                                echo = %echo,
-                                pending_count = pending.len(),
-                                "API response received but no matching pending request"
-                            );
                         }
                     } else {
                         // API response without echo - might be an async notification or error

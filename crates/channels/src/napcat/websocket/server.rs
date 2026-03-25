@@ -639,17 +639,10 @@ impl NapCatWsServer {
                         if let Some(tx) = pending.remove(&echo) {
                             if let Ok(response) = serde_json::from_value::<ApiResponse>(event.clone()) {
                                 let _ = tx.send(response);
-                            } else {
-                                warn!(echo = %echo, "Failed to parse API response");
                             }
-                        } else {
-                            warn!(
-                                echo = %echo,
-                                "API response received but no matching pending request"
-                            );
                         }
                     } else {
-                        warn!(echo_value = ?echo_value, "API response received but no valid echo field");
+                        // API response without echo - might be an async notification or error
                     }
                 }
                 _ => {}

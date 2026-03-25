@@ -408,10 +408,14 @@ pub fn build_enhanced_content(
 
     content.push_str("---\n");
 
-    // 提示 LLM 关于媒体文件的处理规则
-    content.push_str("\n【媒体文件说明】以上文件已在当前聊天中存在。\n");
-    content.push_str("- 默认情况：无需发送回用户，直接用文字回复即可。\n");
-    content.push_str("- 用户要求发回或转发时：请执行用户的请求，将文件发送给指定对象。\n");
+    // 强调：除非用户显式要求，否则不要发送媒体回群聊
+    content.push_str("\n【重要提示 - 媒体文件处理规则】\n");
+    content.push_str("以上文件是用户刚刚发送到聊天中的媒体，已在聊天中展示。\n");
+    content.push_str("⚠️ 除非用户明确要求你「发送」「转发」「传给某人」这些文件，否则：\n");
+    content.push_str("  - 不要使用任何 napcat 发送工具（如 send_image、upload_file 等）\n");
+    content.push_str("  - 不要将文件路径放入任何发送消息的工具参数中\n");
+    content.push_str("  - 只需用文字回复用户即可，不要重复发送已有媒体\n");
+    content.push_str("用户如果需要你处理这些文件（如分析、识别、转写等），请使用相应的工具处理。\n");
 
     content
 }
