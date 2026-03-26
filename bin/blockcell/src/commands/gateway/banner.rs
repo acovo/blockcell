@@ -358,6 +358,17 @@ pub(super) fn print_startup_banner(
                 "no app_id configured".into()
             },
         },
+        ChannelInfo {
+            id: "weixin",
+            name: "Weixin",
+            enabled: ch.weixin.enabled,
+            configured: blockcell_channels::account::channel_configured(config, "weixin"),
+            detail: if !ch.weixin.token.is_empty() {
+                format!("allow_from: {:?}", ch.weixin.allow_from)
+            } else {
+                "no token configured".into()
+            },
+        },
     ];
 
     let mut enabled_routes: Vec<ChannelRouteLine> = Vec::new();
@@ -439,6 +450,13 @@ pub(super) fn print_startup_banner(
                             .get(account)
                             .map(|acc| format!("app_id: {}  env: {}", acc.app_id, if acc.environment.is_empty() { "production" } else { &acc.environment }))
                             .unwrap_or_else(|| ch_info.detail.clone()),
+                        ("weixin", Some(account)) => config
+                            .channels
+                            .weixin
+                            .accounts
+                            .get(account)
+                            .map(|acc| format!("allow_from: {:?}", acc.allow_from))
+                            .unwrap_or_else(|| ch_info.detail.clone()),
                         _ => ch_info.detail.clone(),
                     };
                     let suffix = match ch_info.id {
@@ -476,6 +494,10 @@ pub(super) fn print_startup_banner(
                         ),
                         "qq" => default_marker(
                             config.channels.qq.default_account_id.as_ref(),
+                            account_id,
+                        ),
+                        "weixin" => default_marker(
+                            config.channels.weixin.default_account_id.as_ref(),
                             account_id,
                         ),
                         _ => "",
