@@ -201,12 +201,12 @@ fn execute_cron_action_with_paths(
                 _ => "unknown".to_string(),
             };
 
+            // Don't return 'message' to prevent LLM from echoing/simulating the reminder content
             Ok(json!({
                 "status": "created",
                 "job_id": job_id,
                 "name": name,
-                "schedule": schedule_desc,
-                "message": message
+                "schedule": schedule_desc
             }))
         }
         "list" => {
@@ -383,7 +383,7 @@ impl Tool for CronTool {
         };
 
         Some(format!(
-            "- **定时任务 (cron)**: 用户要求定时执行某项任务时，先判断执行模式。**纯提醒**（如起床提醒、喝水提醒）用 `mode='reminder'`，`message` 直接写最终发给用户的话，不要写成待分析任务；触发时会直接发送，不经过 LLM。若任务需要真正执行某个技能脚本，先调用 `list_skills` 查找技能，再用 `mode='script'` 并设置 `skill_name='...'`。若任务本身就是一段需要模型理解、调用工具、再整理结果的指令（如定时搜索新闻、抓取网页、汇总情报），用 `mode='agent'`，这样触发时会进入正常 agent LLM/tool loop。`mode` 省略时：有 `skill_name` 默认 `script`，否则默认 `reminder`。**一次性任务优先用 `delay_seconds`**（如5分钟后用 `delay_seconds=300`），避免 `at_ms` 单位错误。{}。只有用户**明确**指定特定时区时才需设置 `tz` 参数（如'纽约时间9点'、'东京时间'），自动转换为 IANA 名称（如 `America/New_York`、`Asia/Tokyo`）。一次性任务设 `delete_after_run=true`；周期任务用 `cron_expr` 或 `every_seconds`。`every_seconds` 任务默认等待一个周期后首次执行，若需立即执行设 `run_immediately=true`。",
+            "- **定时任务 (cron)**: 用户要求定时执行某项任务时，先判断执行模式。**纯提醒**（如起床提醒、喝水提醒）用 `mode='reminder'`，`message` 直接写最终发给用户的话，不要写成待分析任务；触发时会直接发送，不经过 LLM。若任务需要真正执行某个技能脚本，先调用 `list_skills` 查找技能，再用 `mode='script'` 并设置 `skill_name='...'`。若任务本身就是一段需要模型理解、调用工具、再整理结果的指令（如定时搜索新闻、抓取网页、汇总情报），用 `mode='agent'`，这样触发时会进入正常 agent LLM/tool loop。`mode` 省略时：有 `skill_name` 默认 `script`，否则默认 `reminder`。**一次性任务优先用 `delay_seconds`**（如5分钟后用 `delay_seconds=300`），避免 `at_ms` 单位错误。{}。只有用户**明确**指定特定时区时才需设置 `tz` 参数（如'纽约时间9点'、'东京时间'），自动转换为 IANA 名称（如 `America/New_York`、`Asia/Tokyo`）。一次性任务设 `delete_after_run=true`；周期任务用 `cron_expr` 或 `every_seconds`。`every_seconds` 任务默认等待一个周期后首次执行，若需立即执行设 `run_immediately=true`。**⚠️ 设置成功后用温暖的语气简洁确认，格式示例：'好的，已为你设置「任务名」，每天 19:29（东八区）会准时提醒你。'。注意括号内的时区根据实际使用的时区填写（如用户指定了东京时间则写东九区）。禁止输出⏰符号、禁止模拟提醒消息内容、禁止写'时间到啦'之类的话。提醒消息由系统自动发送，你只需确认即可。**",
             tz_hint
         ))
     }
