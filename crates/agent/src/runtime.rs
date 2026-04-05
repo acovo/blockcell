@@ -3872,28 +3872,52 @@ impl AgentRuntime {
                         let model_for_type = model.clone();
                         let reload_flag_for_type = Arc::clone(&reload_flag);
 
+                        // 获取最后一条用户消息的 UUID（用于游标更新）
+                        let last_user_uuid = history_for_type
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == "user")
+                            .and_then(|m| m.id.clone())
+                            .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+                            .unwrap_or_else(uuid::Uuid::new_v4);
+
+                        let message_count = history_for_type.len();
+
                         let handle = tokio::spawn(async move {
+                            // 创建提取器（会加载持久化的游标状态）
+                            let mut extractor = match crate::auto_memory::AutoMemoryExtractor::new(&config_dir_for_type).await {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    warn!(error = %e, "[layer5] Failed to create AutoMemoryExtractor");
+                                    return;
+                                }
+                            };
+
                             let system_prompt = Arc::new(
                                 "你是一个记忆提取助手。请从对话中提取用户偏好、项目信息、反馈和外部资源引用。"
                                     .to_string(),
                             );
 
-                            let cursor = crate::auto_memory::ExtractionCursor::new(memory_type);
-                            let result = crate::auto_memory::extract_auto_memory(
-                                provider_pool_for_type,
-                                &config_dir_for_type,
+                            // 使用 ExtractionParams 和 extract() 方法
+                            // 这样游标状态会被正确更新和保存
+                            let params = crate::auto_memory::ExtractionParams {
+                                provider_pool: provider_pool_for_type,
                                 memory_type,
                                 system_prompt,
-                                &model_for_type,
-                                history_for_type,
-                                cursor,
-                            ).await;
+                                model: model_for_type,
+                                messages: history_for_type,
+                                last_message_uuid: last_user_uuid,
+                                message_count,
+                            };
+
+                            let result = extractor.extract(params).await;
 
                             if result.success {
                                 info!(
                                     memory_type = memory_type.name(),
                                     input_tokens = result.input_tokens,
                                     output_tokens = result.output_tokens,
+                                    cursor_save_failed = result.cursor_save_failed,
                                     "[layer5] Auto Memory extraction completed"
                                 );
                                 // 标记需要刷新缓存
