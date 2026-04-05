@@ -1,6 +1,6 @@
 # blockcell Technical Article Series: “A Self-Evolving AI Agent Framework”
 
-> The complete series index for blockcell. It currently contains 22 articles, all aligned to the real codebase and current product behavior.
+> The complete series index for blockcell. It currently contains 24 articles, all aligned to the real codebase and current product behavior.
 
 ---
 
@@ -13,7 +13,7 @@ This series covers the product from first use to advanced architecture topics, i
 - what blockcell is and how to get started
 - tools, skills, memory, channels, browser automation, and gateway mode
 - self-evolution, subagents, Ghost, and the Hub community
-- production-facing topics such as the CLI, provider config, MCP, provider pools, and multi-profile intent routing
+- production-facing topics such as the CLI, provider config, MCP, provider pools, multi-profile intent routing, and multi-agent configuration
 
 For the naming story, see:
 
@@ -45,8 +45,9 @@ For the naming story, see:
 | 18 | [Proxy and Provider Configuration](./18_proxy_and_provider_config.md) | `config.json5`, provider resolution, proxy precedence, and the WebUI raw editor | Intermediate |
 | 19 | [MCP Server Integration](./19_mcp_servers.md) | standalone `mcp.json` / `mcp.d`, template-based setup, and agent visibility binding | Intermediate |
 | 20 | [Provider Pool — Multi-Model High Availability](./20_provider_pool.md) | `modelPool`, priority, weight, failover, and CLI overrides | Advanced |
-| 21 | [intentRouter Multi-Profile Guide](./21_intent_router_profiles.md) | multi-agent intent routing, tool-set composition, and MCP visibility control | Advanced |
+| 21 | [intentRouter Multi-Agent Configuration Guide](./21_intent_router_profiles.md) | agent profile binding, intentRouter profiles, tool composition, and examples | Advanced |
 | 22 | [Path Access Policy](./22_path_access_policy.md) | `path_access.json5`, allow/confirm/deny rules, built-in sensitive path protection | Intermediate |
+| 23 | [Weixin Integration Guide](./23_weixin_integration.md) | Weixin QR-code login, owner binding, and multi-account routing | Intermediate |
 
 ---
 

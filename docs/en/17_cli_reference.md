@@ -425,7 +425,7 @@ blockcell channels <SUBCOMMAND>
 | Subcommand | Description |
 |------|------|
 | `status` | Show channel connection status |
-| `login <CHANNEL>` | Log in to a channel, currently used mainly for WhatsApp QR login |
+| `login <CHANNEL>` | Log in to a channel, currently used mainly for WhatsApp and Weixin QR login |
 | `owner list` | List fallback owners and account-level owner overrides |
 | `owner set --channel <NAME> [--account <ACCOUNT_ID>] --agent <ID>` | Set the owner agent for a channel or account |
 | `owner clear --channel <NAME> [--account <ACCOUNT_ID>]` | Clear the owner binding |

@@ -56,18 +56,18 @@ blockcell channels owner set --channel weixin --agent default
 
 如果你有自己的 Agent，也可以把 `default` 换成你的 Agent 名称。
 
+如果你要给微信的某个账号单独绑定 owner，也可以继续用 `--account <ACCOUNT_ID>`：
+
+```bash
+blockcell channels owner set --channel weixin --account bot1 --agent default
+```
+
 ## 三、启动 blockcell
 
 登录和 owner 设置完成后，就可以启动了：
 
 ```bash
 blockcell gateway
-```
-
-或者你平时用的是 agent 模式，也可以直接启动：
-
-```bash
-blockcell agent
 ```
 
 启动成功后，微信消息就会进入 blockcell 的处理流程。
@@ -98,6 +98,7 @@ blockcell agent
 
 - `token` 是登录后自动保存的
 - `channelOwners.weixin` 一定要有值
+- 如果你只有单个微信账号，保留顶层 `token` 就够了；`accounts` 和 `defaultAccountId` 主要用于多账号场景
 
 ## 五、常见问题
 
@@ -128,6 +129,7 @@ blockcell channels login weixin
 - `channels.weixin.enabled` 是否为 `true`
 - `channels.weixin.token` 是否已经保存
 - `channelOwners.weixin` 是否已设置
+- 如果你用了账号级绑定，再检查 `channelAccountOwners.weixin` 是否存在对应账号
 
 ## 六、推荐的标准流程
 

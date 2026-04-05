@@ -89,7 +89,7 @@ pub fn create_provider(
     model: &str,
     explicit_provider: Option<&str>,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    create_provider_with_tool_mode(config, model, explicit_provider, None)
+    create_provider_with_tool_mode(config, model, explicit_provider, None, None)
 }
 
 pub fn create_provider_with_tool_mode(
@@ -97,9 +97,10 @@ pub fn create_provider_with_tool_mode(
     model: &str,
     explicit_provider: Option<&str>,
     tool_call_mode: Option<ToolCallMode>,
+    temperature_override: Option<f32>,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let max_tokens = config.agents.defaults.max_tokens;
-    let temperature = config.agents.defaults.temperature;
+    let temperature = temperature_override.unwrap_or(config.agents.defaults.temperature);
 
     // 优先级1：显式指定
     // 优先级2：model 前缀推断
@@ -268,7 +269,7 @@ pub fn create_provider_with_tool_mode(
 pub fn create_main_provider(config: &Config) -> anyhow::Result<Box<dyn Provider>> {
     let model = &config.agents.defaults.model;
     let explicit_provider = config.agents.defaults.provider.as_deref();
-    create_provider_with_tool_mode(config, model, explicit_provider, None)
+    create_provider_with_tool_mode(config, model, explicit_provider, None, None)
 }
 
 /// 为自进化创建独立的 provider
@@ -289,7 +290,7 @@ pub fn create_evolution_provider(config: &Config) -> anyhow::Result<Box<dyn Prov
         .as_deref()
         .or(config.agents.defaults.provider.as_deref());
 
-    create_provider_with_tool_mode(config, model, explicit_provider, None)
+    create_provider_with_tool_mode(config, model, explicit_provider, None, None)
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use crate::evolution::SkillLayout;
 use blockcell_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,10 @@ pub struct SkillVersion {
     pub created_by: VersionSource,
     pub changelog: Option<String>,
     pub parent_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<SkillLayout>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
 }
 
 /// 版本来源
@@ -81,6 +86,8 @@ impl VersionManager {
 
         // 计算当前技能内容的 hash
         let hash = self.compute_skill_hash(skill_name)?;
+        let skill_dir = self.skills_dir.join(skill_name);
+        let (layout, source_path) = Self::detect_skill_layout_and_source_path(&skill_dir);
 
         let new_version = SkillVersion {
             version: version.clone(),
@@ -89,6 +96,8 @@ impl VersionManager {
             created_by: source,
             changelog,
             parent_version: Some(history.current_version.clone()),
+            layout,
+            source_path,
         };
 
         // 保存版本快照
@@ -256,6 +265,13 @@ impl VersionManager {
     }
 
     fn read_snapshot_primary_script(snapshot_dir: &Path) -> Result<String> {
+        if let Some(source_path) = Self::snapshot_source_path(snapshot_dir) {
+            let source_file = snapshot_dir.join(source_path);
+            if source_file.exists() {
+                return Ok(std::fs::read_to_string(source_file)?);
+            }
+        }
+
         let file_path = Self::primary_skill_file(snapshot_dir).ok_or_else(|| {
             Error::NotFound(format!(
                 "No skill script found in snapshot: {}",
@@ -267,7 +283,7 @@ impl VersionManager {
 
     fn compute_skill_hash(&self, skill_name: &str) -> Result<String> {
         let skill_dir = self.skills_dir.join(skill_name);
-        let Some(skill_file) = Self::primary_skill_file(&skill_dir) else {
+        let Some(skill_file) = Self::skill_primary_file(&skill_dir) else {
             return Ok("empty".to_string());
         };
 
@@ -276,40 +292,242 @@ impl VersionManager {
         Ok(hash)
     }
 
+    fn skill_primary_file(skill_dir: &Path) -> Option<PathBuf> {
+        if let Some(source_path) = Self::detect_skill_layout_and_source_path(skill_dir).1 {
+            let source_file = skill_dir.join(source_path);
+            if source_file.exists() {
+                return Some(source_file);
+            }
+        }
+
+        Self::primary_skill_file(skill_dir)
+    }
+
+    fn detect_skill_layout_and_source_path(skill_dir: &Path) -> (Option<SkillLayout>, Option<String>) {
+        let has_skill_md = skill_dir.join("SKILL.md").exists();
+
+        if skill_dir.join("SKILL.rhai").exists() {
+            return (Some(SkillLayout::RhaiOrchestration), Some("SKILL.rhai".to_string()));
+        }
+
+        if skill_dir.join("SKILL.py").exists() {
+            let layout = if has_skill_md {
+                SkillLayout::Hybrid
+            } else {
+                SkillLayout::LocalScript
+            };
+            return (Some(layout), Some("SKILL.py".to_string()));
+        }
+
+        if let Some(legacy_py_path) = Self::first_legacy_python_script(skill_dir) {
+            let rel = legacy_py_path
+                .strip_prefix(skill_dir)
+                .ok()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| legacy_py_path.display().to_string());
+            let layout = if has_skill_md {
+                SkillLayout::Hybrid
+            } else {
+                SkillLayout::LocalScript
+            };
+            return (Some(layout), Some(rel));
+        }
+
+        if let Some(local_script_path) = Self::first_local_script_asset(skill_dir) {
+            let rel = local_script_path
+                .strip_prefix(skill_dir)
+                .ok()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| local_script_path.display().to_string());
+            let layout = if has_skill_md {
+                SkillLayout::Hybrid
+            } else {
+                SkillLayout::LocalScript
+            };
+            return (Some(layout), Some(rel));
+        }
+
+        if has_skill_md {
+            return (Some(SkillLayout::PromptTool), Some("SKILL.md".to_string()));
+        }
+
+        (None, None)
+    }
+
+    fn snapshot_source_path(snapshot_dir: &Path) -> Option<String> {
+        let version_path = snapshot_dir.join("version.json");
+        let content = std::fs::read_to_string(version_path).ok()?;
+        let version: SkillVersion = serde_json::from_str(&content).ok()?;
+        version.source_path
+    }
+
+    fn first_legacy_python_script(skill_dir: &Path) -> Option<PathBuf> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+
+        let scripts_dir = skill_dir.join("scripts");
+        if scripts_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().is_some_and(|e| e == "py") {
+                        candidates.push(path);
+                    }
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            if let Ok(entries) = std::fs::read_dir(skill_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file()
+                        && path.file_name().and_then(|n| n.to_str()) != Some("SKILL.py")
+                        && path.extension().is_some_and(|e| e == "py")
+                    {
+                        candidates.push(path);
+                    }
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+        candidates.into_iter().next()
+    }
+
+    fn first_local_script_asset(skill_dir: &Path) -> Option<PathBuf> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+
+        let allowed_extensions = ["sh", "bash", "zsh", "js", "php", "rb"];
+        let scan_dir = |dir: &Path, candidates: &mut Vec<PathBuf>| {
+            if !dir.is_dir() {
+                return;
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let ext_ok = path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| allowed_extensions.contains(&ext));
+                    let no_ext_exec = path.extension().is_none() && Self::looks_executable(&path);
+                    if ext_ok || no_ext_exec {
+                        candidates.push(path);
+                    }
+                }
+            }
+        };
+
+        scan_dir(&skill_dir.join("scripts"), &mut candidates);
+        scan_dir(&skill_dir.join("bin"), &mut candidates);
+
+        if candidates.is_empty() {
+            if let Ok(entries) = std::fs::read_dir(skill_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if matches!(file_name, "SKILL.md" | "SKILL.py" | "SKILL.rhai" | "meta.yaml" | "meta.json") {
+                        continue;
+                    }
+                    let ext_ok = path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| allowed_extensions.contains(&ext));
+                    let no_ext_exec = path.extension().is_none() && Self::looks_executable(&path);
+                    if ext_ok || no_ext_exec {
+                        candidates.push(path);
+                    }
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+        candidates.into_iter().next()
+    }
+
+    fn copy_dir_contents(src: &Path, dst: &Path, excluded_names: &[&str]) -> Result<()> {
+        std::fs::create_dir_all(dst)?;
+
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if excluded_names.iter().any(|excluded| *excluded == name_str) {
+                continue;
+            }
+
+            Self::copy_path_recursive(&entry.path(), &dst.join(name))?;
+        }
+
+        Ok(())
+    }
+
+    fn copy_path_recursive(src: &Path, dst: &Path) -> Result<()> {
+        if src.is_dir() {
+            std::fs::create_dir_all(dst)?;
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                Self::copy_path_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+            }
+            return Ok(());
+        }
+
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+        Ok(())
+    }
+
+    fn clear_skill_asset_tree(skill_dir: &Path) -> Result<()> {
+        if !skill_dir.exists() {
+            std::fs::create_dir_all(skill_dir)?;
+            return Ok(());
+        }
+
+        for entry in std::fs::read_dir(skill_dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if matches!(file_name.to_str(), Some("versions") | Some("version_history.json")) {
+                continue;
+            }
+
+            let path = entry.path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(path)?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn looks_executable(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    fn looks_executable(_path: &Path) -> bool {
+        false
+    }
+
     fn save_version_snapshot(&self, skill_name: &str, version: &SkillVersion) -> Result<()> {
         let snapshot_dir = self.get_version_snapshot_dir(skill_name, &version.version);
         std::fs::create_dir_all(&snapshot_dir)?;
 
         let skill_dir = self.skills_dir.join(skill_name);
 
-        // 复制 SKILL.rhai
-        let skill_file = skill_dir.join("SKILL.rhai");
-        if skill_file.exists() {
-            std::fs::copy(&skill_file, snapshot_dir.join("SKILL.rhai"))?;
-        }
-
-        // 复制 SKILL.py
-        let py_file = skill_dir.join("SKILL.py");
-        if py_file.exists() {
-            std::fs::copy(&py_file, snapshot_dir.join("SKILL.py"))?;
-        }
-
-        // 复制 meta.yaml 或 meta.json
-        let meta_yaml = skill_dir.join("meta.yaml");
-        if meta_yaml.exists() {
-            std::fs::copy(&meta_yaml, snapshot_dir.join("meta.yaml"))?;
-        }
-
-        let meta_json = skill_dir.join("meta.json");
-        if meta_json.exists() {
-            std::fs::copy(&meta_json, snapshot_dir.join("meta.json"))?;
-        }
-
-        // 复制 SKILL.md
-        let skill_md = skill_dir.join("SKILL.md");
-        if skill_md.exists() {
-            std::fs::copy(&skill_md, snapshot_dir.join("SKILL.md"))?;
-        }
+        Self::copy_dir_contents(&skill_dir, &snapshot_dir, &["versions", "version_history.json", "version.json"])?;
 
         // 保存版本元数据
         let version_meta = serde_json::to_string_pretty(version)?;
@@ -330,42 +548,8 @@ impl VersionManager {
 
         let skill_dir = self.skills_dir.join(skill_name);
 
-        // 清理当前目录中的脚本文件，避免恢复后保留旧脚本类型
-        for filename in &["SKILL.rhai", "SKILL.py"] {
-            let path = skill_dir.join(filename);
-            if path.exists() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-
-        // 恢复 SKILL.rhai
-        let snapshot_skill = snapshot_dir.join("SKILL.rhai");
-        if snapshot_skill.exists() {
-            std::fs::copy(&snapshot_skill, skill_dir.join("SKILL.rhai"))?;
-        }
-
-        // 恢复 SKILL.py
-        let snapshot_py = snapshot_dir.join("SKILL.py");
-        if snapshot_py.exists() {
-            std::fs::copy(&snapshot_py, skill_dir.join("SKILL.py"))?;
-        }
-
-        // 恢复 meta 文件
-        let snapshot_meta_yaml = snapshot_dir.join("meta.yaml");
-        if snapshot_meta_yaml.exists() {
-            std::fs::copy(&snapshot_meta_yaml, skill_dir.join("meta.yaml"))?;
-        }
-
-        let snapshot_meta_json = snapshot_dir.join("meta.json");
-        if snapshot_meta_json.exists() {
-            std::fs::copy(&snapshot_meta_json, skill_dir.join("meta.json"))?;
-        }
-
-        // 恢复 SKILL.md
-        let snapshot_md = snapshot_dir.join("SKILL.md");
-        if snapshot_md.exists() {
-            std::fs::copy(&snapshot_md, skill_dir.join("SKILL.md"))?;
-        }
+        Self::clear_skill_asset_tree(&skill_dir)?;
+        Self::copy_dir_contents(&snapshot_dir, &skill_dir, &["version.json"])?;
 
         Ok(())
     }
@@ -452,6 +636,16 @@ impl VersionManager {
         let version_meta_content = std::fs::read_to_string(&version_meta_path)?;
         let mut version: SkillVersion = serde_json::from_str(&version_meta_content)?;
 
+        if version.layout.is_none() || version.source_path.is_none() {
+            let (layout, source_path) = Self::detect_skill_layout_and_source_path(&temp_dir.join(skill_name));
+            if version.layout.is_none() {
+                version.layout = layout;
+            }
+            if version.source_path.is_none() {
+                version.source_path = source_path;
+            }
+        }
+
         // 修改版本号和来源
         let mut history = self.get_history(skill_name)?;
         let version_num = history.versions.len() + 1;
@@ -463,11 +657,7 @@ impl VersionManager {
         let snapshot_dir = self.get_version_snapshot_dir(skill_name, &version.version);
         std::fs::create_dir_all(&snapshot_dir)?;
 
-        for entry in std::fs::read_dir(temp_dir.join(skill_name))? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            std::fs::copy(entry.path(), snapshot_dir.join(&file_name))?;
-        }
+        Self::copy_dir_contents(&temp_dir.join(skill_name), &snapshot_dir, &[])?;
 
         // 更新历史
         history.versions.push(version.clone());
@@ -566,6 +756,147 @@ mod tests {
             .expect("diff versions");
         assert!(diff.contains("print('v1')"));
         assert!(diff.contains("print('v2')"));
+
+        let _ = std::fs::remove_dir_all(skills_dir);
+    }
+
+    #[test]
+    fn test_version_snapshot_restores_nested_assets_and_metadata() {
+        let skills_dir = temp_skills_dir("restore_tree");
+        let skill_name = "restore_skill";
+        let skill_dir = skills_dir.join(skill_name);
+        std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts dir");
+        std::fs::write(skill_dir.join("SKILL.md"), "# restore skill\n").expect("write SKILL.md");
+        std::fs::write(skill_dir.join("scripts/run.sh"), "#!/bin/sh\necho run\n")
+            .expect("write run script");
+
+        let vm = VersionManager::new(skills_dir.clone());
+        let version = vm
+            .create_version(skill_name, VersionSource::Manual, None)
+            .expect("create version");
+
+        assert_eq!(version.layout, Some(SkillLayout::Hybrid));
+        assert_eq!(version.source_path.as_deref(), Some("scripts/run.sh"));
+        assert!(skill_dir.join("versions/v1/scripts/run.sh").exists());
+
+        std::fs::write(skill_dir.join("SKILL.md"), "# mutated\n").expect("mutate SKILL.md");
+        std::fs::write(skill_dir.join("scripts/extra.sh"), "#!/bin/sh\necho extra\n")
+            .expect("write extra script");
+        std::fs::create_dir_all(skill_dir.join("bin")).expect("create bin dir");
+        std::fs::write(skill_dir.join("bin/helper.sh"), "#!/bin/sh\necho helper\n")
+            .expect("write helper script");
+
+        vm.switch_to_version(skill_name, "v1").expect("restore v1");
+
+        assert_eq!(std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap(), "# restore skill\n");
+        assert!(skill_dir.join("scripts/run.sh").exists());
+        assert!(!skill_dir.join("scripts/extra.sh").exists());
+        assert!(!skill_dir.join("bin/helper.sh").exists());
+
+        let _ = std::fs::remove_dir_all(skills_dir);
+    }
+
+    #[test]
+    fn test_import_version_preserves_nested_assets() {
+        let skills_dir = temp_skills_dir("import_tree");
+        let skill_name = "import_skill";
+        let skill_dir = skills_dir.join(skill_name);
+        std::fs::create_dir_all(skill_dir.join("bin")).expect("create bin dir");
+        std::fs::write(skill_dir.join("SKILL.md"), "# import skill\n").expect("write SKILL.md");
+        std::fs::write(skill_dir.join("bin/run.sh"), "#!/bin/sh\necho run\n")
+            .expect("write run script");
+
+        let vm = VersionManager::new(skills_dir.clone());
+        vm.create_version(skill_name, VersionSource::Manual, None)
+            .expect("create version");
+
+        let archive_path = skills_dir.join("import_skill.tar.gz");
+        vm.export_version(skill_name, "v1", &archive_path)
+            .expect("export version");
+
+        let imported = vm
+            .import_version(skill_name, &archive_path)
+            .expect("import version");
+
+        assert_eq!(imported.version, "v2");
+        assert!(skill_dir.join("versions/v2/bin/run.sh").exists());
+        assert_eq!(std::fs::read_to_string(skill_dir.join("versions/v2/bin/run.sh")).unwrap(), "#!/bin/sh\necho run\n");
+
+        let _ = std::fs::remove_dir_all(skills_dir);
+    }
+
+    #[test]
+    fn test_version_snapshot_preserves_manual_assets() {
+        let skills_dir = temp_skills_dir("manual_tree");
+        let skill_name = "manual_skill";
+        let skill_dir = skills_dir.join(skill_name);
+        std::fs::create_dir_all(skill_dir.join("manual")).expect("create manual dir");
+        std::fs::write(skill_dir.join("SKILL.md"), "# manual skill\n").expect("write SKILL.md");
+        std::fs::write(
+            skill_dir.join("manual/evolution.md"),
+            "## history\n- initial note\n",
+        )
+        .expect("write evolution manual");
+
+        let vm = VersionManager::new(skills_dir.clone());
+        vm.create_version(skill_name, VersionSource::Manual, None)
+            .expect("create version");
+
+        std::fs::write(
+            skill_dir.join("manual/evolution.md"),
+            "## history\n- mutated note\n",
+        )
+        .expect("mutate evolution manual");
+
+        vm.switch_to_version(skill_name, "v1").expect("restore v1");
+        assert_eq!(
+            std::fs::read_to_string(skill_dir.join("manual/evolution.md")).unwrap(),
+            "## history\n- initial note\n"
+        );
+
+        let archive_path = skills_dir.join("manual_skill.tar.gz");
+        vm.export_version(skill_name, "v1", &archive_path)
+            .expect("export version");
+        let imported = vm
+            .import_version(skill_name, &archive_path)
+            .expect("import version");
+
+        assert_eq!(imported.version, "v2");
+        assert_eq!(
+            std::fs::read_to_string(skill_dir.join("versions/v2/manual/evolution.md")).unwrap(),
+            "## history\n- initial note\n"
+        );
+
+        let _ = std::fs::remove_dir_all(skills_dir);
+    }
+
+    #[test]
+    fn test_version_snapshot_preserves_hybrid_python_and_scripts_assets() {
+        let skills_dir = temp_skills_dir("hybrid_python_tree");
+        let skill_name = "hybrid_skill";
+        let skill_dir = skills_dir.join(skill_name);
+        std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts dir");
+        std::fs::write(skill_dir.join("SKILL.md"), "# hybrid skill\n").expect("write SKILL.md");
+        std::fs::write(skill_dir.join("SKILL.py"), "print('hybrid')\n").expect("write SKILL.py");
+        std::fs::write(skill_dir.join("scripts/helper.sh"), "#!/bin/sh\necho helper\n")
+            .expect("write helper script");
+
+        let vm = VersionManager::new(skills_dir.clone());
+        let version = vm
+            .create_version(skill_name, VersionSource::Manual, None)
+            .expect("create version");
+
+        assert_eq!(version.layout, Some(SkillLayout::Hybrid));
+        assert_eq!(version.source_path.as_deref(), Some("SKILL.py"));
+        assert!(skill_dir.join("versions/v1/SKILL.py").exists());
+        assert!(skill_dir.join("versions/v1/scripts/helper.sh").exists());
+
+        std::fs::write(skill_dir.join("scripts/helper.sh"), "#!/bin/sh\necho mutated\n")
+            .expect("mutate helper script");
+        vm.switch_to_version(skill_name, "v1").expect("restore v1");
+
+        assert_eq!(std::fs::read_to_string(skill_dir.join("SKILL.py")).unwrap(), "print('hybrid')\n");
+        assert_eq!(std::fs::read_to_string(skill_dir.join("scripts/helper.sh")).unwrap(), "#!/bin/sh\necho helper\n");
 
         let _ = std::fs::remove_dir_all(skills_dir);
     }

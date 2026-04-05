@@ -59,7 +59,9 @@ pub struct JobPayload {
     pub channel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
-    /// For kind="script": the script runtime kind ("rhai" | "python")
+    /// For kind="script": detected skill file kind metadata ("rhai" | "python" | "markdown").
+    /// Currently stored for bookkeeping/UI only; runtime dispatch still routes through
+    /// the unified skill entry instead of branching on this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub script_kind: Option<String>,
     /// For kind="script": the skill directory name (e.g. "stock_monitor")

@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod capability_provider;
 pub mod capability_versioning;
 pub mod core_evolution;
@@ -18,7 +19,7 @@ pub use capability_versioning::{
 pub use core_evolution::CoreEvolution;
 pub use dispatcher::{SkillDispatchResult, SkillDispatcher, ToolCallRecord};
 pub use engine::{EngineConfig, ExecutionResult, RhaiEngine, SkillExecutor};
-pub use evolution::{EvolutionContext, LLMProvider, SkillEvolution, SkillType, TriggerReason};
+pub use evolution::{EvolutionContext, LLMProvider, SkillEvolution, SkillLayout, SkillType, TriggerReason};
 pub use manager::{Skill, SkillCard, SkillManager, SkillMeta, SkillTestFixture};
 pub use service::{
     is_builtin_tool, CapabilityErrorReport, ErrorReport, EvolutionService, EvolutionServiceConfig,

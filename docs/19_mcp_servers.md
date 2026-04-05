@@ -17,13 +17,13 @@
 
 现在的 blockcell 不再把 MCP 配置塞进 `config.json5` 的 `mcpServers` 字段，而是改成**独立 MCP 配置层**：
 
-- `~/.blockcell/mcp.json`：全局 MCP 元配置
-- `~/.blockcell/mcp.d/*.json`：按 server 拆分的独立文件
+- `~/.blockcell/mcp.json`：全局 MCP 根配置，包含 `defaults` 和 `servers`
+- `~/.blockcell/mcp.d/*.json`：按 server 拆分的独立文件，使用严格 JSON
 
 同时，MCP 与多 agent 的关系也更清晰：
 
 - **MCP 独立**：server 定义属于基础设施层
-- **agent 绑定权限视图**：agent 只声明允许访问哪些 MCP servers/tools
+- **agent 绑定权限视图**：agent 通过 `allowedMcpServers` / `allowedMcpTools` 声明允许访问哪些 MCP servers/tools
 - **运行时共享**：同一进程内，MCP server 由共享管理器统一启动与复用
 
 ## 快速开始
@@ -44,6 +44,27 @@ blockcell mcp list
 ### 方式二：直接编辑文件
 
 如果你使用 `blockcell mcp add github`，当前版本生成的模板里会写入 `${env:GITHUB_PERSONAL_ACCESS_TOKEN}` 这个**字面量占位符**。使用前请手动打开 `mcp.d/github.json`，把它替换成真实 token，或删除该键改为依赖父进程环境。
+
+根配置 `~/.blockcell/mcp.json` 的结构如下：
+
+```json
+{
+  "defaults": {
+    "startupTimeoutSecs": 20,
+    "callTimeoutSecs": 60,
+    "autoStart": true
+  },
+  "servers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_PERSONAL_ACCESS_TOKEN}"
+      }
+    }
+  }
+}
+```
 
 
 例如创建 `~/.blockcell/mcp.d/github.json`：
@@ -98,6 +119,13 @@ blockcell gateway
 | `autoStart` | bool | 启动 blockcell 时是否自动启动 |
 | `startupTimeoutSecs` | integer | 启动/握手超时 |
 | `callTimeoutSecs` | integer | 工具调用超时 |
+
+根配置 `mcp.json` 还支持：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `defaults` | object | 作用于所有 server 的默认超时与 autoStart 设置 |
+| `servers` | object | 以 server 名称为 key 的 root-level server 定义 |
 
 ## 工具命名规则
 
@@ -161,6 +189,8 @@ blockcell 内部通过共享 `McpManager` 管理 MCP：
 - `~/.blockcell/mcp.d/<name>.json`
 
 并检查 JSON 是否合法。
+
+注意：`mcp.json` 和 `mcp.d/*.json` 都是严格 JSON，不能使用 JSON5 注释语法。
 
 ### 2. 配置已写入但工具列表里没有 MCP 工具
 

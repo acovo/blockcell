@@ -959,6 +959,28 @@ pub(super) async fn handle_skill_install_external(
                 .unwrap_or_default(),
             openclaw_content,
         ),
+        blockcell_skills::SkillType::LocalScript => format!(
+            "Convert the following OpenClaw-compatible skill into a Blockcell local script / CLI skill asset.\n\
+            Skill name: {}\n\
+            {}\n\
+            Generate a COMPLETE local script entrypoint and a minimal compatible meta.yaml.\n\
+            Blockcell local-script runtime contract:\n\
+            - Script is executed through `exec_local` inside the active skill directory\n\
+            - Use relative paths only; do not depend on absolute paths\n\
+            - Read user input from stdin, args, or env when appropriate\n\
+            - Write user-facing results to stdout\n\
+            - meta.yaml should stay minimal: keep `name`, `description`, and only add `tools`/`requires`/`permissions`/`fallback` when truly needed\n\
+            - Do NOT generate any legacy routing or formatting fields\n\
+            Reuse useful logic from legacy OpenClaw scripts, but adapt the entrypoint and output format to Blockcell style.\n\
+            \n\
+            {}",
+            fm_name.as_deref().unwrap_or(&skill_name),
+            fm_description
+                .as_deref()
+                .map(|d| format!("Description: {}", d))
+                .unwrap_or_default(),
+            openclaw_content,
+        ),
         blockcell_skills::SkillType::Rhai => format!(
             "Convert the following OpenClaw-compatible skill into a Blockcell SKILL.rhai script.\n\
             Skill name: {}\n\
@@ -1004,6 +1026,13 @@ pub(super) async fn handle_skill_install_external(
         trigger: blockcell_skills::TriggerReason::ManualRequest { description },
         error_stack: None,
         source_snippet: None,
+        source_path: None,
+        layout: match ext_skill_type {
+            blockcell_skills::SkillType::Rhai => blockcell_skills::SkillLayout::RhaiOrchestration,
+            blockcell_skills::SkillType::Python => blockcell_skills::SkillLayout::Hybrid,
+            blockcell_skills::SkillType::LocalScript => blockcell_skills::SkillLayout::LocalScript,
+            blockcell_skills::SkillType::PromptOnly => blockcell_skills::SkillLayout::PromptTool,
+        },
         tool_schemas: vec![],
         timestamp: chrono::Utc::now().timestamp(),
         skill_type: ext_skill_type,

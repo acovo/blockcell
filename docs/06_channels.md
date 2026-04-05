@@ -17,7 +17,7 @@
 
 ## 支持的渠道
 
-blockcell 目前支持 8 个消息渠道：
+blockcell 目前支持 11 个消息渠道：
 
 | 渠道 | 协议 | 适用场景 |
 |------|------|---------|
@@ -29,6 +29,9 @@ blockcell 目前支持 8 个消息渠道：
 | Discord | Gateway WebSocket | 社区/开发者 |
 | 钉钉（DingTalk） | Stream SDK（WebSocket） | 国内企业 |
 | 企业微信（WeCom） | Webhook 回调 / 轮询 | 国内企业 |
+| QQ | Bot API / WebSocket | QQ 群 / 个人消息 |
+| NapCatQQ | OneBot 11 / WebSocket | QQ 机器人生态 |
+| 微信（Weixin） | iLink Bot API | 扫码登录、微信机器人 |
 
 ---
 
@@ -49,9 +52,11 @@ blockcell 目前支持 8 个消息渠道：
 ### 当前版本的路由规则
 
 - `cli`、`cron`、`ws` 这类内部入口默认进入 `default` agent
-- Telegram / Slack / Discord / 飞书 / 钉钉 / 企业微信 / Lark / WhatsApp 这类外部渠道，启动后会优先按 `channelAccountOwners.<channel>.<accountId>` 路由到目标 agent，未命中时回退到 `channelOwners.<channel>`
+- Telegram / WhatsApp / 飞书 / Lark / Slack / Discord / 钉钉 / 企业微信 / QQ / NapCat / 微信 这类外部渠道，启动后会优先按 `channelAccountOwners.<channel>.<accountId>` 路由到目标 agent，未命中时回退到 `channelOwners.<channel>`
 - **已启用的外部渠道必须配置 owner**：要么配置 `channelOwners.<channel>` 作为整渠道兜底 owner，要么为该渠道的每个启用账号配置 `channelAccountOwners.<channel>.<accountId>`
 - 可用 `blockcell channels owner list|set|clear` 管理 owner 绑定
+
+`blockcell channels login` 目前只支持 `whatsapp` 和 `weixin`。
 
 一个最小示例：
 

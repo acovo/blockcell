@@ -1,6 +1,6 @@
 use crate::evolution::{
     EvolutionContext, EvolutionRecord, EvolutionStatus, FeedbackEntry, LLMProvider, SkillEvolution,
-    SkillType, TriggerReason,
+    SkillLayout, SkillType, TriggerReason,
 };
 use blockcell_core::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -272,7 +272,7 @@ pub struct EvolutionServiceConfig {
     pub error_window_minutes: u32,
     /// 是否启用自动进化
     pub enabled: bool,
-    /// 每个阶段失败后的最大重试次数（审计/编译/测试失败都会重试）
+    /// 每个阶段失败后的最大重试次数（静态审计/LLM 审计/编译/契约检查失败都会重试）
     pub max_retries: u32,
     /// LLM 调用超时时间（秒）
     pub llm_timeout_secs: u64,
@@ -389,17 +389,105 @@ impl EvolutionService {
         candidates.into_iter().next()
     }
 
-    fn detect_skill_layout(&self, skill_name: &str) -> (SkillType, Option<String>) {
+    fn first_local_script_asset(skill_dir: &Path) -> Option<PathBuf> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+
+        let allowed_extensions = ["sh", "bash", "zsh", "js", "php", "rb"];
+        let scan_dir = |dir: &Path, candidates: &mut Vec<PathBuf>| {
+            if !dir.is_dir() {
+                return;
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let ext_ok = path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| allowed_extensions.contains(&ext));
+                    let no_ext_exec = path.extension().is_none() && Self::looks_executable(&path);
+                    if ext_ok || no_ext_exec {
+                        candidates.push(path);
+                    }
+                }
+            }
+        };
+
+        scan_dir(&skill_dir.join("scripts"), &mut candidates);
+        scan_dir(&skill_dir.join("bin"), &mut candidates);
+
+        if candidates.is_empty() {
+            if let Ok(entries) = std::fs::read_dir(skill_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if matches!(file_name, "SKILL.md" | "SKILL.py" | "SKILL.rhai" | "meta.yaml" | "meta.json") {
+                        continue;
+                    }
+                    let ext_ok = path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| allowed_extensions.contains(&ext));
+                    let no_ext_exec = path.extension().is_none() && Self::looks_executable(&path);
+                    if ext_ok || no_ext_exec {
+                        candidates.push(path);
+                    }
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+        candidates.into_iter().next()
+    }
+
+    #[cfg(unix)]
+    fn looks_executable(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    fn looks_executable(_path: &Path) -> bool {
+        false
+    }
+
+    fn detect_skill_layout(
+        &self,
+        skill_name: &str,
+    ) -> (SkillLayout, SkillType, Option<String>, Option<String>) {
         let skill_dir = self.evolution.skills_dir().join(skill_name);
+        let has_skill_md = skill_dir.join("SKILL.md").exists();
 
         let rhai_path = skill_dir.join("SKILL.rhai");
         if rhai_path.exists() {
-            return (SkillType::Rhai, std::fs::read_to_string(rhai_path).ok());
+            return (
+                SkillLayout::RhaiOrchestration,
+                SkillType::Rhai,
+                std::fs::read_to_string(&rhai_path).ok(),
+                Some("SKILL.rhai".to_string()),
+            );
         }
 
         let py_path = skill_dir.join("SKILL.py");
         if py_path.exists() {
-            return (SkillType::Python, std::fs::read_to_string(py_path).ok());
+            let layout = if has_skill_md {
+                SkillLayout::Hybrid
+            } else {
+                SkillLayout::LocalScript
+            };
+            return (
+                layout,
+                SkillType::Python,
+                std::fs::read_to_string(&py_path).ok(),
+                Some("SKILL.py".to_string()),
+            );
         }
 
         if let Some(legacy_py_path) = Self::first_legacy_python_script(&skill_dir) {
@@ -424,15 +512,67 @@ impl EvolutionService {
                 snippet.push_str(&md);
             }
 
-            return (SkillType::Python, Some(snippet));
+            let layout = if has_skill_md {
+                SkillLayout::Hybrid
+            } else {
+                SkillLayout::LocalScript
+            };
+
+            let source_path = legacy_py_path
+                .strip_prefix(&skill_dir)
+                .ok()
+                .map(|p| p.display().to_string());
+
+            return (layout, SkillType::Python, Some(snippet), source_path);
+        }
+
+        if let Some(local_script_path) = Self::first_local_script_asset(&skill_dir) {
+            let rel = local_script_path
+                .strip_prefix(&skill_dir)
+                .ok()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| local_script_path.display().to_string());
+
+            let script_code = std::fs::read_to_string(&local_script_path)
+                .ok()
+                .map(|s| Self::truncate_chars(&s, 8_000))
+                .unwrap_or_default();
+
+            let skill_md = std::fs::read_to_string(skill_dir.join("SKILL.md"))
+                .ok()
+                .map(|s| Self::truncate_chars(&s, 3_000));
+
+            let mut snippet = format!("# Local script asset: {}\n{}", rel, script_code);
+            if let Some(md) = skill_md {
+                snippet.push_str("\n\n# Current SKILL.md\n");
+                snippet.push_str(&md);
+            }
+
+            let layout = if has_skill_md {
+                SkillLayout::Hybrid
+            } else {
+                SkillLayout::LocalScript
+            };
+
+            return (
+                layout,
+                SkillType::LocalScript,
+                Some(snippet),
+                Some(rel),
+            );
         }
 
         let md_path = skill_dir.join("SKILL.md");
         if md_path.exists() {
-            return (SkillType::PromptOnly, std::fs::read_to_string(md_path).ok());
+            return (
+                SkillLayout::PromptTool,
+                SkillType::PromptOnly,
+                std::fs::read_to_string(&md_path).ok(),
+                Some("SKILL.md".to_string()),
+            );
         }
 
-        (SkillType::PromptOnly, None)
+        (SkillLayout::PromptTool, SkillType::PromptOnly, None, None)
     }
 
     pub fn new(skills_dir: PathBuf, config: EvolutionServiceConfig) -> Self {
@@ -551,8 +691,8 @@ impl EvolutionService {
             .get_current_version(skill_name)
             .unwrap_or_else(|_| "unknown".to_string());
 
-        // 检测技能类型（支持 OpenClaw scripts/*.py 兼容布局）
-        let (skill_type, inferred_source_snippet) = self.detect_skill_layout(skill_name);
+        // 检测技能布局（支持 PromptTool / LocalScript / Hybrid / RhaiOrchestration）
+        let (layout, skill_type, inferred_source_snippet, source_path) = self.detect_skill_layout(skill_name);
         let source_snippet = source_snippet.or(inferred_source_snippet);
 
         let context = EvolutionContext {
@@ -561,6 +701,8 @@ impl EvolutionService {
             trigger,
             error_stack: Some(error_msg.to_string()),
             source_snippet,
+            source_path,
+            layout,
             tool_schemas,
             timestamp: chrono::Utc::now().timestamp(),
             skill_type,
@@ -725,7 +867,51 @@ impl EvolutionService {
                 );
             }
 
-            // --- 2. 审计 ---
+            // --- 2a. 静态审计（确定性规则检查，零 LLM 成本）---
+            let record = self.evolution.load_record(evolution_id)?;
+            if record.status == EvolutionStatus::Generated {
+                if let Some(ref patch) = record.patch {
+                    let static_result = crate::audit::static_audit(
+                        &record.context.skill_type,
+                        &patch.diff,
+                    );
+                    if !static_result.passed {
+                        let feedback_text = crate::audit::format_static_audit_feedback(&static_result);
+                        warn!(
+                            evolution_id = %evolution_id,
+                            violations = static_result.violations.len(),
+                            "🧠 [pipeline] Static audit FAILED ({} violations), regenerating",
+                            static_result.violations.len()
+                        );
+
+                        let feedback = FeedbackEntry {
+                            attempt: record.attempt,
+                            stage: "static_audit".to_string(),
+                            feedback: feedback_text,
+                            previous_code: patch.diff.clone(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                        };
+
+                        self.evolution
+                            .regenerate_with_feedback(evolution_id, llm_provider, &feedback)
+                            .await?;
+                        continue;
+                    }
+                    // Log warnings even if passed
+                    let warnings: Vec<_> = static_result.violations.iter()
+                        .filter(|v| v.severity == "warning")
+                        .collect();
+                    if !warnings.is_empty() {
+                        info!(
+                            evolution_id = %evolution_id,
+                            "🧠 [pipeline] Static audit passed with {} warning(s)",
+                            warnings.len()
+                        );
+                    }
+                }
+            }
+
+            // --- 2b. LLM 审计 ---
             let record = self.evolution.load_record(evolution_id)?;
             if record.status == EvolutionStatus::Generated {
                 info!(evolution_id = %evolution_id, "🧠 [pipeline] ═══ Auditing patch (attempt {}) ═══", attempt);
@@ -810,6 +996,42 @@ impl EvolutionService {
                     continue;
                 }
                 info!(evolution_id = %evolution_id, "🧠 [pipeline] ✅ Compile check passed (attempt {})", attempt);
+            }
+
+            // --- 3b. 契约一致性检查（SKILL.md/meta.yaml 结构验证）---
+            let record = self.evolution.load_record(evolution_id)?;
+            if record.status.is_compile_passed() {
+                info!(evolution_id = %evolution_id, "🧠 [pipeline] ═══ Contract check (attempt {}) ═══", attempt);
+                let (contract_passed, contract_error) = self.evolution.contract_check(evolution_id)?;
+
+                if !contract_passed {
+                    let error_msg = contract_error.unwrap_or_else(|| "Unknown contract violation".to_string());
+                    warn!(
+                        evolution_id = %evolution_id,
+                        "🧠 [pipeline] Contract check FAILED: {}, will regenerate with feedback",
+                        error_msg
+                    );
+
+                    let current_code = record
+                        .patch
+                        .as_ref()
+                        .map(|p| p.diff.clone())
+                        .unwrap_or_default();
+
+                    let feedback = FeedbackEntry {
+                        attempt: record.attempt,
+                        stage: "contract".to_string(),
+                        feedback: format!("Contract validation failed:\n{}", error_msg),
+                        previous_code: current_code,
+                        timestamp: chrono::Utc::now().timestamp(),
+                    };
+
+                    self.evolution
+                        .regenerate_with_feedback(evolution_id, llm_provider, &feedback)
+                        .await?;
+                    continue;
+                }
+                info!(evolution_id = %evolution_id, "🧠 [pipeline] ✅ Contract check passed (attempt {})", attempt);
             }
 
             // 所有检查都通过了，跳出循环
@@ -1032,6 +1254,7 @@ impl EvolutionService {
                     "🧠 [观察] 观察窗口到期，错误率正常，标记完成"
                 );
                 self.evolution.mark_completed(evolution_id)?;
+                self.persist_evolution_experience(evolution_id);
                 self.cleanup_evolution(skill_name, evolution_id).await;
             }
             Some(false) => {
@@ -1162,6 +1385,110 @@ impl EvolutionService {
         );
 
         Ok(evolution_id)
+    }
+
+    /// Persist evolution experience to manual/evolution.md after successful completion.
+    /// This is the "experience auto-sedimentation" mechanism — inspired by claude-code's MemoryWriteTool.
+    /// Successful fixes are written back to the skill's manual/ directory so future evolutions
+    /// can learn from past repairs.
+    fn persist_evolution_experience(&self, evolution_id: &str) {
+        let record = match self.evolution.load_record(evolution_id) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    evolution_id = %evolution_id,
+                    error = %e,
+                    "🧠 [experience] Failed to load record for experience persistence"
+                );
+                return;
+            }
+        };
+
+        let skill_dir = self.evolution.skills_dir().join(&record.skill_name);
+        let manual_dir = skill_dir.join("manual");
+        if let Err(e) = std::fs::create_dir_all(&manual_dir) {
+            warn!(
+                skill = %record.skill_name,
+                error = %e,
+                "🧠 [experience] Failed to create manual/ directory"
+            );
+            return;
+        }
+
+        let evolution_md_path = manual_dir.join("evolution.md");
+
+        // Build the experience entry
+        let trigger_desc = format!("{:?}", record.context.trigger);
+        let explanation = record
+            .patch
+            .as_ref()
+            .map(|p| p.explanation.chars().take(300).collect::<String>())
+            .unwrap_or_else(|| "N/A".to_string());
+
+        let feedback_summary = if record.feedback_history.is_empty() {
+            "None (first attempt succeeded)".to_string()
+        } else {
+            record
+                .feedback_history
+                .iter()
+                .map(|f| format!("  - Attempt #{} ({}): {}", f.attempt, f.stage,
+                    f.feedback.chars().take(100).collect::<String>()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let timestamp = chrono::DateTime::from_timestamp(record.created_at, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| format!("timestamp={}", record.created_at));
+
+        let entry = format!(
+            "\n## {} — Evolution {}\n\n\
+             - **Trigger**: {}\n\
+             - **Attempts**: {}\n\
+             - **Fix summary**: {}\n\
+             - **Feedback history**:\n{}\n\
+             - **Status**: Completed\n\n\
+             ---\n",
+            timestamp,
+            &record.id[..8.min(record.id.len())],
+            trigger_desc,
+            record.attempt,
+            explanation,
+            feedback_summary,
+        );
+
+        // Append to evolution.md
+        let write_result = if evolution_md_path.exists() {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&evolution_md_path)
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    f.write_all(entry.as_bytes())
+                })
+        } else {
+            let header = "# Evolution History\n\nAutomatically recorded successful evolution fixes.\n";
+            let content = format!("{}{}", header, entry);
+            std::fs::write(&evolution_md_path, content)
+        };
+
+        match write_result {
+            Ok(()) => {
+                info!(
+                    skill = %record.skill_name,
+                    evolution_id = %evolution_id,
+                    path = %evolution_md_path.display(),
+                    "🧠 [experience] ✅ Evolution experience persisted to manual/evolution.md"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    skill = %record.skill_name,
+                    error = %e,
+                    "🧠 [experience] Failed to write evolution experience"
+                );
+            }
+        }
     }
 
     /// 清理已完成/失败的进化（成功时清除错误计数器）
@@ -1376,8 +1703,8 @@ impl EvolutionService {
             .get_current_version(skill_name)
             .unwrap_or_else(|_| "0.0.0".to_string());
 
-        // 检测技能类型：支持 SKILL.rhai / SKILL.py / SKILL.md 以及 OpenClaw scripts/*.py 布局
-        let (skill_type, source_snippet) = self.detect_skill_layout(skill_name);
+        // 检测技能布局（支持 PromptTool / LocalScript / Hybrid / RhaiOrchestration）
+        let (layout, skill_type, source_snippet, source_path) = self.detect_skill_layout(skill_name);
 
         let context = EvolutionContext {
             skill_name: skill_name.to_string(),
@@ -1387,6 +1714,8 @@ impl EvolutionService {
             },
             error_stack: None,
             source_snippet,
+            source_path,
+            layout,
             tool_schemas: vec![],
             timestamp: chrono::Utc::now().timestamp(),
             skill_type,
@@ -1618,6 +1947,21 @@ mod tests {
         (root, skills_dir)
     }
 
+    fn write_skill_dir(skill_dir: &Path, files: &[(&str, &str)]) {
+        std::fs::create_dir_all(skill_dir).expect("create skill dir");
+        for (relative_path, content) in files {
+            let full_path = skill_dir.join(relative_path);
+            if let Some(parent) = full_path.parent() {
+                std::fs::create_dir_all(parent).expect("create parent dir");
+            }
+            std::fs::write(full_path, content).expect("write skill file");
+        }
+    }
+
+    fn make_service(skills_dir: PathBuf) -> EvolutionService {
+        EvolutionService::new(skills_dir, EvolutionServiceConfig::default())
+    }
+
     fn test_context(skill_name: &str) -> EvolutionContext {
         EvolutionContext {
             skill_name: skill_name.to_string(),
@@ -1627,12 +1971,136 @@ mod tests {
             },
             error_stack: None,
             source_snippet: None,
+            source_path: None,
+            layout: SkillLayout::PromptTool,
             tool_schemas: vec![],
             timestamp: chrono::Utc::now().timestamp(),
             skill_type: SkillType::PromptOnly,
             staged: false,
             staging_skills_dir: None,
         }
+    }
+
+    #[test]
+    fn test_detect_skill_layout_prompt_only() {
+        let (root, skills_dir) = setup_test_dirs("layout_prompt_only");
+        let skill_dir = skills_dir.join("weather");
+        write_skill_dir(
+            &skill_dir,
+            &[
+                (
+                    "SKILL.md",
+                    "# Weather\n\n## Shared {#shared}\nQuery weather.\n\n## Prompt {#prompt}\nAsk for a city.",
+                ),
+                ("meta.yaml", "name: weather\ndescription: weather skill\n"),
+            ],
+        );
+
+        let service = make_service(skills_dir);
+        let (layout, skill_type, snippet, source_path) = service.detect_skill_layout("weather");
+
+        assert_eq!(layout, SkillLayout::PromptTool);
+        assert_eq!(skill_type, SkillType::PromptOnly);
+        assert!(snippet.is_some());
+        assert_eq!(source_path.as_deref(), Some("SKILL.md"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_detect_skill_layout_hybrid_with_python() {
+        let (root, skills_dir) = setup_test_dirs("layout_hybrid_python");
+        let skill_dir = skills_dir.join("analyzer");
+        write_skill_dir(
+            &skill_dir,
+            &[
+                (
+                    "SKILL.md",
+                    "# Analyzer\n\n## Shared {#shared}\nUse a script and prompt together.\n\n## Prompt {#prompt}\nCall the script when needed.",
+                ),
+                ("SKILL.py", "print('ok')\n"),
+                ("meta.yaml", "name: analyzer\ndescription: analyzer skill\n"),
+            ],
+        );
+
+        let service = make_service(skills_dir);
+        let (layout, skill_type, snippet, source_path) = service.detect_skill_layout("analyzer");
+
+        assert_eq!(layout, SkillLayout::Hybrid);
+        assert_eq!(skill_type, SkillType::Python);
+        assert!(snippet.is_some());
+        assert_eq!(source_path.as_deref(), Some("SKILL.py"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_detect_skill_layout_hybrid_with_python_and_scripts() {
+        let (root, skills_dir) = setup_test_dirs("layout_hybrid_python_scripts");
+        let skill_dir = skills_dir.join("analyzer_plus");
+        write_skill_dir(
+            &skill_dir,
+            &[
+                (
+                    "SKILL.md",
+                    "# Analyzer Plus\n\n## Shared {#shared}\nUse script assets together.\n\n## Prompt {#prompt}\nCall the Python entrypoint when needed.",
+                ),
+                ("SKILL.py", "print('ok plus')\n"),
+                ("scripts/helper.sh", "#!/bin/sh\necho helper\n"),
+                ("meta.yaml", "name: analyzer_plus\ndescription: analyzer plus skill\n"),
+            ],
+        );
+
+        let service = make_service(skills_dir);
+        let (layout, skill_type, snippet, source_path) = service.detect_skill_layout("analyzer_plus");
+
+        assert_eq!(layout, SkillLayout::Hybrid);
+        assert_eq!(skill_type, SkillType::Python);
+        assert!(snippet.is_some());
+        assert_eq!(source_path.as_deref(), Some("SKILL.py"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_detect_skill_layout_local_script_directory() {
+        let (root, skills_dir) = setup_test_dirs("layout_local_script");
+        let skill_dir = skills_dir.join("runner");
+        write_skill_dir(
+            &skill_dir,
+            &[
+                ("scripts/run.sh", "#!/bin/sh\necho ok\n"),
+                ("meta.yaml", "name: runner\ndescription: runner skill\n"),
+            ],
+        );
+
+        let service = make_service(skills_dir);
+        let (layout, skill_type, snippet, source_path) = service.detect_skill_layout("runner");
+
+        assert_eq!(layout, SkillLayout::LocalScript);
+        assert_eq!(skill_type, SkillType::LocalScript);
+        assert!(snippet.is_some());
+        assert!(source_path.is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_detect_skill_layout_rhai_orchestration() {
+        let (root, skills_dir) = setup_test_dirs("layout_rhai");
+        let skill_dir = skills_dir.join("orchestrator");
+        write_skill_dir(
+            &skill_dir,
+            &[
+                ("SKILL.rhai", "let x = 1;\n"),
+                ("meta.yaml", "name: orchestrator\ndescription: rhai skill\n"),
+            ],
+        );
+
+        let service = make_service(skills_dir);
+        let (layout, skill_type, snippet, source_path) = service.detect_skill_layout("orchestrator");
+
+        assert_eq!(layout, SkillLayout::RhaiOrchestration);
+        assert_eq!(skill_type, SkillType::Rhai);
+        assert!(snippet.is_some());
+        assert_eq!(source_path.as_deref(), Some("SKILL.rhai"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

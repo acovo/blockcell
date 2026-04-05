@@ -450,7 +450,7 @@ blockcell channels <SUBCOMMAND>
 | 子命令 | 说明 |
 |--------|------|
 | `status` | 显示所有渠道连接状态 |
-| `login <CHANNEL>` | 登录指定渠道（当前主要用于 WhatsApp 扫码） |
+| `login <CHANNEL>` | 登录指定渠道（当前主要用于 WhatsApp 和 Weixin 扫码登录） |
 | `owner list` | 列出渠道 fallback owner 与账号级 owner 覆盖 |
 | `owner set --channel <NAME> [--account <ACCOUNT_ID>] --agent <ID>` | 设置渠道或账号 owner |
 | `owner clear --channel <NAME> [--account <ACCOUNT_ID>]` | 清除渠道或账号 owner |
@@ -464,7 +464,7 @@ blockcell channels owner clear --channel telegram --account bot2
 
 ---
 
-## cron — 管理定时任务
+## cron — 查看定时任务
 
 ```
 blockcell cron <SUBCOMMAND>
@@ -473,73 +473,15 @@ blockcell cron <SUBCOMMAND>
 ### cron list
 
 ```bash
-blockcell cron list [--all]
+blockcell cron list [--all] [--agent <ID>]
 ```
 
-| 选项 | 说明 |
-|------|------|
-| `--all` | 显示所有任务，包括已禁用的 |
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--all` | false | 显示所有任务，包括已禁用的 |
+| `--agent <ID>` | `default` | 指定要查看的 agent |
 
-### cron add
-
-创建定时任务。
-
-```bash
-blockcell cron add --name <NAME> --message <TEXT> [调度选项] [投递选项]
-```
-
-| 选项 | 说明 |
-|------|------|
-| `--name <NAME>` | 任务名称（必填） |
-| `--message <TEXT>` | 要发送的消息内容（必填） |
-| `--every <SECONDS>` | 每隔 N 秒执行一次 |
-| `--cron <EXPR>` | Cron 表达式（如 `"0 9 * * 1-5"`） |
-| `--at <ISO_TIME>` | 在指定时间执行一次（ISO 格式） |
-| `--deliver` | 将输出投递到渠道 |
-| `--to <CHAT_ID>` | 目标 chat ID |
-| `--channel <NAME>` | 目标渠道名称 |
-
-**示例：**
-```bash
-# 每天早上 9 点发送金融日报
-blockcell cron add --name daily_report --message "生成今日金融日报" \
-  --cron "0 9 * * 1-5" --deliver --channel telegram --to 123456789
-
-# 每隔 60 秒检查一次
-blockcell cron add --name check --message "检查系统状态" --every 60
-```
-
-### cron pause / resume
-
-```bash
-blockcell cron pause <JOB_ID>
-blockcell cron resume <JOB_ID>
-```
-
-### cron enable
-
-```bash
-blockcell cron enable <JOB_ID>          # 启用
-blockcell cron enable <JOB_ID> --disable  # 禁用
-```
-
-### cron run
-
-立即运行一个定时任务。
-
-```bash
-blockcell cron run <JOB_ID> [--force]
-```
-
-| 选项 | 说明 |
-|------|------|
-| `--force` | 强制运行，即使任务已禁用 |
-
-### cron remove
-
-```bash
-blockcell cron remove <JOB_ID>
-```
+> 当前 CLI 只提供查看入口；创建、暂停、恢复、删除等操作需要通过 WebUI 或对话/工具链完成。
 
 ---
 
@@ -790,6 +732,26 @@ blockcell memory maintenance [--recycle-days <DAYS>]
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
 | `--recycle-days <DAYS>` | 30 | 软删除记录的保留天数 |
+
+### memory retry-vector-sync
+
+重试队列中的向量索引同步操作。
+
+```bash
+blockcell memory retry-vector-sync [--limit <N>]
+```
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--limit <N>` | 100 | 单次重放的最大待处理操作数 |
+
+### memory reindex
+
+从当前 SQLite 活跃记录重建向量索引。
+
+```bash
+blockcell memory reindex
+```
 
 ---
 

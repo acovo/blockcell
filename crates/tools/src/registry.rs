@@ -18,6 +18,7 @@ use crate::email::EmailTool;
 use crate::encrypt::EncryptTool;
 use crate::exec::ExecTool;
 use crate::exec_local::ExecLocalTool;
+use crate::exec_skill_script::ExecSkillScriptTool;
 use crate::file_ops::FileOpsTool;
 use crate::fs::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 use crate::http_request::HttpRequestTool;
@@ -83,6 +84,7 @@ impl ToolRegistry {
         // Exec tool
         registry.register(Arc::new(ExecTool));
         registry.register(Arc::new(ExecLocalTool));
+        registry.register(Arc::new(ExecSkillScriptTool));
 
         // Web tools
         registry.register(Arc::new(WebSearchTool));

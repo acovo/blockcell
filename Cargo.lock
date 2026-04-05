@@ -950,6 +950,7 @@ dependencies = [
  "base64",
  "blockcell-channels",
  "blockcell-core",
+ "blockcell-skills",
  "blockcell-storage",
  "calamine",
  "chrono",

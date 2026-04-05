@@ -2055,6 +2055,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 max_tool_iterations: None,
+                max_tool_iterations_by_tool: HashMap::new(),
                 llm_max_retries: None,
                 llm_retry_delay_ms: None,
                 max_context_tokens: None,

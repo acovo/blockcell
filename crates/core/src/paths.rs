@@ -2,6 +2,78 @@ use std::path::PathBuf;
 
 use crate::session_file_stem;
 
+/// Default content written to `~/.blockcell/BLOCKCELL.md` on first run.
+///
+/// This file is the global project-rules memory for the self-evolution system —
+/// equivalent to `CLAUDE.md` in claude-code. It is injected into every evolution
+/// prompt as high-level context, so edits here affect all skill evolutions.
+const DEFAULT_BLOCKCELL_MD: &str = r#"# BLOCKCELL.md — Global Agent Rules
+
+> This file is auto-loaded by the self-evolution system as global context.
+> Edit it to record stable rules, conventions, and lessons that apply to all skills.
+
+## Skill Development Conventions
+
+- All user skills live in `~/.blockcell/workspace/skills/<skill_name>/`
+- Every skill must have `meta.yaml` + `SKILL.md` (the runtime contract)
+- `meta.yaml` required fields: `name`, `description`
+- `meta.yaml` optional fields: `tools`, `requires`, `permissions`, `fallback`
+- **Do NOT** add legacy routing fields (`triggers`, `capabilities`, `always`, `output_format`)
+- `SKILL.md` must contain `## Shared {#shared}` and `## Prompt {#prompt}` sections
+
+## Skill Types
+
+| Type | Primary file | When to use |
+|------|-------------|-------------|
+| Prompt Tool | `SKILL.md` only | Pure LLM + blockcell built-in tools |
+| Local Script | `SKILL.py` or `scripts/` | Needs Python/Shell/Node local execution |
+| Hybrid | `SKILL.md` + `SKILL.py` | Both tool calls AND local script |
+
+## Self-Evolution Principles
+
+1. **Minimum change** — only modify what is necessary to fix the reported issue
+2. **Keep SKILL.md intact** — do not remove `## Shared` or `## Prompt` sections
+3. **No dangerous operations** — avoid `os.remove`, `shutil.rmtree`, `subprocess` with unsanitized input
+4. **Handle errors gracefully** — every external call should have a fallback
+5. **Prefer `display_text`** — if the skill produces user-facing output, return it as `display_text`
+
+## Tool Usage Rules
+
+- Only list tools in `meta.yaml` that the skill actually uses
+- `exec_local` is provided automatically; do NOT add it to `tools`
+- When using `web_fetch` or `http_request`, always handle non-200 responses
+
+## Error Handling Pattern (Python skills)
+
+```python
+import sys, json
+
+try:
+    result = do_work()
+    print(json.dumps({"display_text": result}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}), file=sys.stderr)
+    sys.exit(1)
+```
+
+## Common Fix Patterns
+
+- **Empty response from API**: add retry logic or degrade gracefully
+- **Import error**: add the package to `requires.bins` or use stdlib only
+- **JSON parse error**: validate `response.status == 200` before parsing
+
+## Self-Evolution Pipeline
+
+The self-evolution pipeline is fixed to the full validation flow:
+
+1. Generate patch
+2. Static audit
+3. LLM audit
+4. Compile check
+5. Contract check
+6. Deploy and observe
+"#;
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub base: PathBuf,
@@ -123,6 +195,12 @@ impl Paths {
         self.workspace().join("skills")
     }
 
+    /// Path to `BLOCKCELL.md` — the project-level global rules file.
+    /// Used by the self-evolution system to inject project-wide context into prompts.
+    pub fn blockcell_md(&self) -> PathBuf {
+        self.base.join("BLOCKCELL.md")
+    }
+
     pub fn import_staging_skills_dir(&self) -> PathBuf {
         self.workspace().join("import_staging").join("skills")
     }
@@ -186,6 +264,11 @@ impl Paths {
         std::fs::create_dir_all(self.evolved_tools_dir())?;
         std::fs::create_dir_all(self.tool_artifacts_dir())?;
         std::fs::create_dir_all(self.tool_evolution_records_dir())?;
+        // Bootstrap BLOCKCELL.md with default template if it does not exist
+        let blockcell_md = self.blockcell_md();
+        if !blockcell_md.exists() {
+            let _ = std::fs::write(&blockcell_md, DEFAULT_BLOCKCELL_MD);
+        }
         Ok(())
     }
 }

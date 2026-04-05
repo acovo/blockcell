@@ -497,6 +497,7 @@ mod tests {
             priority: 1,
             input_price: None,
             output_price: None,
+            temperature: None,
             tool_call_mode: blockcell_core::config::ToolCallMode::Native,
         }];
         config.agents.defaults.provider = Some("deepseek".to_string());
@@ -523,6 +524,7 @@ mod tests {
             priority: 1,
             input_price: None,
             output_price: None,
+            temperature: None,
             tool_call_mode: blockcell_core::config::ToolCallMode::Native,
         }];
         config.agents.defaults.provider = Some("ollama".to_string());

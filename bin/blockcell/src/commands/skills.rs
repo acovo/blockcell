@@ -8,6 +8,18 @@ use std::sync::Arc;
 
 use super::memory_store::open_memory_store;
 
+fn skill_test_intro_note() -> &'static str {
+    "SKILL.md decides when script assets run; this command only validates top-level compatibility assets and basic asset contracts."
+}
+
+fn skill_test_primary_asset_step_label() -> &'static str {
+    "primary asset check"
+}
+
+fn skill_test_rhai_compat_step_label() -> &'static str {
+    "legacy Rhai compat"
+}
+
 /// List all skill evolution records.
 pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
     let paths = Paths::default();
@@ -198,15 +210,15 @@ pub async fn show(name: &str) -> anyhow::Result<()> {
 
     if skill_path.join("SKILL.rhai").exists() {
         println!();
-        println!("  Script: SKILL.rhai ✓");
+        println!("  Script Asset: SKILL.rhai ✓ (top-level compatibility)");
     }
     if skill_path.join("SKILL.py").exists() {
         println!();
-        println!("  Script: SKILL.py ✓");
+        println!("  Script Asset: SKILL.py ✓ (top-level compatibility)");
     }
     if skill_path.join("SKILL.md").exists() {
         println!();
-        println!("  Manual: SKILL.md ✓");
+        println!("  Control Plane: SKILL.md ✓");
     }
 
     // Show evolution records for this skill
@@ -565,6 +577,7 @@ pub async fn test(path: &str, input: Option<String>, verbose: bool) -> anyhow::R
     println!();
     println!("🧪 Testing skill: {}", skill_name);
     println!("   Path: {}", skill_path.display());
+    println!("   Note: {}", skill_test_intro_note());
     println!();
 
     let mut pass = 0usize;
@@ -628,16 +641,16 @@ pub async fn test(path: &str, input: Option<String>, verbose: bool) -> anyhow::R
         }
     }
 
-    // ── Step 3: SKILL.rhai compile + mock run ────────────────────────────────
+    // ── Step 3: primary asset compatibility ─────────────────────────────────
     let rhai_path = skill_path.join("SKILL.rhai");
     let py_path = skill_path.join("SKILL.py");
-    print!("  [3/3] SKILL.rhai compile ");
+    print!("  [3/3] {:<18}", skill_test_primary_asset_step_label());
     if !rhai_path.exists() {
         if py_path.exists() {
-            print!("\r  [3/3] SKILL.py syntax    ");
+            print!("\r  [3/3] {:<18}", skill_test_primary_asset_step_label());
             match python_syntax_check(&py_path) {
                 Ok(_) => {
-                    println!("✅ OK");
+                    println!("✅ OK (SKILL.py)");
                     pass += 1;
                 }
                 Err(e) => {
@@ -746,16 +759,16 @@ pub async fn test(path: &str, input: Option<String>, verbose: bool) -> anyhow::R
             return Ok(());
         }
         Ok(ast) => {
-            println!("✅ OK");
+            println!("✅ OK (SKILL.rhai)");
             pass += 1;
 
-            // ── Step 4: mock run ──────────────────────────────────────────────
-            print!("  [4/4] SKILL.rhai run     ");
+            // ── Step 4: top-level Rhai compatibility run ─────────────────────
+            print!("  [4/4] {:<18}", skill_test_rhai_compat_step_label());
 
             // Inject dummy variables from meta.yaml (all common ones as ())
             let user_msg = input
                 .as_deref()
-                .unwrap_or("test input from blockcell skills test");
+                .unwrap_or("test input for skill.md-driven asset validation");
             let mut scope = Scope::new();
             scope.push("user_input", Dynamic::from(user_msg.to_string()));
 
@@ -1050,11 +1063,11 @@ pub async fn test_all(dir: &str, input: Option<String>, verbose: bool) -> anyhow
             .and_then(|n| n.to_str())
             .unwrap_or("?");
 
-        // Run test and capture whether it passed
+        // Run test and capture whether the top-level compatibility assets still validate
         let result = test(skill_path.to_str().unwrap_or(""), input.clone(), verbose).await;
         match result {
             Ok(_) => {
-                // Re-check by script type (rhai compile / python syntax check).
+                // Re-check by primary compatibility asset (top-level Rhai compile or Python syntax).
                 let script_ok = {
                     let rhai_path = skill_path.join("SKILL.rhai");
                     if rhai_path.exists() {
@@ -1144,5 +1157,19 @@ fn format_ts(ts: i64) -> String {
     match Local.timestamp_opt(ts, 0) {
         chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_skill_test_describes_rhai_as_skill_md_driven_asset() {
+        let note = skill_test_intro_note();
+        assert!(note.contains("SKILL.md decides when script assets run"));
+        assert!(note.contains("top-level compatibility assets"));
+        assert!(skill_test_primary_asset_step_label().contains("primary asset"));
+        assert!(skill_test_rhai_compat_step_label().contains("compat"));
     }
 }

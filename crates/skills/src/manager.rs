@@ -560,13 +560,93 @@ fn skill_dir_contains_local_script(dir: &Path) -> bool {
     false
 }
 
+fn skill_local_exec_entrypoints(skill: &Skill) -> Vec<String> {
+    let mut entrypoints = Vec::new();
+
+    for candidate in ["SKILL.py", "SKILL.rhai"] {
+        if skill.path.join(candidate).exists() {
+            entrypoints.push(candidate.to_string());
+        }
+    }
+
+    for directory in ["scripts", "bin"] {
+        if skill_dir_contains_local_script(&skill.path.join(directory)) {
+            entrypoints.push(format!("{}/", directory));
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir(&skill.path) else {
+        entrypoints.sort();
+        entrypoints.dedup();
+        return entrypoints;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+        if matches!(
+            file_name,
+            "SKILL.md" | "SKILL.py" | "SKILL.rhai" | "meta.yaml" | "meta.json" | "CHANGELOG.md"
+        ) {
+            continue;
+        }
+
+        let ext_ok = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext, "py" | "sh" | "php" | "js" | "ts" | "rb"));
+        let no_ext_exec = path.extension().is_none() && looks_executable(&path);
+        if ext_ok || no_ext_exec {
+            if let Ok(rel_path) = path.strip_prefix(&skill.path) {
+                entrypoints.push(rel_path.display().to_string());
+            }
+        }
+    }
+
+    entrypoints.sort();
+    entrypoints.dedup();
+    entrypoints
+}
+
+fn skill_execution_layout(skill: &Skill, manual: &str) -> String {
+    let has_rhai = skill.path.join("SKILL.rhai").exists();
+    let supports_local_exec = skill_supports_local_exec(skill, manual);
+
+    match (has_rhai, supports_local_exec) {
+        (true, true) => "RhaiOrchestration + LocalScript".to_string(),
+        (true, false) => "RhaiOrchestration".to_string(),
+        (false, true) => "PromptTool + LocalScript".to_string(),
+        (false, false) => "PromptTool".to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn looks_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn looks_executable(_path: &Path) -> bool {
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SkillCard {
     pub name: String,
     pub description: String,
+    pub execution_layout: String,
     pub when_to_use: String,
     pub outputs: String,
     pub allowed_tools: Vec<String>,
+    pub local_exec_entrypoints: Vec<String>,
     pub supports_local_exec: bool,
 }
 
@@ -976,6 +1056,7 @@ impl SkillManager {
         SkillCard {
             name: skill.name.clone(),
             description: skill.meta.description.clone(),
+            execution_layout: skill_execution_layout(skill, &manual),
             when_to_use: if when_to_use.is_empty() {
                 concise_markdown_excerpt(&manual, 220)
             } else {
@@ -990,6 +1071,7 @@ impl SkillManager {
                 outputs
             },
             allowed_tools: skill.meta.effective_tools(),
+            local_exec_entrypoints: skill_local_exec_entrypoints(skill),
             supports_local_exec: skill_supports_local_exec(skill, &manual),
         }
     }
@@ -1437,9 +1519,11 @@ tools:
         let card = SkillManager::build_skill_card(&skill);
         assert_eq!(card.name, "weather");
         assert_eq!(card.description, "查询天气");
+        assert_eq!(card.execution_layout, "PromptTool + LocalScript");
         assert!(card.when_to_use.contains("适合查询城市天气"));
         assert!(card.outputs.contains("输出天气概览"));
         assert_eq!(card.allowed_tools, vec!["web_fetch"]);
+        assert!(card.local_exec_entrypoints.iter().any(|entry| entry == "weather.py"));
         assert!(card.supports_local_exec);
     }
 
@@ -1532,5 +1616,10 @@ description: 本地脚本 demo
 
         let card = SkillManager::build_skill_card(&skill);
         assert!(card.supports_local_exec);
+        assert_eq!(card.execution_layout, "PromptTool + LocalScript");
+        assert!(card
+            .local_exec_entrypoints
+            .iter()
+            .any(|entry| entry == "scripts/"));
     }
 }

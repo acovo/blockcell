@@ -18,6 +18,7 @@ pub struct OpenAIResponsesProvider {
     api_base: String,
     model: String,
     max_tokens: u32,
+    temperature: f32,
     tool_call_mode: ToolCallMode,
 }
 
@@ -60,7 +61,7 @@ impl OpenAIResponsesProvider {
         api_base: Option<&str>,
         model: &str,
         max_tokens: u32,
-        _temperature: f32,
+        temperature: f32,
         provider_proxy: Option<&str>,
         global_proxy: Option<&str>,
         no_proxy: &[String],
@@ -83,6 +84,7 @@ impl OpenAIResponsesProvider {
             api_base: resolved_base,
             model: model.to_string(),
             max_tokens,
+            temperature,
             tool_call_mode,
         }
     }
@@ -282,6 +284,7 @@ impl OpenAIResponsesProvider {
                 Self::build_tools(tools)
             },
             max_output_tokens: self.max_tokens,
+            temperature: self.temperature,
         };
 
         let request_body = serde_json::to_string(&request).map_err(|e| {
@@ -457,6 +460,7 @@ struct ResponsesRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
     max_output_tokens: u32,
+    temperature: f32,
 }
 
 #[async_trait]
@@ -623,5 +627,20 @@ mod tests {
         assert_eq!(built[0]["name"], "read_file");
         assert_eq!(built[0]["arguments"], "{\"path\":\"/tmp/a.txt\"}");
         assert!(built[0].get("thought_signature").is_none());
+    }
+
+    #[test]
+    fn test_responses_request_includes_temperature() {
+        let request = ResponsesRequest {
+            model: "gpt-4o".to_string(),
+            input: Vec::new(),
+            tools: Vec::new(),
+            max_output_tokens: 128,
+            temperature: 0.7,
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["temperature"], 0.7);
+        assert_eq!(value["max_output_tokens"], 128);
     }
 }

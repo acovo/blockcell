@@ -9,6 +9,7 @@ napcat = ["blockcell-channels/napcat"]
 
 [dependencies]
 blockcell-core = { path = "../core" }
+blockcell-skills = { path = "../skills" }
 blockcell-storage = { path = "../storage" }
 blockcell-channels = { path = "../channels", optional = true }
 tokio = { workspace = true }

@@ -17,7 +17,7 @@ That’s what blockcell’s multi-channel system is for: **make the AI work insi
 
 ## Supported channels
 
-blockcell currently supports 8 messaging channels:
+blockcell currently supports 11 messaging channels:
 
 | Channel | Protocol | Typical usage |
 |------|------|---------|
@@ -29,6 +29,9 @@ blockcell currently supports 8 messaging channels:
 | Discord | Gateway WebSocket | community/developers |
 | DingTalk | Stream SDK (WebSocket) | CN enterprises |
 | WeCom (WeChat Work) | webhook callback / polling | CN enterprises |
+| QQ | Bot API / WebSocket | QQ groups / direct messages |
+| NapCatQQ | OneBot 11 / WebSocket | QQ bot ecosystem |
+| Weixin | iLink Bot API | QR-code login, Weixin bots |
 
 ---
 
@@ -49,9 +52,11 @@ This way, Agent Runtime does not need to care which channel is used — behavior
 ### Current routing rules
 
 - Internal entry points such as `cli`, `cron`, and `ws` go to the `default` agent
-- External channels (Telegram / Slack / Discord / Feishu / DingTalk / WeCom / Lark / WhatsApp) first check `channelAccountOwners.<channel>.<accountId>` and fall back to `channelOwners.<channel>`
+- External channels (Telegram / WhatsApp / Feishu / Lark / Slack / Discord / DingTalk / WeCom / QQ / NapCat / Weixin) first check `channelAccountOwners.<channel>.<accountId>` and fall back to `channelOwners.<channel>`
 - **Every enabled external channel must have an owner**, otherwise `blockcell gateway` fails fast during startup
 - Use `blockcell channels owner list|set|clear` to manage bindings
+
+`blockcell channels login` currently supports `whatsapp` and `weixin`.
 
 Minimal example:
 

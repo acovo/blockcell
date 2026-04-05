@@ -907,9 +907,10 @@ pub(super) async fn handle_evolution_test_suggest(
         .unwrap_or_default();
 
     let mut context = format!(
-        "Skill name: {}\nDescription: {}\nWhen to use: {}\nOutputs: {}\nAllowed tools: {}\nSupports local execution: {}\n\n## meta.yaml\n{}\n\n## Prompt bundle\n{}",
+        "Skill name: {}\nDescription: {}\nLayout: {}\nWhen to use: {}\nOutputs: {}\nAllowed tools: {}\nSupports local execution: {}\nLocal entrypoints: {}\n\n## meta.yaml\n{}\n\n## Prompt bundle\n{}",
         skill_card.name,
         skill_card.description,
+        skill_card.execution_layout,
         skill_card.when_to_use,
         skill_card.outputs,
         if skill_card.allowed_tools.is_empty() {
@@ -918,12 +919,17 @@ pub(super) async fn handle_evolution_test_suggest(
             skill_card.allowed_tools.join(", ")
         },
         skill_card.supports_local_exec,
+        if skill_card.local_exec_entrypoints.is_empty() {
+            "(none)".to_string()
+        } else {
+            skill_card.local_exec_entrypoints.join(", ")
+        },
         meta_yaml,
         prompt_bundle
     );
     if skill_card.supports_local_exec {
         context.push_str(
-            "\n\n## Notes\nThis skill may execute local scripts through `exec_local`, but test input generation should still be based on the manual and the user-visible skill contract.",
+            "\n\n## Notes\nThis skill may execute local scripts through `exec_local`, but test input generation should still be based on the manual and the user-visible skill contract. The listed local entrypoints are the only relative paths that should be considered for local execution.",
         );
     }
 

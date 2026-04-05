@@ -94,6 +94,10 @@ pub struct ModelEntry {
     /// 输出价格（USD/1M tokens），可选
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_price: Option<f64>,
+    /// 模型专用温度参数（可选）。
+    /// 若未配置，则沿用全局 `agents.defaults.temperature`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
     /// 工具调用模式：
     /// - native: 使用 API 原生 tools/tool_calls
     /// - text: 不发送 tools，改为文本协议 <tool_call> ... </tool_call>

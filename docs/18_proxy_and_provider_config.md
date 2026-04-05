@@ -40,19 +40,25 @@ WebUI 的完整配置编辑器也会直接读取/保存原始 `config.json5` 文
 
 ### 内置 Provider 列表
 
-以下 provider 在默认配置中已预置，只需填入 `apiKey` 即可使用：
+以下 provider 在默认配置中已预置，只需填入 `apiKey` 即可使用；其中一部分是 OpenAI 兼容接口，一部分使用专用 provider 实现：
 
 | Provider 名称 | 默认 apiBase | 说明 |
 |---------------|-------------|------|
-| `anthropic` | `https://api.anthropic.com` | Anthropic Claude 系列 |
+| `anthropic` | `https://api.anthropic.com/v1` | Anthropic Claude 系列 |
 | `openai` | `https://api.openai.com/v1` | OpenAI GPT/o1/o3 系列 |
 | `deepseek` | `https://api.deepseek.com/v1` | DeepSeek 系列 |
-| `kimi` | `https://api.moonshot.cn/v1` | Kimi / Moonshot 系列 |
-| `gemini` | （原生 Gemini API） | Google Gemini 系列 |
+| `openrouter` | `https://openrouter.ai/api/v1` | OpenRouter 聚合 |
 | `groq` | `https://api.groq.com/openai/v1` | Groq 加速推理 |
 | `zhipu` | `https://open.bigmodel.cn/api/paas/v4` | 智谱 ChatGLM 系列 |
-| `openrouter` | `https://openrouter.ai/api/v1` | OpenRouter 聚合 |
 | `vllm` | `http://localhost:8000/v1` | 本地 vLLM 服务 |
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai` | Google Gemini 系列（OpenAI-compatible 配置） |
+| `kimi` | `https://api.moonshot.cn/v1` | Kimi / Moonshot 系列 |
+| `xai` | `https://api.x.ai/v1` | xAI / Grok 系列 |
+| `mistral` | `https://api.mistral.ai/v1` | Mistral 系列 |
+| `minimax` | `https://api.minimaxi.com/v1` | MiniMax 系列 |
+| `qwen` | `https://api.qwen.ai/v1` | Qwen 系列 |
+| `glm` | `https://api.z.ai/v1` | GLM 系列 |
+| `siliconflow` | `https://api.siliconflow.cn/v1` | SiliconFlow 聚合 |
 | `ollama` | `http://localhost:11434` | 本地 Ollama 服务（不需要 apiKey） |
 
 ### 常用配置示例
@@ -206,7 +212,11 @@ WebUI 的完整配置编辑器也会直接读取/保存原始 `config.json5` 文
    - `openai/...`、`gpt-`、`o1`、`o3` 开头 → `openai`
    - `deepseek` 开头 → `deepseek`
    - `groq/...` 开头 → `groq`
-3. **从 `providers` 中找第一个配置了有效 apiKey 的 provider**（fallback）
+3. **从 `providers` 中按内置优先顺序找第一个配置了有效 apiKey 的 provider**（fallback）
+
+内置 fallback 顺序目前是：`anthropic` → `openai` → `openrouter` → `deepseek` → `kimi` → `gemini` → `zhipu` → `groq` → `vllm` → `ollama`。
+
+`xai`、`mistral`、`minimax`、`qwen`、`glm`、`siliconflow` 这些 provider 也在默认配置里预置了，但如果你想优先使用它们，通常需要显式指定 `provider` 或在 `model` 上使用能推断出对应 provider 的前缀。
 
 **实际示例：**
 

@@ -248,6 +248,9 @@ fn inject_skill_cards_into_system_prompt(
     let mut section = String::from(
         "\n\n## Installed Skills\nUse `activate_skill` when one installed skill is a better fit than general tools.\nIf you call `activate_skill`, do not call any other tools in the same assistant turn.\n",
     );
+    section.push_str(
+        "If a skill card shows local execution entries, you may use `exec_local` only for those relative paths and only inside the active skill scope. Do not auto-run local scripts unless the skill is active.\n",
+    );
 
     if let Some(skill_name) = recent_skill_name {
         section.push_str(&format!(
@@ -257,9 +260,24 @@ fn inject_skill_cards_into_system_prompt(
     }
 
     for card in skill_cards {
+        let local_exec_note = if card.supports_local_exec {
+            if card.local_exec_entrypoints.is_empty() {
+                " | 本地入口: active skill 目录内的相对脚本".to_string()
+            } else {
+                format!(" | 本地入口: {}", card.local_exec_entrypoints.join(", "))
+            }
+        } else {
+            String::new()
+        };
+
         section.push_str(&format!(
-            "- `{}`: {} | 适合: {} | 输出: {}\n",
-            card.name, card.description, card.when_to_use, card.outputs
+            "- `{}`: {} | 布局: {}{} | 适合: {} | 输出: {}\n",
+            card.name,
+            card.description,
+            card.execution_layout,
+            local_exec_note,
+            card.when_to_use,
+            card.outputs
         ));
     }
 
@@ -2387,6 +2405,7 @@ impl AgentRuntime {
             .map(blockcell_skills::SkillManager::build_skill_card)
             .is_some_and(|card| card.supports_local_exec)
         {
+            declared_tools.push("exec_skill_script".to_string());
             declared_tools.push("exec_local".to_string());
         }
         crate::prompt_skill_executor::PromptSkillExecutor::resolve_allowed_tool_names(
@@ -3777,7 +3796,7 @@ impl AgentRuntime {
         args: &serde_json::Value,
         msg: &InboundMessage,
     ) -> bool {
-        if tool_name == "exec_local" {
+        if matches!(tool_name, "exec_local" | "exec_skill_script") {
             return true;
         }
         let raw_paths = self.extract_paths(tool_name, args);
@@ -4127,7 +4146,7 @@ impl AgentRuntime {
                     tool_call.name
                 ));
             } else if let Some(evo_service) = self.context_builder.evolution_service() {
-                // Try to load the current SKILL.rhai source for context
+                // Preserve any legacy top-level Rhai asset as supplemental evolution context.
                 let source_snippet = self
                     .context_builder
                     .skill_manager()
@@ -4344,6 +4363,9 @@ impl AgentRuntime {
     }
 
     #[allow(dead_code)]
+    #[deprecated(
+        note = "Legacy compatibility helper for direct SKILL.rhai execution. Prefer SKILL.md-driven exec_skill_script flows."
+    )]
     async fn run_rhai_script_with_context(
         &self,
         rhai_path: &std::path::Path,
@@ -4467,7 +4489,7 @@ impl AgentRuntime {
                 })
             };
 
-        // Context variables for the script
+        // Context variables for the legacy compatibility script.
         let mut context_vars = HashMap::new();
         context_vars.insert("skill_name".to_string(), serde_json::json!(skill_name));
         context_vars.insert("trigger".to_string(), serde_json::json!("cron"));
@@ -4477,7 +4499,7 @@ impl AgentRuntime {
             .and_then(|ctx| ctx.get("invocation"))
             .cloned();
 
-        // Build a `ctx` map so SKILL.rhai scripts can use `ctx.user_input`, `ctx.channel`, etc.
+        // Build a `ctx` map so legacy Rhai assets can use `ctx.user_input`, `ctx.channel`, etc.
         let mut ctx_json = serde_json::json!({
             "user_input": msg.content,
             "skill_name": skill_name,
@@ -4495,7 +4517,7 @@ impl AgentRuntime {
         }
         context_vars.insert("ctx".to_string(), ctx_json);
 
-        // Execute the Rhai script in a blocking task
+        // Execute the compatibility Rhai asset in a blocking task.
         let dispatcher = SkillDispatcher::new();
         let user_input = msg.content.clone();
 
@@ -4516,12 +4538,16 @@ impl AgentRuntime {
             info!(
                 skill = %skill_name,
                 tool_calls = result.tool_calls.len(),
-                "SKILL.rhai cron execution succeeded"
+                "Legacy Rhai compatibility execution succeeded"
             );
             Ok(output_str)
         } else {
             let err = result.error.unwrap_or_else(|| "Unknown error".to_string());
-            warn!(skill = %skill_name, error = %err, "SKILL.rhai cron execution failed");
+            warn!(
+                skill = %skill_name,
+                error = %err,
+                "Legacy Rhai compatibility execution failed"
+            );
             Err(blockcell_core::Error::Skill(err))
         }
     }
@@ -5288,7 +5314,40 @@ mod tests {
                 .map(chat_message_text);
             let active_skill_name = extract_active_skill_name(&system_text);
 
-            let response = if matches!(
+            let response = if matches!(active_skill_name.as_deref(), Some("compat_local_demo"))
+                && latest_tool_text.is_none()
+            {
+                LLMResponse {
+                    content: Some("准备调用兼容本地脚本".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCallRequest {
+                        id: "test-exec-local-compat".to_string(),
+                        name: "exec_local".to_string(),
+                        arguments: serde_json::json!({
+                            "path": "scripts/hello.sh",
+                            "runner": "sh",
+                            "args": ["skill"],
+                            "cwd_mode": "skill"
+                        }),
+                        thought_signature: None,
+                    }],
+                    finish_reason: "tool_calls".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else if matches!(active_skill_name.as_deref(), Some("compat_local_demo")) {
+                let stdout = latest_tool_text
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .and_then(|value| value.get("stdout").and_then(|value| value.as_str()).map(str::trim).map(str::to_string))
+                    .unwrap_or_default();
+                LLMResponse {
+                    content: Some(format!("local exec result: {}", stdout)),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else if matches!(
                 active_skill_name.as_deref(),
                 Some("local_demo" | "legacy_script_demo" | "cli_demo")
             ) && latest_tool_text.is_none()
@@ -5301,8 +5360,8 @@ mod tests {
                     content: Some("准备调用本地脚本".to_string()),
                     reasoning_content: None,
                     tool_calls: vec![ToolCallRequest {
-                        id: "test-exec-local".to_string(),
-                        name: "exec_local".to_string(),
+                        id: "test-exec-skill-script".to_string(),
+                        name: "exec_skill_script".to_string(),
                         arguments: serde_json::json!({
                             "path": path,
                             "runner": "sh",
@@ -5462,15 +5521,54 @@ mod tests {
             let latest_tool_text = latest_tool_msg.map(chat_message_text);
             let active_skill_name = extract_active_skill_name(&system_text);
 
-            let response = if matches!(active_skill_name.as_deref(), Some("local_demo"))
+            let response = if matches!(active_skill_name.as_deref(), Some("compat_local_demo"))
                 && latest_tool_name != "exec_local"
+            {
+                LLMResponse {
+                    content: Some("进入 compat_local_demo".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCallRequest {
+                        id: "skill-exec-local-compat".to_string(),
+                        name: "exec_local".to_string(),
+                        arguments: serde_json::json!({
+                            "path": "scripts/hello.sh",
+                            "runner": "sh",
+                            "args": ["skill"],
+                            "cwd_mode": "skill"
+                        }),
+                        thought_signature: None,
+                    }],
+                    finish_reason: "tool_calls".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else if matches!(active_skill_name.as_deref(), Some("compat_local_demo")) {
+                let stdout = latest_tool_text
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .and_then(|value| {
+                        value
+                            .get("stdout")
+                            .and_then(|value| value.as_str())
+                            .map(str::trim)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                LLMResponse {
+                    content: Some(format!("local exec result: {}", stdout)),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else if matches!(active_skill_name.as_deref(), Some("local_demo"))
+                && latest_tool_name != "exec_skill_script"
             {
                 LLMResponse {
                     content: Some("进入 local_demo".to_string()),
                     reasoning_content: None,
                     tool_calls: vec![ToolCallRequest {
-                        id: "skill-exec-local".to_string(),
-                        name: "exec_local".to_string(),
+                        id: "skill-exec-skill-script".to_string(),
+                        name: "exec_skill_script".to_string(),
                         arguments: serde_json::json!({
                             "path": "scripts/hello.sh",
                             "runner": "sh",
@@ -5893,6 +5991,31 @@ mod tests {
     }
 
     #[test]
+    fn test_skill_prompt_injection_keeps_activate_skill_mainline() {
+        let mut messages = vec![ChatMessage::system("You are BlockCell.")];
+        let skill_cards = vec![SkillCard {
+            name: "local_demo".to_string(),
+            description: "Local demo skill".to_string(),
+            execution_layout: "PromptTool + LocalScript".to_string(),
+            when_to_use: "Run local demo scripts".to_string(),
+            outputs: "Local exec output".to_string(),
+            allowed_tools: vec!["exec_local".to_string()],
+            local_exec_entrypoints: vec!["scripts/hello.sh".to_string()],
+            supports_local_exec: true,
+        }];
+
+        inject_skill_cards_into_system_prompt(&mut messages, &skill_cards, Some("local_demo"));
+
+        let prompt = messages[0].content.as_str().unwrap_or_default();
+        assert!(prompt.contains("## Installed Skills"));
+        assert!(prompt.contains("Use `activate_skill` when one installed skill is a better fit than general tools."));
+        assert!(prompt.contains("If a skill card shows local execution entries, you may use `exec_local` only for those relative paths and only inside the active skill scope."));
+        assert!(prompt.contains("Recent active skill: `local_demo`"));
+        assert!(prompt.contains("布局: PromptTool + LocalScript"));
+        assert!(prompt.contains("本地入口: scripts/hello.sh"));
+    }
+
+    #[test]
     fn test_markdown_skill_executor_limits_tools_to_skill_scope() {
         let available: HashSet<String> = ["web_search", "read_file", "spawn", "memory_query"]
             .into_iter()
@@ -5991,11 +6114,11 @@ description: prompt demo
     }
 
     #[tokio::test]
-    async fn test_prompt_skill_can_use_exec_local_inside_skill_scope() {
+    async fn test_prompt_skill_can_use_exec_skill_script_inside_skill_scope() {
         let mut runtime = test_runtime();
         runtime
             .tool_registry
-            .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+            .register(Arc::new(blockcell_tools::exec_skill_script::ExecSkillScriptTool));
         let skill_dir = runtime.paths.skills_dir().join("local_demo");
         let scripts_dir = skill_dir.join("scripts");
         std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
@@ -6015,7 +6138,7 @@ description: local demo
 适合执行 skill 目录内的本地脚本。
 
 ## Prompt {#prompt}
-如果要运行本地脚本，使用 exec_local。
+如果要运行本地脚本，使用 exec_skill_script 调用 `scripts/hello.sh`。
 "#,
         )
         .expect("write skill md");
@@ -6052,17 +6175,79 @@ description: local demo
             message
                 .tool_calls
                 .as_ref()
-                .map(|calls| calls.iter().any(|call| call.name == "exec_local"))
+                .map(|calls| calls.iter().any(|call| call.name == "exec_skill_script"))
                 .unwrap_or(false)
         }));
     }
 
-    #[tokio::test]
-    async fn test_skill_executor_uses_manual_not_file_type_to_choose_local_exec() {
+    #[test]
+    fn test_resolved_skill_tool_names_include_exec_skill_script_for_script_capable_skill() {
         let mut runtime = test_runtime();
         runtime
             .tool_registry
+            .register(Arc::new(blockcell_tools::exec_skill_script::ExecSkillScriptTool));
+        runtime
+            .tool_registry
             .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+        let skill_dir = runtime.paths.skills_dir().join("script_demo");
+        std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts dir");
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: script_demo
+description: script demo
+"#,
+        )
+        .expect("write meta");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"# Script Demo
+
+## Shared {#shared}
+适合执行 skill 目录内的脚本资产。
+
+## Prompt {#prompt}
+如果需要运行本地脚本，使用 exec_skill_script 调用 `scripts/hello.sh`。
+"#,
+        )
+        .expect("write skill md");
+        std::fs::write(skill_dir.join("scripts/hello.sh"), "#!/bin/sh\necho ok\n")
+            .expect("write script");
+        runtime.context_builder.reload_skills();
+
+        let active_skill = crate::context::ActiveSkillContext {
+            name: "script_demo".to_string(),
+            prompt_md: String::new(),
+            inject_prompt_md: true,
+            tools: vec![],
+            fallback_message: None,
+        };
+
+        let tool_names = runtime.resolved_skill_tool_names(&active_skill);
+        assert!(tool_names.contains(&"exec_skill_script".to_string()));
+        assert!(tool_names.contains(&"exec_local".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_check_path_permission_allows_exec_skill_script_skill_paths() {
+        let mut runtime = test_runtime();
+        let msg = test_main_session_inbound("cli", "chat-script-path");
+
+        assert!(runtime
+            .check_path_permission(
+                "exec_skill_script",
+                &serde_json::json!({"path": "scripts/hello.sh"}),
+                &msg,
+            )
+            .await);
+    }
+
+    #[tokio::test]
+    async fn test_skill_executor_uses_manual_not_file_type_to_choose_skill_script() {
+        let mut runtime = test_runtime();
+        runtime
+            .tool_registry
+            .register(Arc::new(blockcell_tools::exec_skill_script::ExecSkillScriptTool));
         let skill_dir = runtime.paths.skills_dir().join("legacy_script_demo");
         let scripts_dir = skill_dir.join("scripts");
         std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
@@ -6082,7 +6267,7 @@ description: legacy script demo
 适合执行 skill 目录内的本地脚本。
 
 ## Prompt {#prompt}
-如果需要运行本地脚本，使用 exec_local 调用 `scripts/hello.sh`。
+如果需要运行本地脚本，使用 exec_skill_script 调用 `scripts/hello.sh`。
 "#,
         )
         .expect("write skill md");
@@ -6121,17 +6306,17 @@ description: legacy script demo
             message
                 .tool_calls
                 .as_ref()
-                .map(|calls| calls.iter().any(|call| call.name == "exec_local"))
+                .map(|calls| calls.iter().any(|call| call.name == "exec_skill_script"))
                 .unwrap_or(false)
         }));
     }
 
     #[tokio::test]
-    async fn test_cli_style_skill_runs_via_exec_local() {
+    async fn test_cli_style_skill_runs_via_exec_skill_script() {
         let mut runtime = test_runtime();
         runtime
             .tool_registry
-            .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+            .register(Arc::new(blockcell_tools::exec_skill_script::ExecSkillScriptTool));
         let skill_dir = runtime.paths.skills_dir().join("cli_demo");
         let bin_dir = skill_dir.join("bin");
         std::fs::create_dir_all(&bin_dir).expect("create bin dir");
@@ -6151,7 +6336,7 @@ description: cli demo
 适合执行 skill 目录中的 CLI 脚本。
 
 ## Prompt {#prompt}
-当用户要求执行 CLI 时，使用 exec_local 调用 `bin/cli.sh`。
+当用户要求执行 CLI 时，使用 exec_skill_script 调用 `bin/cli.sh`。
 "#,
         )
         .expect("write skill md");
@@ -6174,6 +6359,73 @@ description: cli demo
 
         let result = runtime.process_message(msg).await.expect("process message");
         assert!(result.contains("local-cli-demo"), "unexpected cli result: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_skill_can_still_use_exec_local_inside_skill_scope_for_compat() {
+        let mut runtime = test_runtime();
+        runtime
+            .tool_registry
+            .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+        let skill_dir = runtime.paths.skills_dir().join("compat_local_demo");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: compat_local_demo
+description: compat local demo
+"#,
+        )
+        .expect("write meta");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"# Compat Local Demo
+
+## Shared {#shared}
+适合执行 skill 目录内的本地脚本。
+
+## Prompt {#prompt}
+如果要运行本地脚本，使用 exec_local。
+"#,
+        )
+        .expect("write skill md");
+        std::fs::write(scripts_dir.join("hello.sh"), "#!/bin/sh\necho local-skill-$1\n")
+            .expect("write script");
+        runtime.context_builder.reload_skills();
+
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "chat-local-compat".to_string(),
+            content: "运行兼容本地脚本".to_string(),
+            media: vec![],
+            metadata: serde_json::json!({
+                "forced_skill_name": "compat_local_demo",
+            }),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let result = runtime.process_message(msg).await.expect("process message");
+        let session_key = blockcell_core::build_session_key("cli", "chat-local-compat");
+        let history = runtime
+            .session_store
+            .load(&session_key)
+            .expect("load session history");
+        assert!(
+            result.contains("local-skill-skill"),
+            "unexpected skill result: {}; history: {:?}",
+            result,
+            history
+        );
+        assert!(history.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().any(|call| call.name == "exec_local"))
+                .unwrap_or(false)
+        }));
     }
 
     #[tokio::test]
@@ -6207,7 +6459,7 @@ description: cli demo
         let mut runtime = test_runtime_with_provider(provider.clone());
         runtime
             .tool_registry
-            .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+            .register(Arc::new(blockcell_tools::exec_skill_script::ExecSkillScriptTool));
         let skill_dir = runtime.paths.skills_dir().join("local_demo");
         let scripts_dir = skill_dir.join("scripts");
         std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
@@ -6227,7 +6479,7 @@ description: local demo
 适合执行 skill 目录内的本地脚本。
 
 ## Prompt {#prompt}
-如果需要运行本地脚本，使用 exec_local 调用 `scripts/hello.sh`。
+如果需要运行本地脚本，使用 exec_skill_script 调用 `scripts/hello.sh`。
 "#,
         )
         .expect("write skill md");

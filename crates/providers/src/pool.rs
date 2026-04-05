@@ -110,7 +110,7 @@ impl ProviderPool {
         let defaults = &config.agents.defaults;
 
         // 收集 ModelEntry 列表（兼容旧配置）
-        let entries_cfg: Vec<(String, String, u32, u32, ToolCallMode)> =
+        let entries_cfg: Vec<(String, String, u32, u32, ToolCallMode, Option<f32>)> =
             if !defaults.model_pool.is_empty() {
                 defaults
                     .model_pool
@@ -122,6 +122,7 @@ impl ProviderPool {
                             e.weight,
                             e.priority,
                             e.tool_call_mode,
+                            e.temperature,
                         )
                     })
                     .collect()
@@ -129,7 +130,7 @@ impl ProviderPool {
                 // 旧配置：单条目
                 let model = defaults.model.clone();
                 let provider_name = defaults.provider.clone().unwrap_or_default();
-                vec![(model, provider_name, 1, 1, ToolCallMode::Native)]
+                vec![(model, provider_name, 1, 1, ToolCallMode::Native, None)]
             };
 
         if entries_cfg.is_empty() {
@@ -142,7 +143,7 @@ impl ProviderPool {
         let mut health_map = HashMap::new();
         let stats_map = HashMap::new();
 
-        for (idx, (model, provider_name, weight, priority, tool_call_mode)) in
+        for (idx, (model, provider_name, weight, priority, tool_call_mode, temperature)) in
             entries_cfg.into_iter().enumerate()
         {
             let explicit = if provider_name.is_empty() {
@@ -150,7 +151,14 @@ impl ProviderPool {
             } else {
                 Some(provider_name.as_str())
             };
-            match create_provider_with_tool_mode(config, &model, explicit, Some(tool_call_mode)) {
+            let temperature = temperature.unwrap_or(defaults.temperature);
+            match create_provider_with_tool_mode(
+                config,
+                &model,
+                explicit,
+                Some(tool_call_mode),
+                Some(temperature),
+            ) {
                 Ok(p) => {
                     info!(
                         idx, model = %model, provider = %provider_name,
@@ -459,6 +467,7 @@ mod tests {
             priority: 1,
             input_price: None,
             output_price: None,
+            temperature: None,
             tool_call_mode: blockcell_core::config::ToolCallMode::Native,
         }];
         let result = ProviderPool::from_config(&config);
@@ -483,6 +492,7 @@ mod tests {
             priority: 1,
             input_price: None,
             output_price: None,
+            temperature: None,
             tool_call_mode: blockcell_core::config::ToolCallMode::Native,
         }];
         let pool = ProviderPool::from_config(&config).unwrap();
@@ -507,6 +517,7 @@ mod tests {
             priority: 1,
             input_price: None,
             output_price: None,
+            temperature: None,
             tool_call_mode: blockcell_core::config::ToolCallMode::Native,
         }];
         let pool = ProviderPool::from_config(&config).unwrap();

@@ -11,9 +11,9 @@ use crate::{Tool, ToolContext, ToolSchema};
 
 pub struct ExecLocalTool;
 
-const ALLOWED_RUNNERS: &[&str] = &["python3", "bash", "sh", "node", "php"];
+pub(crate) const ALLOWED_RUNNERS: &[&str] = &["python3", "bash", "sh", "node", "php"];
 
-fn validate_relative_skill_path(path: &str) -> Result<()> {
+pub(crate) fn validate_relative_skill_path(path: &str) -> Result<()> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err(Error::Validation(
@@ -40,7 +40,7 @@ fn validate_relative_skill_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_runner(runner: &str) -> Result<()> {
+pub(crate) fn validate_runner(runner: &str) -> Result<()> {
     if ALLOWED_RUNNERS.contains(&runner) {
         Ok(())
     } else {
@@ -51,7 +51,7 @@ fn validate_runner(runner: &str) -> Result<()> {
     }
 }
 
-fn truncate_output(text: String, max_chars: usize, suffix: &str) -> String {
+pub(crate) fn truncate_output(text: String, max_chars: usize, suffix: &str) -> String {
     if text.chars().count() <= max_chars {
         return text;
     }
@@ -62,7 +62,7 @@ fn truncate_output(text: String, max_chars: usize, suffix: &str) -> String {
     }
 }
 
-fn resolve_script_path(skill_dir: &Path, relative_path: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_script_path(skill_dir: &Path, relative_path: &str) -> Result<PathBuf> {
     validate_relative_skill_path(relative_path)?;
     let joined = skill_dir.join(relative_path);
     let canonical_skill_dir = std::fs::canonicalize(skill_dir)?;
@@ -313,6 +313,40 @@ mod tests {
 
         assert_eq!(result["exit_code"].as_i64(), Some(0));
         assert!(result["stdout"].as_str().unwrap_or_default().contains("hello world"));
+        assert_eq!(
+            result["resolved_path"].as_str(),
+            Some(expected_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_local_runs_top_level_skill_py() {
+        let skill_dir = temp_skill_dir("blockcell-exec-local-skill-py");
+        let script_path = skill_dir.join("SKILL.py");
+        fs::write(
+            &script_path,
+            "import sys\nprint('py:' + '-'.join(sys.argv[1:]))\n",
+        )
+        .expect("write skill py");
+
+        let tool = ExecLocalTool;
+        let result = tool
+            .execute(
+                tool_context(skill_dir.clone()),
+                json!({
+                    "path": "SKILL.py",
+                    "runner": "python3",
+                    "args": ["demo", "local"],
+                    "cwd_mode": "skill"
+                }),
+            )
+            .await
+            .expect("exec_local should succeed for SKILL.py");
+
+        let expected_path = script_path.canonicalize().expect("canonical path");
+
+        assert_eq!(result["exit_code"].as_i64(), Some(0));
+        assert!(result["stdout"].as_str().unwrap_or_default().contains("py:demo-local"));
         assert_eq!(
             result["resolved_path"].as_str(),
             Some(expected_path.to_string_lossy().as_ref())

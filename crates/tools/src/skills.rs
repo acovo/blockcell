@@ -1,8 +1,60 @@
 use async_trait::async_trait;
 use blockcell_core::Result;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 use crate::{Tool, ToolContext, ToolSchema};
+
+#[derive(Debug, Default)]
+struct SkillAssetMetadata {
+    has_rhai: bool,
+    has_py: bool,
+    has_md: bool,
+    script_assets: Vec<String>,
+}
+
+fn is_script_asset(path: &Path) -> bool {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "rhai" | "py" | "sh" | "php" | "js" | "ts" | "rb"))
+    {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(path)
+            .ok()
+            .is_some_and(|meta| meta.permissions().mode() & 0o111 != 0)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn collect_script_assets(root: &Path, dir: &Path, assets: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_script_assets(root, &path, assets);
+            continue;
+        }
+
+        if path.is_file() && is_script_asset(&path) {
+            if let Ok(rel) = path.strip_prefix(root) {
+                assets.push(rel.to_path_buf());
+            }
+        }
+    }
+}
 
 /// Tool for querying skill evolution status — what skills are being learned,
 /// what skills have been learned, and the overall evolution state.
@@ -58,6 +110,27 @@ impl Tool for ListSkillsTool {
 }
 
 impl ListSkillsTool {
+    fn detect_skill_assets(&self, skill_dir: &Path) -> SkillAssetMetadata {
+        let has_rhai = skill_dir.join("SKILL.rhai").exists();
+        let has_py = skill_dir.join("SKILL.py").exists();
+        let has_md = skill_dir.join("SKILL.md").exists();
+
+        let mut script_assets = Vec::new();
+        collect_script_assets(skill_dir, skill_dir, &mut script_assets);
+        script_assets.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+        script_assets.dedup();
+
+        SkillAssetMetadata {
+            has_rhai,
+            has_py,
+            has_md,
+            script_assets: script_assets
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+        }
+    }
+
     /// Get skills currently being evolved (Triggered, Generating, Generated, Auditing, etc.)
     async fn get_learning_skills(&self, records_dir: &std::path::Path) -> Result<Value> {
         let records = self.load_evolution_records(records_dir)?;
@@ -199,19 +272,20 @@ impl ListSkillsTool {
                     }
 
                     let meta = self.read_skill_meta(&path);
-                    let has_rhai = path.join("SKILL.rhai").exists();
-                    let has_py = path.join("SKILL.py").exists();
-                    let has_md = path.join("SKILL.md").exists();
-                    let has_skill_file = has_rhai || has_py || has_md;
+                    let assets = self.detect_skill_assets(&path);
+                    let has_skill_file =
+                        assets.has_rhai || assets.has_py || assets.has_md || !assets.script_assets.is_empty();
 
                     if has_skill_file {
                         skills.push(json!({
                             "name": name,
                             "description": meta.get("description").unwrap_or(&Value::Null),
                             "always": meta.get("always").unwrap_or(&json!(false)),
-                            "has_rhai": has_rhai,
-                            "has_py": has_py,
-                            "has_md": has_md,
+                            "has_rhai": assets.has_rhai,
+                            "has_py": assets.has_py,
+                            "has_md": assets.has_md,
+                            "has_script_assets": !assets.script_assets.is_empty(),
+                            "script_assets": assets.script_assets,
                             "path": path.display().to_string(),
                         }));
                     }
@@ -314,6 +388,8 @@ impl ListSkillsTool {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -384,6 +460,82 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(names.iter().any(|n| n == "py_demo_skill"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn test_list_skills_metadata_reports_script_assets_consistently() {
+        let tool = ListSkillsTool;
+
+        let mut root = std::env::temp_dir();
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        root.push(format!(
+            "blockcell_list_skills_assets_{}_{}",
+            std::process::id(),
+            now_ns
+        ));
+
+        let skill_dir = root.join("asset_skill");
+        std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts dir");
+        std::fs::create_dir_all(skill_dir.join("bin")).expect("create bin dir");
+        std::fs::write(skill_dir.join("SKILL.rhai"), "set_output(\"compat\");\n")
+            .expect("write SKILL.rhai");
+        std::fs::write(skill_dir.join("SKILL.py"), "print('compat')\n").expect("write SKILL.py");
+        std::fs::write(skill_dir.join("SKILL.md"), "# Asset skill\n").expect("write SKILL.md");
+        std::fs::write(skill_dir.join("scripts/flow.rhai"), "set_output(\"nested\");\n")
+            .expect("write scripts/flow.rhai");
+        std::fs::write(skill_dir.join("scripts/report.py"), "print('nested')\n")
+            .expect("write scripts/report.py");
+        std::fs::write(skill_dir.join("bin/run"), "#!/bin/sh\necho ok\n").expect("write bin/run");
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(skill_dir.join("bin/run"))
+                .expect("stat bin/run")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(skill_dir.join("bin/run"), perms)
+                .expect("chmod bin/run");
+        }
+
+        let result = tool
+            .get_available_skills(&root, None)
+            .await
+            .expect("get available skills");
+
+        let skill = result
+            .get("available_skills")
+            .and_then(|v| v.as_array())
+            .and_then(|skills| skills.iter().find(|skill| {
+                skill
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    == Some("asset_skill")
+            }))
+            .expect("find asset_skill entry");
+
+        assert_eq!(skill.get("has_rhai"), Some(&Value::Bool(true)));
+        assert_eq!(skill.get("has_py"), Some(&Value::Bool(true)));
+        assert_eq!(skill.get("has_md"), Some(&Value::Bool(true)));
+        assert_eq!(skill.get("has_script_assets"), Some(&Value::Bool(true)));
+
+        let script_assets = skill
+            .get("script_assets")
+            .and_then(|value| value.as_array())
+            .expect("script_assets should be an array");
+        let asset_paths: Vec<&str> = script_assets
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+
+        assert!(asset_paths.contains(&"SKILL.rhai"));
+        assert!(asset_paths.contains(&"SKILL.py"));
+        assert!(asset_paths.contains(&"scripts/flow.rhai"));
+        assert!(asset_paths.contains(&"scripts/report.py"));
+        assert!(asset_paths.contains(&"bin/run"));
 
         let _ = std::fs::remove_dir_all(root);
     }
