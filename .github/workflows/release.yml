@@ -33,8 +33,8 @@ jobs:
             archive_ext: tar.gz
             deployment_target: "11.0"
 
-          # macOS Intel (x86_64) — native build on Intel runner
-          - os: macos-13
+          # macOS Intel (x86_64) — cross-compiled from arm64 runner
+          - os: macos-15
             target: x86_64-apple-darwin
             platform: darwin
             arch: amd64

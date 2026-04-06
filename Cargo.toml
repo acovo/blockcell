@@ -116,7 +116,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Lazy statics
 once_cell = "1.19"
-lancedb = "0.27.1"
+lancedb = "0.27.2"
 arrow-array = "57.3.0"
 arrow-schema = "57.3.0"
 

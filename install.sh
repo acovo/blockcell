@@ -31,6 +31,29 @@ detect_arch() {
   esac
 }
 
+install_source_deps() {
+  os="$1"
+
+  if [ "$os" = "linux" ]; then
+    if command -v apt-get >/dev/null 2>&1; then
+      echo "Installing build dependencies (pkg-config, libssl-dev, libprotobuf-dev, protobuf-compiler, perl, make)..."
+      sudo apt-get update -qq
+      sudo apt-get install -y pkg-config libssl-dev libprotobuf-dev protobuf-compiler perl make gcc 2>/dev/null || true
+    elif command -v yum >/dev/null 2>&1; then
+      echo "Installing build dependencies (pkgconfig, openssl-devel, protobuf-devel, protobuf-compiler, perl, make)..."
+      sudo yum install -y pkgconfig openssl-devel protobuf-devel protobuf-compiler perl make gcc 2>/dev/null || true
+    elif command -v dnf >/dev/null 2>&1; then
+      echo "Installing build dependencies (pkgconfig, openssl-devel, protobuf-devel, protobuf-compiler, perl, make)..."
+      sudo dnf install -y pkgconfig openssl-devel protobuf-devel protobuf-compiler perl make gcc 2>/dev/null || true
+    fi
+  elif [ "$os" = "darwin" ]; then
+    if command -v brew >/dev/null 2>&1; then
+      echo "Installing build dependencies (pkg-config, protobuf)..."
+      brew install pkg-config protobuf >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
 github_release_asset_url() {
   require_cmd curl
   require_cmd grep
@@ -78,18 +101,7 @@ install_from_source() {
 
   echo "Building (release)..."
   os=$(detect_os)
-
-  if [ "$os" = "linux" ]; then
-    if command -v apt-get >/dev/null 2>&1; then
-      echo "Installing build dependencies (pkg-config, libssl-dev, perl, make)..."
-      sudo apt-get update -qq
-      sudo apt-get install -y pkg-config libssl-dev perl make gcc 2>/dev/null || true
-    elif command -v yum >/dev/null 2>&1; then
-      sudo yum install -y pkgconfig openssl-devel perl make gcc 2>/dev/null || true
-    elif command -v dnf >/dev/null 2>&1; then
-      sudo dnf install -y pkgconfig openssl-devel perl make gcc 2>/dev/null || true
-    fi
-  fi
+  install_source_deps "$os"
 
   # Limit parallel jobs to avoid OOM on low-memory servers (each rustc job can use 1-2 GB)
   total_mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0)

@@ -27,6 +27,8 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
         build-essential \
         pkg-config \
         libssl-dev \
+        libprotobuf-dev \
+        protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -35,6 +37,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY bin ./bin
+COPY skills ./skills
 
 # Copy webui dist (required for rust-embed)
 COPY --from=webui-builder /webui/dist ./webui/dist
