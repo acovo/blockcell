@@ -1,6 +1,6 @@
 use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, ConfirmRequest, CoreEvolutionAdapter,
-    MemoryStoreAdapter, MessageBus, ProviderLLMBridge, TaskManager,
+    MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCache, TaskManager,
 };
 #[cfg(feature = "dingtalk")]
 use blockcell_channels::dingtalk::DingTalkChannel;
@@ -20,7 +20,7 @@ use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, InboundMessage, Paths};
 use blockcell_providers::{Provider, ProviderPool};
 use blockcell_scheduler::{CronService, DreamService, DreamServiceConfig};
-use blockcell_skills::{is_builtin_tool, new_registry_handle, CoreEvolution};
+use blockcell_skills::{new_registry_handle, CoreEvolution};
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
     build_tool_registry_for_agent_config, CapabilityRegistryHandle, CoreEvolutionHandle,
@@ -33,11 +33,13 @@ use crossterm::{
     style::Print,
     terminal::{self, Clear, ClearType},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
 
 use super::memory_store::open_memory_store;
+use super::slash_commands::{CommandContext, CommandResult, SLASH_COMMAND_HANDLER};
 
 /// Built-in tools grouped by category for /tools display.
 /// This must include ALL tools registered in ToolRegistry::with_defaults().
@@ -646,6 +648,11 @@ pub async fn run(
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
 
+        // Create shared ResponseCache for CLI and runtime
+        // This allows the /clear command to clear the in-memory cache
+        let response_cache = ResponseCache::new();
+        runtime.set_response_cache(response_cache.clone());
+
         // Initialize Layer 5 memory injector (7-layer memory system)
         if let Err(e) = runtime.init_memory_injector().await {
             warn!(error = %e, "Failed to initialize memory injector");
@@ -804,6 +811,12 @@ pub async fn run(
         let stdin_tx = inbound_tx.clone();
         let session_clone = session.clone();
         let stdin_task_manager = task_manager.clone();
+
+        // 创建会话清除标记（用于 /clear 命令）
+        let session_clear_flag = Arc::new(AtomicBool::new(false));
+        let session_clear_flag_clone = session_clear_flag.clone();
+        let response_cache_for_stdin = response_cache.clone();
+
         let stdin_handle = tokio::task::spawn_blocking(move || {
             let mut stdout = std::io::stdout();
             // Create a small tokio runtime for blocking task manager queries
@@ -843,149 +856,89 @@ pub async fn run(
                     continue;
                 }
 
-                if input == "/quit" || input == "/exit" {
-                    break;
-                }
-
-                // /help — print all available slash commands
-                if input == "/help" {
-                    println!();
-                    println!("Available commands:");
-                    println!("  /help               Show this help");
-                    println!("  /tasks              List background tasks");
-                    println!("  /skills             List skills and evolution status");
-                    println!("  /tools              List all registered tools");
-                    println!("  /learn <desc>       Learn a new skill by description");
-                    println!("  /clear              Clear current session history");
-                    println!("  /clear-skills       Clear all skill evolution records");
-                    println!("  /forget-skill <n>   Delete records for a specific skill");
-                    println!("  /quit  /exit        Exit interactive mode");
-                    println!("  /<name>             Quick invoke a tool or skill");
-                    println!();
-                    continue;
-                }
-
-                // /clear — clear current session history (acknowledged locally)
-                if input == "/clear" {
-                    println!("  Session history cleared. (Note: server-side history persists in memory store)");
-                    println!();
-                    continue;
-                }
-
-                // Local /tasks command — query TaskManager directly, no LLM needed
-                if input == "/tasks" || input.starts_with("/tasks ") {
-                    let tm = &stdin_task_manager;
-                    let (queued, running, completed, failed, tasks) = local_rt.block_on(async {
-                        let (q, r, c, f) = tm.summary().await;
-                        let tasks = tm.list_tasks(None).await;
-                        (q, r, c, f, tasks)
-                    });
-                    println!();
-                    println!(
-                        "📋 Task overview: {} queued | {} running | {} completed | {} failed",
-                        queued, running, completed, failed
-                    );
-                    if tasks.is_empty() {
-                        println!("  (No tasks)");
-                    } else {
-                        for t in &tasks {
-                            let status_icon = match t.status.to_string().as_str() {
-                                "queued" => "⏳",
-                                "running" => "🔄",
-                                "completed" => "✅",
-                                "failed" => "❌",
-                                _ => "•",
-                            };
-                            let short_id_str: String = t.id.chars().take(12).collect();
-                            let short_id = short_id_str.as_str();
-                            println!(
-                                "  {} [{}] {} - {}",
-                                status_icon, short_id, t.status, t.label
-                            );
-                            if let Some(ref progress) = t.progress {
-                                println!("    Progress: {}", progress);
-                            }
-                            if let Some(ref result) = t.result {
-                                let preview = if result.chars().count() > 100 {
-                                    let truncated: String = result.chars().take(100).collect();
-                                    format!("{}...", truncated)
-                                } else {
-                                    result.clone()
-                                };
-                                println!("    Result: {}", preview);
-                            }
-                            if let Some(ref err) = t.error {
-                                println!("    Error: {}", err);
-                            }
-                        }
-                    }
-                    println!();
-                    continue;
-                }
-
-                // /skills — list skill evolution status (local, no LLM)
-                if input == "/skills" || input.starts_with("/skills ") {
-                    print_skills_status(&stdin_paths);
-                    continue;
-                }
-
-                // /tools — list registered tools (local, no LLM)
-                if input == "/tools" {
-                    print_tools_status(&stdin_paths);
-                    continue;
-                }
-
-                // /clear-skills — clear all evolution records
-                if input == "/clear-skills" {
-                    clear_all_skill_records(&stdin_paths);
-                    continue;
-                }
-
-                // /forget-skill <name> — delete records for a specific skill
-                if input.starts_with("/forget-skill ") {
-                    let skill_name = input.trim_start_matches("/forget-skill ").trim();
-                    if skill_name.is_empty() {
-                        println!("  Usage: /forget-skill <skill_name>");
-                    } else {
-                        delete_skill_records(&stdin_paths, skill_name);
-                    }
-                    println!();
-                    continue;
-                }
-
-                // /learn <description> — send a learn request to the LLM
-                if input.starts_with("/learn ") {
-                    let description = input.trim_start_matches("/learn ").trim();
-                    if description.is_empty() {
-                        println!("  Usage: /learn <skill description>");
-                        println!();
-                        continue;
-                    }
-                    // Frame the message so the LLM understands it's a skill learning request
-                    let learn_msg = format!(
-                        "Please learn the following skill: {}\n\n\
-                        If this skill is already learned (has a record in list_skills query=learned), just tell me it's done.\n\
-                        Otherwise, start learning this skill and report progress.",
-                        description
-                    );
-                    let inbound = InboundMessage {
-                        channel: "cli".to_string(),
-                        account_id: None,
-                        sender_id: "user".to_string(),
-                        chat_id: session_clone
+                // 使用统一的斜杠命令处理器
+                if input.starts_with('/') {
+                    // 构造命令上下文
+                    let ctx = CommandContext::for_cli(
+                        stdin_paths.clone(),
+                        stdin_task_manager.clone(),
+                        session_clone
                             .split(':')
                             .nth(1)
                             .unwrap_or("default")
                             .to_string(),
-                        content: learn_msg,
-                        media: vec![],
-                        metadata: serde_json::Value::Null,
-                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
-                    };
-                    if stdin_tx.blocking_send(inbound).is_err() {
-                        break;
+                    ).with_clear_callback(Arc::new({
+                        let flag = session_clear_flag_clone.clone();
+                        move || {
+                            flag.store(true, Ordering::SeqCst);
+                            true
+                        }
+                    }));
+
+                    // 同步执行命令处理器
+                    let result = local_rt.block_on(SLASH_COMMAND_HANDLER.try_handle(&input, &ctx));
+
+                    match result {
+                        CommandResult::Handled(response) => {
+                            print!("{}", response.content);
+                            continue;
+                        }
+                        CommandResult::ExitRequested => {
+                            println!("退出交互模式...");
+                            break;
+                        }
+                        CommandResult::NotACommand => {
+                            // 不是斜杠命令，或者 /learn 命令（需要转发给 LLM）
+                        }
+                        CommandResult::PermissionDenied(msg) => {
+                            eprintln!("权限不足: {}", msg);
+                            continue;
+                        }
+                        CommandResult::Error(e) => {
+                            eprintln!("命令执行错误: {}", e);
+                            continue;
+                        }
                     }
-                    continue;
+
+                    // 特殊处理 /learn 命令：将消息转发给 AgentRuntime
+                    if input.starts_with("/learn ") {
+                        let description = input.trim_start_matches("/learn ").trim();
+                        if !description.is_empty() {
+                            let learn_msg = format!(
+                                "Please learn the following skill: {}\n\n\
+                                If this skill is already learned (has a record in list_skills query=learned), just tell me it's done.\n\
+                                Otherwise, start learning this skill and report progress.",
+                                description
+                            );
+                            let inbound = InboundMessage {
+                                channel: "cli".to_string(),
+                                account_id: None,
+                                sender_id: "user".to_string(),
+                                chat_id: session_clone
+                                    .split(':')
+                                    .nth(1)
+                                    .unwrap_or("default")
+                                    .to_string(),
+                                content: learn_msg,
+                                media: vec![],
+                                metadata: serde_json::Value::Null,
+                                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                            };
+                            if stdin_tx.blocking_send(inbound).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // 检查会话清除标记（由 /clear 命令设置）
+                if session_clear_flag_clone.load(Ordering::SeqCst) {
+                    // 标记已处理，重置
+                    session_clear_flag_clone.store(false, Ordering::SeqCst);
+                    // 清除内存中的 ResponseCache
+                    response_cache_for_stdin.clear_session(&session_clone);
+                    tracing::info!(session = %session_clone, "[/clear] ResponseCache cleared");
                 }
 
                 // Extract image paths from input for multimodal support
@@ -1619,415 +1572,6 @@ fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
     skills
 }
 
-/// Skill domain categories for grouping skills in /skills display.
-const SKILL_CATEGORIES: &[(&str, &[&str])] = &[
-    (
-        "💰 Finance",
-        &[
-            "stock_monitor",
-            "stock_screener",
-            "bond_monitor",
-            "futures_monitor",
-            "futures_strategy",
-            "portfolio_advisor",
-            "macro_monitor",
-            "daily_finance_report",
-        ],
-    ),
-    (
-        "⛓️ Blockchain/DeFi",
-        &[
-            "crypto_research",
-            "crypto_onchain",
-            "crypto_sentiment",
-            "crypto_tax",
-            "quant_crypto",
-            "defi_analysis",
-            "nft_analysis",
-            "dao_analysis",
-            "token_security",
-            "contract_audit",
-            "wallet_security",
-            "whale_tracker",
-            "address_monitor",
-            "treasury_management",
-        ],
-    ),
-    (
-        "📧 Email",
-        &[
-            "email_digest",
-            "email_auto_reply",
-            "email_cleanup",
-            "email_backup",
-            "email_report",
-            "email_to_tasks",
-        ],
-    ),
-    ("🖥️ GUI Automation", &["app_control", "camera"]),
-    (
-        "📅 Productivity",
-        &[
-            "daily_digest",
-            "weekly_review",
-            "calendar_manager",
-            "calendar_reminders",
-            "personal_life",
-            "smart_home",
-            "learning_assistant",
-        ],
-    ),
-    (
-        "🔧 DevOps",
-        &[
-            "dev_workflow",
-            "dev_security",
-            "devops_monitor",
-            "log_monitor",
-            "site_monitor",
-            "security_privacy",
-        ],
-    ),
-    ("📰 Content", &["news_monitor", "content_creator"]),
-    ("🏢 Business", &["business_ops"]),
-];
-
-/// Print skill status (local filesystem operation, no LLM needed).
-/// Shows skill directories grouped by domain + evolution records.
-fn print_skills_status(paths: &Paths) {
-    use blockcell_skills::evolution::EvolutionRecord;
-
-    let records_dir = paths.workspace().join("evolution_records");
-
-    // Collect all skills from built-in and workspace dirs
-    let builtin_skills = scan_skill_dirs(&paths.builtin_skills_dir());
-    let workspace_skills = scan_skill_dirs(&paths.skills_dir());
-
-    // Merge: workspace overrides built-in
-    let mut skill_map: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    for (name, desc) in &builtin_skills {
-        skill_map.insert(name.clone(), desc.clone());
-    }
-    for (name, desc) in &workspace_skills {
-        skill_map.insert(name.clone(), desc.clone());
-    }
-
-    println!();
-    println!("🧠 Skills ({} total)", skill_map.len());
-
-    // Group skills by category
-    let mut categorized = std::collections::HashSet::new();
-
-    for (category, skill_names) in SKILL_CATEGORIES {
-        let mut items: Vec<(&str, &str)> = Vec::new();
-        for &sn in *skill_names {
-            if let Some(desc) = skill_map.get(sn) {
-                items.push((sn, desc.as_str()));
-                categorized.insert(sn.to_string());
-            }
-        }
-        if !items.is_empty() {
-            println!();
-            println!("  {} ({})", category, items.len());
-            for (name, desc) in &items {
-                if desc.is_empty() {
-                    println!("    • {}", name);
-                } else {
-                    // Truncate long descriptions
-                    let char_count = desc.chars().count();
-                    if char_count > 40 {
-                        let short: String = desc.chars().take(40).collect();
-                        println!("    • {} — {}…", name, short);
-                    } else {
-                        println!("    • {} — {}", name, desc);
-                    }
-                }
-            }
-        }
-    }
-
-    // Show uncategorized skills (user-created or newly added)
-    let uncategorized: Vec<_> = skill_map
-        .iter()
-        .filter(|(name, _)| !categorized.contains(name.as_str()))
-        .collect();
-    if !uncategorized.is_empty() {
-        println!();
-        println!("  📦 Other ({})", uncategorized.len());
-        for (name, desc) in &uncategorized {
-            if desc.is_empty() {
-                println!("    • {}", name);
-            } else {
-                let char_count = desc.chars().count();
-                if char_count > 40 {
-                    let short: String = desc.chars().take(40).collect();
-                    println!("    • {} — {}…", name, short);
-                } else {
-                    println!("    • {} — {}", name, desc);
-                }
-            }
-        }
-    }
-
-    // --- Evolution records (learned / learning / failed) ---
-    let mut records: Vec<EvolutionRecord> = Vec::new();
-    if records_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&records_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "json") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(record) = serde_json::from_str::<EvolutionRecord>(&content) {
-                            records.push(record);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-    let mut seen = std::collections::HashSet::new();
-    let mut learning = Vec::new();
-    let mut learned = Vec::new();
-    let mut failed = Vec::new();
-
-    for r in &records {
-        if is_builtin_tool(&r.skill_name) {
-            continue;
-        }
-        if !seen.insert(r.skill_name.clone()) {
-            continue;
-        }
-        let status_str = format!("{:?}", r.status);
-        match status_str.as_str() {
-            "Completed" => learned.push(r),
-            "Failed" | "RolledBack" | "AuditFailed" | "DryRunFailed" | "TestFailed" => {
-                failed.push(r)
-            }
-            _ => learning.push(r),
-        }
-    }
-
-    if !learned.is_empty() || !learning.is_empty() || !failed.is_empty() {
-        println!();
-        println!("  ── Evolution Status ──");
-    }
-
-    if !learned.is_empty() {
-        println!("  ✅ Learned ({}):", learned.len());
-        for r in &learned {
-            println!(
-                "    • {} ({})",
-                r.skill_name,
-                format_timestamp(r.created_at)
-            );
-        }
-    }
-
-    if !learning.is_empty() {
-        println!("  🔄 Learning ({}):", learning.len());
-        for r in &learning {
-            let status_desc = match format!("{:?}", r.status).as_str() {
-                "Triggered" => "pending",
-                "Generating" => "generating",
-                "Generated" => "generated",
-                "Auditing" => "auditing",
-                "AuditPassed" => "audit passed",
-                "CompilePassed" | "DryRunPassed" | "TestPassed" => "compile passed",
-                "CompileFailed" | "DryRunFailed" | "TestFailed" | "Testing" => "compile failed",
-                "Observing" | "RollingOut" => "observing",
-                _ => "in progress",
-            };
-            println!(
-                "    • {} [{}] ({})",
-                r.skill_name,
-                status_desc,
-                format_timestamp(r.created_at)
-            );
-        }
-    }
-
-    if !failed.is_empty() {
-        println!("  ❌ Failed ({}):", failed.len());
-        for r in &failed {
-            println!(
-                "    • {} ({})",
-                r.skill_name,
-                format_timestamp(r.created_at)
-            );
-        }
-    }
-
-    let builtin_err_count = records
-        .iter()
-        .filter(|r| is_builtin_tool(&r.skill_name))
-        .count();
-    if builtin_err_count > 0 {
-        println!();
-        println!(
-            "  ℹ️  {} built-in tool error records hidden (/clear-skills to clean up)",
-            builtin_err_count
-        );
-    }
-
-    println!();
-    println!("  💡 /tools view tools | /learn <desc> learn new skill");
-    println!();
-}
-
-/// Clear all evolution records from disk.
-fn clear_all_skill_records(paths: &Paths) {
-    let records_dir = paths.workspace().join("evolution_records");
-    let mut count = 0;
-
-    if records_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&records_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "json")
-                    && std::fs::remove_file(&path).is_ok()
-                {
-                    count += 1;
-                }
-            }
-        }
-    }
-
-    println!();
-    if count > 0 {
-        println!("  ✅ Cleared all skill evolution records ({} total)", count);
-    } else {
-        println!("  (No records to clear)");
-    }
-    println!();
-}
-
-/// Delete evolution records for a specific skill name.
-fn delete_skill_records(paths: &Paths, skill_name: &str) {
-    use blockcell_skills::evolution::EvolutionRecord;
-
-    let records_dir = paths.workspace().join("evolution_records");
-    let mut count = 0;
-
-    if records_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&records_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "json") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(record) = serde_json::from_str::<EvolutionRecord>(&content) {
-                            if record.skill_name == skill_name
-                                && std::fs::remove_file(&path).is_ok()
-                            {
-                                count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    println!();
-    if count > 0 {
-        println!(
-            "  ✅ Deleted all records for skill `{}` ({} total)",
-            skill_name, count
-        );
-    } else {
-        println!("  ⚠️  No records found for skill `{}`", skill_name);
-    }
-}
-
-/// Print registered tools status (local, no LLM needed).
-/// Shows ALL built-in tools grouped by category + dynamic evolved tools.
-fn print_tools_status(paths: &Paths) {
-    use blockcell_core::CapabilityDescriptor;
-
-    // Count total tools
-    let total_tools: usize = BUILTIN_TOOLS.iter().map(|(_, items)| items.len()).sum();
-
-    println!();
-    println!(
-        "🔌 Built-in tools ({} total, {} categories)",
-        total_tools,
-        BUILTIN_TOOLS.len()
-    );
-
-    for (category, items) in BUILTIN_TOOLS {
-        println!();
-        println!("  {} ({})", category, items.len());
-        for (name, desc) in *items {
-            println!("    ✅ {} — {}", name, desc);
-        }
-    }
-
-    // Dynamic evolved tools from evolved_tools.json
-    let cap_file = paths
-        .workspace()
-        .join("evolved_tools")
-        .join("evolved_tools.json");
-    if cap_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(&cap_file) {
-            if let Ok(caps) = serde_json::from_str::<Vec<CapabilityDescriptor>>(&content) {
-                if !caps.is_empty() {
-                    let active = caps.iter().filter(|c| c.is_available()).count();
-                    println!();
-                    println!(
-                        "  🧬 Dynamic evolved tools ({}, {} available)",
-                        caps.len(),
-                        active
-                    );
-                    for cap in &caps {
-                        let icon = match format!("{:?}", cap.status).as_str() {
-                            "Active" => "✅",
-                            "Available" | "Discovered" => "�",
-                            "Loading" | "Evolving" => "⏳",
-                            _ => "❌",
-                        };
-                        println!(
-                            "    {} {} v{} — {}",
-                            icon, cap.id, cap.version, cap.description
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Core evolution records
-    let evo_dir = paths.workspace().join("tool_evolution_records");
-    if evo_dir.exists() {
-        let mut evo_count = 0;
-        let mut active_count = 0;
-        if let Ok(entries) = std::fs::read_dir(&evo_dir) {
-            for entry in entries.flatten() {
-                if entry.path().extension().is_some_and(|e| e == "json") {
-                    evo_count += 1;
-                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                        if content.contains("\"Active\"") {
-                            active_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-        if evo_count > 0 {
-            println!();
-            println!(
-                "  🧬 Core evolution: {} records ({} active)",
-                evo_count, active_count
-            );
-        }
-    }
-
-    println!();
-    println!("  💡 /skills view skills | capability_evolve tool to learn new tools");
-    println!();
-}
-
 /// A command item for the interactive picker
 #[derive(Clone)]
 struct CommandItem {
@@ -2077,14 +1621,6 @@ fn collect_command_items(paths: &Paths) -> Vec<CommandItem> {
     items
 }
 
-/// Format a Unix timestamp to a human-readable string.
-fn format_timestamp(ts: i64) -> String {
-    use chrono::{Local, TimeZone};
-    match Local.timestamp_opt(ts, 0) {
-        chrono::LocalResult::Single(dt) => dt.format("%m-%d %H:%M").to_string(),
-        _ => "unknown".to_string(),
-    }
-}
 
 #[cfg(test)]
 mod tests {

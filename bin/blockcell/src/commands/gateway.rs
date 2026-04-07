@@ -1253,6 +1253,10 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     let (filtered_inbound_tx, filtered_inbound_rx) = mpsc::channel::<InboundMessage>(100);
     let pending_ch_for_interceptor = Arc::clone(&pending_channel_confirms);
     let mut interceptor_shutdown_rx = shutdown_tx.subscribe();
+    // 斜杠命令拦截需要的变量
+    let slash_paths = paths.clone();
+    let slash_task_manager = task_manager.clone();
+    let slash_outbound_tx = outbound_tx.clone();
     let interceptor_handle = tokio::spawn(async move {
         let mut inbound_rx = inbound_rx;
         loop {
@@ -1287,6 +1291,63 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                     );
                     let _ = tx.send(approved);
                     continue; // Don't forward this message to the runtime
+                }
+            }
+
+            // 斜杠命令拦截（在 confirm reply 检查之后，转发给 runtime 之前）
+            if !is_internal_channel(&msg.channel) && msg.content.starts_with('/') {
+                use crate::commands::slash_commands::{
+                    CommandContext, CommandResult, SLASH_COMMAND_HANDLER,
+                };
+
+                let ctx = CommandContext::for_channel(
+                    slash_paths.clone(),
+                    slash_task_manager.clone(),
+                    msg.channel.clone(),
+                    msg.chat_id.clone(),
+                    Some(msg.sender_id.clone()),
+                );
+
+                match SLASH_COMMAND_HANDLER.try_handle(&msg.content, &ctx).await {
+                    CommandResult::Handled(response) => {
+                        // 发送响应回原渠道
+                        let reply = OutboundMessage::new(&msg.channel, &msg.chat_id, &response.content);
+                        if let Err(e) = slash_outbound_tx.send(reply).await {
+                            warn!(error = %e, "Failed to send command response");
+                        }
+                        continue; // 不转发给 AgentRuntime
+                    }
+                    CommandResult::NotACommand => {
+                        // 非斜杠命令，或 /learn 命令（需要转发给 LLM）
+                    }
+                    CommandResult::PermissionDenied(err_msg) => {
+                        let reply = OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            &format!("权限不足: {}", err_msg),
+                        );
+                        let _ = slash_outbound_tx.send(reply).await;
+                        continue;
+                    }
+                    CommandResult::Error(e) => {
+                        let reply = OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            &format!("命令执行错误: {}", e),
+                        );
+                        let _ = slash_outbound_tx.send(reply).await;
+                        continue;
+                    }
+                    CommandResult::ExitRequested => {
+                        // /quit 和 /exit 在 Channel 模式下不应该到达这里
+                        let reply = OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            "此命令仅在 CLI 模式可用",
+                        );
+                        let _ = slash_outbound_tx.send(reply).await;
+                        continue;
+                    }
                 }
             }
 

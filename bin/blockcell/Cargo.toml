@@ -41,6 +41,7 @@ reqwest = { workspace = true }
 zip = { workspace = true }
 urlencoding = { workspace = true }
 rhai = { workspace = true }
+once_cell = { workspace = true }
 crossterm = "0.28"
 qrcode = "0.14"
 

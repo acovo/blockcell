@@ -1610,6 +1610,21 @@ impl AgentRuntime {
         self.system_event_emitter.clone()
     }
 
+    /// Set a shared ResponseCache instance.
+    ///
+    /// This allows external code (like the CLI stdin loop) to share the same
+    /// cache instance with the runtime, enabling cache clearing via `/clear` command.
+    pub fn set_response_cache(&mut self, cache: crate::response_cache::ResponseCache) {
+        self.response_cache = cache;
+    }
+
+    /// Get a reference to the ResponseCache.
+    ///
+    /// This is useful for external code to clear session caches.
+    pub fn response_cache(&self) -> &crate::response_cache::ResponseCache {
+        &self.response_cache
+    }
+
     /// Initialize the 7-layer memory system for this session.
     ///
     /// This method creates the memory system and performs async initialization:

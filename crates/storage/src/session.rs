@@ -202,6 +202,20 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Clear session history by deleting the session file.
+    /// Returns true if the file existed and was deleted, false if it didn't exist.
+    pub fn clear(&self, session_key: &str) -> Result<bool> {
+        let path = self.paths.session_file(session_key);
+
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            debug!(session_key = %session_key, path = %path.display(), "Session file deleted");
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Set session display name in _meta.json, only if not already set.
     /// `content` is the user's first message; we take the first ~30 chars as the name.
     pub fn set_session_name_if_new(&self, session_key: &str, content: &str) -> Option<String> {

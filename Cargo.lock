@@ -468,6 +468,7 @@ dependencies = [
  "dirs",
  "futures",
  "mime_guess",
+ "once_cell",
  "qrcode",
  "reqwest",
  "rhai",

@@ -1,5 +1,8 @@
 use super::*;
 use crate::commands::gateway::chat::assign_session_id;
+use crate::commands::slash_commands::{
+    CommandContext, CommandResult, SLASH_COMMAND_HANDLER,
+};
 // ---------------------------------------------------------------------------
 // P0: WebSocket with structured protocol
 // ---------------------------------------------------------------------------
@@ -138,6 +141,58 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                 })
                                 .unwrap_or_default(),
                             );
+
+                            // 斜杠命令拦截：在创建 InboundMessage 之前检查
+                            if content.starts_with('/') {
+                                let ctx = CommandContext::for_websocket(
+                                    state.paths.clone(),
+                                    state.task_manager.clone(),
+                                    chat_id.clone(),
+                                );
+
+                                match SLASH_COMMAND_HANDLER.try_handle(&content, &ctx).await {
+                                    CommandResult::Handled(response) => {
+                                        // 复用 message_done 事件（前端已支持）
+                                        let event = serde_json::json!({
+                                            "type": "message_done",
+                                            "chat_id": chat_id,
+                                            "content": response.content,
+                                            "task_id": "",
+                                        });
+                                        let _ = ws_broadcast.send(event.to_string());
+                                        continue; // 不转发给 AgentRuntime
+                                    }
+                                    CommandResult::NotACommand => {
+                                        // 非斜杠命令，或 /learn 命令（需要转发给 LLM）
+                                    }
+                                    CommandResult::PermissionDenied(msg) => {
+                                        let _ = ws_broadcast.send(serde_json::json!({
+                                            "type": "error",
+                                            "chat_id": chat_id,
+                                            "message": format!("权限不足: {}", msg),
+                                        }).to_string());
+                                        continue;
+                                    }
+                                    CommandResult::Error(e) => {
+                                        let _ = ws_broadcast.send(serde_json::json!({
+                                            "type": "error",
+                                            "chat_id": chat_id,
+                                            "message": format!("命令执行错误: {}", e),
+                                        }).to_string());
+                                        continue;
+                                    }
+                                    CommandResult::ExitRequested => {
+                                        // /quit 和 /exit 在 WebSocket 模式下不应该到达这里
+                                        // 因为渠道限制会在 try_handle 中处理
+                                        let _ = ws_broadcast.send(serde_json::json!({
+                                            "type": "error",
+                                            "chat_id": chat_id,
+                                            "message": "此命令仅在 CLI 模式可用",
+                                        }).to_string());
+                                        continue;
+                                    }
+                                }
+                            }
 
                             let inbound = InboundMessage {
                                 channel: "ws".to_string(),

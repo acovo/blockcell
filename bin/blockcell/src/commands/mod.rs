@@ -17,6 +17,7 @@ pub mod onboard;
 pub mod provider;
 pub mod run_cmd;
 pub mod setup;
+pub mod slash_commands;
 pub mod skills;
 pub mod status;
 pub mod streams_cmd;
