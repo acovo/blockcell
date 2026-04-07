@@ -118,11 +118,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         Ok(agent_id) => agent_id,
                                         Err(err) => {
                                             let _ = ws_broadcast.send(
-                                                serde_json::to_string(&WsEvent::Error {
-                                                    chat_id: client_chat_id.clone(),
-                                                    message: err,
-                                                })
-                                                .unwrap_or_default(),
+                                                WsEvent::error(client_chat_id.clone(), err).to_json(),
                                             );
                                             continue;
                                         }
@@ -134,12 +130,12 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                             let chat_id = assign_session_id(&client_chat_id, &resolved_agent_id);
 
                             let _ = ws_broadcast.send(
-                                serde_json::to_string(&WsEvent::SessionBound {
+                                WsEvent::SessionBound {
                                     client_chat_id: client_chat_id.clone(),
                                     chat_id: chat_id.clone(),
                                     agent_id: resolved_agent_id.clone(),
-                                })
-                                .unwrap_or_default(),
+                                }
+                                .to_json(),
                             );
 
                             // 斜杠命令拦截：在创建 InboundMessage 之前检查
@@ -228,11 +224,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
 
                             if let Err(e) = inbound_tx.send(inbound).await {
                                 let _ = ws_broadcast.send(
-                                    serde_json::to_string(&WsEvent::Error {
-                                        chat_id: chat_id.clone(),
-                                        message: format!("{}", e),
-                                    })
-                                    .unwrap_or_default(),
+                                    WsEvent::error(chat_id.clone(), format!("{}", e)).to_json(),
                                 );
                                 break;
                             }
@@ -283,11 +275,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         Ok(agent_id) => with_route_agent_id(inbound, &agent_id),
                                         Err(err) => {
                                             let _ = ws_broadcast.send(
-                                                serde_json::to_string(&WsEvent::Error {
-                                                    chat_id: chat_id.clone(),
-                                                    message: err,
-                                                })
-                                                .unwrap_or_default(),
+                                                WsEvent::error(chat_id.clone(), err).to_json(),
                                             );
                                             continue;
                                         }
@@ -298,11 +286,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
 
                             if let Err(e) = inbound_tx.send(inbound).await {
                                 let _ = ws_broadcast.send(
-                                    serde_json::to_string(&WsEvent::Error {
-                                        chat_id,
-                                        message: format!("{}", e),
-                                    })
-                                    .unwrap_or_default(),
+                                    WsEvent::error(chat_id, format!("{}", e)).to_json(),
                                 );
                             }
                         }

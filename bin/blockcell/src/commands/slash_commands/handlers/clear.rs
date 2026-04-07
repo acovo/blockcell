@@ -57,18 +57,16 @@ impl SlashCommand for ClearCommand {
         }
 
         // 3. 清除 Session Memory 文件
-        let session_memory_path = ctx
-            .paths
-            .workspace()
-            .join("sessions")
-            .join(&ctx.source.chat_id)
-            .join("memory.md");
+        // 使用 session_key 作为目录名，与 memory_system 保持一致
+        let session_dir = ctx.paths.workspace().join("sessions").join(&session_key);
+        let session_memory_path = session_dir.join("memory.md");
 
         if session_memory_path.exists() {
             match tokio::fs::remove_file(&session_memory_path).await {
                 Ok(_) => results.push("✅ Session Memory 文件已删除".to_string()),
                 Err(e) => results.push(format!(
-                    "⚠️ Session Memory 删除失败 (path: {}): {}",
+                    "⚠️ Session Memory 删除失败 (session: {}, path: {}): {}",
+                    session_key,
                     session_memory_path.display(),
                     e
                 )),
@@ -76,15 +74,20 @@ impl SlashCommand for ClearCommand {
         }
 
         // 4. 清除 .active 标记文件
-        let active_file = ctx
-            .paths
-            .workspace()
-            .join("sessions")
-            .join(&ctx.source.chat_id)
-            .join(".active");
+        let active_file = session_dir.join(".active");
 
         if active_file.exists() {
-            let _ = tokio::fs::remove_file(&active_file).await;
+            match tokio::fs::remove_file(&active_file).await {
+                Ok(_) => tracing::trace!(
+                    session_key = %session_key,
+                    "[/clear] .active marker deleted"
+                ),
+                Err(e) => tracing::warn!(
+                    session_key = %session_key,
+                    error = %e,
+                    "[/clear] Failed to delete .active marker"
+                ),
+            }
         }
 
         // 5. 构建响应

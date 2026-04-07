@@ -121,6 +121,29 @@ enum WsEvent {
     Error { chat_id: String, message: String },
 }
 
+impl WsEvent {
+    /// Serialize the event to a JSON string.
+    ///
+    /// This method is safe because all WsEvent variants contain only
+    /// serializable types (String, usize, u64, Vec<String>).
+    /// The serialization should never fail, but we handle it gracefully
+    /// by returning a fallback error JSON string.
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            // Fallback: return a minimal error event
+            r#"{"type":"error","chat_id":"","message":"Internal serialization error"}"#.to_string()
+        })
+    }
+
+    /// Create an error event with the given chat_id and message
+    fn error(chat_id: impl Into<String>, message: impl Into<String>) -> Self {
+        WsEvent::Error {
+            chat_id: chat_id.into(),
+            message: message.into(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared state passed to HTTP/WS handlers
 // ---------------------------------------------------------------------------
