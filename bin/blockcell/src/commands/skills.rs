@@ -109,7 +109,7 @@ fn load_skill_test_fixtures(skill_path: &std::path::Path) -> Vec<SkillTestFixtur
     let mut fixtures = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&tests_dir) {
         let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by(|left, right| left.path().cmp(&right.path()));
+        entries.sort_by_key(|entry| entry.path());
 
         for entry in entries {
             let path = entry.path();
@@ -190,11 +190,11 @@ fn response_matches_expected_output(actual: &str, expected: Option<&str>) -> boo
 }
 
 async fn build_skill_test_runtime(paths: &Paths) -> anyhow::Result<AgentRuntime> {
-    let config = Config::load_or_default(&paths)?;
+    let config = Config::load_or_default(paths)?;
 
     let provider_pool = blockcell_providers::ProviderPool::from_config(&config)?;
 
-    let memory_store_handle = if let Ok(store) = open_memory_store(&paths, &config) {
+    let memory_store_handle = if let Ok(store) = open_memory_store(paths, &config) {
         use blockcell_agent::MemoryStoreAdapter;
         use std::sync::Arc;
         Some(Arc::new(MemoryStoreAdapter::new(store)) as blockcell_tools::MemoryStoreHandle)
@@ -202,7 +202,7 @@ async fn build_skill_test_runtime(paths: &Paths) -> anyhow::Result<AgentRuntime>
         None
     };
 
-    let mcp_manager = Arc::new(McpManager::load(&paths).await?);
+    let mcp_manager = Arc::new(McpManager::load(paths).await?);
     let tool_registry = build_tool_registry_for_agent_config(&config, Some(&mcp_manager)).await?;
     let mut runtime = AgentRuntime::new(config, paths.clone(), provider_pool, tool_registry)?;
 

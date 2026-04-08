@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use axum::{
@@ -121,6 +121,29 @@ enum WsEvent {
     Error { chat_id: String, message: String },
 }
 
+impl WsEvent {
+    /// Serialize the event to a JSON string.
+    ///
+    /// This method is safe because all WsEvent variants contain only
+    /// serializable types (String, usize, u64, Vec<String>).
+    /// The serialization should never fail, but we handle it gracefully
+    /// by returning a fallback error JSON string.
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            // Fallback: return a minimal error event
+            r#"{"type":"error","chat_id":"","message":"Internal serialization error"}"#.to_string()
+        })
+    }
+
+    /// Create an error event with the given chat_id and message
+    fn error(chat_id: impl Into<String>, message: impl Into<String>) -> Self {
+        WsEvent::Error {
+            chat_id: chat_id.into(),
+            message: message.into(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared state passed to HTTP/WS handlers
 // ---------------------------------------------------------------------------
@@ -153,6 +176,8 @@ struct GatewayState {
     channel_manager: Arc<blockcell_channels::ChannelManager>,
     /// Shared EvolutionService for trigger/delete/status handlers
     evolution_service: Arc<Mutex<EvolutionService>>,
+    /// Shared ResponseCache for all agents (for /clear command)
+    response_caches: Arc<RwLock<HashMap<String, blockcell_agent::ResponseCache>>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -660,6 +685,45 @@ fn open_agent_memory_store(paths: &Paths, config: &Config) -> Option<MemoryStore
     }
 }
 
+/// Create a session clear callback for CommandContext.
+/// This callback is used by the /clear command to clear ResponseCache.
+fn create_session_clear_callback(
+    response_caches: Arc<RwLock<HashMap<String, blockcell_agent::ResponseCache>>>,
+    agent_id: String,
+    session_key: String,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    Arc::new(move || {
+        // Use try_current to get tokio runtime handle
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let caches = response_caches.clone();
+            let agent_id = agent_id.clone();
+            let session_key = session_key.clone();
+
+            handle.block_on(async {
+                let caches = caches.read().await;
+                if let Some(cache) = caches.get(&agent_id) {
+                    cache.clear_session(&session_key);
+                    info!(
+                        session_key = %session_key,
+                        agent_id = %agent_id,
+                        "[/clear] ResponseCache cleared"
+                    );
+                    true
+                } else {
+                    warn!(
+                        agent_id = %agent_id,
+                        "[/clear] No ResponseCache found for agent"
+                    );
+                    false
+                }
+            })
+        } else {
+            error!("[/clear] No tokio runtime available");
+            false
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_agent_runtime(
     config: &Config,
@@ -671,6 +735,7 @@ async fn spawn_agent_runtime(
     ws_broadcast_tx: broadcast::Sender<String>,
     shutdown_tx: broadcast::Sender<()>,
     task_manager: TaskManager,
+    response_caches: Arc<RwLock<HashMap<String, blockcell_agent::ResponseCache>>>,
 ) -> anyhow::Result<(
     mpsc::Sender<InboundMessage>,
     tokio::task::JoinHandle<()>,
@@ -750,6 +815,15 @@ async fn spawn_agent_runtime(
     runtime.set_capability_registry(cap_registry_handle);
     runtime.set_core_evolution(core_evo_handle);
     runtime.set_event_tx(ws_broadcast_tx);
+
+    // Create shared ResponseCache and register it
+    let response_cache = blockcell_agent::ResponseCache::new();
+    runtime.set_response_cache(response_cache.clone());
+    {
+        let mut caches = response_caches.write().await;
+        caches.insert(agent_id.to_string(), response_cache);
+    }
+    info!(agent_id = %agent_id, "ResponseCache registered for /clear command");
 
     // Initialize Layer 5 memory injector (7-layer memory system)
     if let Err(e) = runtime.init_memory_injector().await {
@@ -1105,6 +1179,9 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
 
     // ── Create one runtime per resolved agent ──
     let resolved_agents = config.resolved_agents();
+    // Shared ResponseCache for /clear command
+    let response_caches: Arc<RwLock<HashMap<String, blockcell_agent::ResponseCache>>> =
+        Arc::new(RwLock::new(HashMap::new()));
     let mut runtime_senders: HashMap<String, mpsc::Sender<InboundMessage>> = HashMap::new();
     let mut runtime_handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut agent_memory_stores: HashMap<String, MemoryStoreHandle> = HashMap::new();
@@ -1121,6 +1198,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             ws_broadcast_tx.clone(),
             shutdown_tx.clone(),
             task_manager.clone(),
+            response_caches.clone(),
         )
         .await?;
         if let Some(memory_store_handle) = memory_store_handle {
@@ -1253,10 +1331,16 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     let (filtered_inbound_tx, filtered_inbound_rx) = mpsc::channel::<InboundMessage>(100);
     let pending_ch_for_interceptor = Arc::clone(&pending_channel_confirms);
     let mut interceptor_shutdown_rx = shutdown_tx.subscribe();
+    // 斜杠命令拦截需要的变量
+    let slash_paths = paths.clone();
+    let slash_task_manager = task_manager.clone();
+    let slash_outbound_tx = outbound_tx.clone();
+    let slash_response_caches = response_caches.clone();
+    let slash_config = config.clone();
     let interceptor_handle = tokio::spawn(async move {
         let mut inbound_rx = inbound_rx;
         loop {
-            let msg = tokio::select! {
+            let mut msg = tokio::select! {
                 msg = inbound_rx.recv() => match msg {
                     Some(m) => m,
                     None => break,
@@ -1287,6 +1371,87 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                     );
                     let _ = tx.send(approved);
                     continue; // Don't forward this message to the runtime
+                }
+            }
+
+            // 斜杠命令拦截（在 confirm reply 检查之后，转发给 runtime 之前）
+            if !is_internal_channel(&msg.channel) && msg.content.starts_with('/') {
+                use crate::commands::slash_commands::{
+                    CommandContext, CommandResult, SLASH_COMMAND_HANDLER,
+                };
+
+                // 解析目标 agent_id 和 session_key
+                let agent_id = resolve_runtime_agent_id(&slash_config, &msg)
+                    .unwrap_or_else(|| "default".to_string());
+                let session_key = format!("{}:{}", msg.channel, msg.chat_id);
+
+                let ctx = CommandContext::for_channel(
+                    slash_paths.clone(),
+                    slash_task_manager.clone(),
+                    msg.channel.clone(),
+                    msg.chat_id.clone(),
+                    Some(msg.sender_id.clone()),
+                )
+                .with_clear_callback(create_session_clear_callback(
+                    slash_response_caches.clone(),
+                    agent_id,
+                    session_key,
+                ));
+
+                match SLASH_COMMAND_HANDLER.try_handle(&msg.content, &ctx).await {
+                    CommandResult::Handled(response) => {
+                        // 发送响应回原渠道
+                        let reply = OutboundMessage::new(&msg.channel, &msg.chat_id, &response.content);
+                        if let Err(e) = slash_outbound_tx.send(reply).await {
+                            warn!(error = %e, "Failed to send command response");
+                        }
+                        continue; // 不转发给 AgentRuntime
+                    }
+                    CommandResult::NotACommand => {
+                        // 非斜杠命令，继续正常消息处理流程
+                    }
+                    CommandResult::PermissionDenied(err_msg) => {
+                        let reply = OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            &format!("权限不足: {}", err_msg),
+                        );
+                        let _ = slash_outbound_tx.send(reply).await;
+                        continue;
+                    }
+                    CommandResult::Error(e) => {
+                        let reply = OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            &format!("命令执行错误: {}", e),
+                        );
+                        let _ = slash_outbound_tx.send(reply).await;
+                        continue;
+                    }
+                    CommandResult::ExitRequested => {
+                        // /quit 和 /exit 在 Channel 模式下不应该到达这里
+                        let reply = OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            "此命令仅在 CLI 模式可用",
+                        );
+                        let _ = slash_outbound_tx.send(reply).await;
+                        continue;
+                    }
+                    CommandResult::ForwardToRuntime {
+                        transformed_content,
+                        original_command,
+                    } => {
+                        // 命令需要转发给 AgentRuntime（如 /learn）
+                        info!(
+                            channel = %msg.channel,
+                            command = %original_command,
+                            "Forwarding command to AgentRuntime"
+                        );
+                        // 修改消息内容为转换后的内容
+                        msg.content = transformed_content;
+                        // 继续正常流程，转发给 AgentRuntime
+                    }
                 }
             }
 
@@ -1562,6 +1727,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         web_password: web_password.clone(),
         channel_manager: Arc::clone(&channel_manager),
         evolution_service: shared_evo_service,
+        response_caches: response_caches.clone(),
     };
 
     let app = Router::new()

@@ -1,5 +1,8 @@
 use super::*;
 use crate::commands::gateway::chat::assign_session_id;
+use crate::commands::slash_commands::{
+    CommandContext, CommandResult, SLASH_COMMAND_HANDLER,
+};
 // ---------------------------------------------------------------------------
 // P0: WebSocket with structured protocol
 // ---------------------------------------------------------------------------
@@ -86,7 +89,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
 
                     match msg_type {
                         "chat" => {
-                            let content = parsed
+                            let mut content = parsed
                                 .get("content")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
@@ -115,11 +118,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         Ok(agent_id) => agent_id,
                                         Err(err) => {
                                             let _ = ws_broadcast.send(
-                                                serde_json::to_string(&WsEvent::Error {
-                                                    chat_id: client_chat_id.clone(),
-                                                    message: err,
-                                                })
-                                                .unwrap_or_default(),
+                                                WsEvent::error(client_chat_id.clone(), err).to_json(),
                                             );
                                             continue;
                                         }
@@ -131,13 +130,85 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                             let chat_id = assign_session_id(&client_chat_id, &resolved_agent_id);
 
                             let _ = ws_broadcast.send(
-                                serde_json::to_string(&WsEvent::SessionBound {
+                                WsEvent::SessionBound {
                                     client_chat_id: client_chat_id.clone(),
                                     chat_id: chat_id.clone(),
                                     agent_id: resolved_agent_id.clone(),
-                                })
-                                .unwrap_or_default(),
+                                }
+                                .to_json(),
                             );
+
+                            // 斜杠命令拦截：在创建 InboundMessage 之前检查
+                            if content.starts_with('/') {
+                                let session_key = format!("ws:{}", chat_id);
+                                let ctx = CommandContext::for_websocket(
+                                    state.paths.clone(),
+                                    state.task_manager.clone(),
+                                    chat_id.clone(),
+                                )
+                                .with_clear_callback(super::create_session_clear_callback(
+                                    state.response_caches.clone(),
+                                    resolved_agent_id.clone(),
+                                    session_key,
+                                ));
+
+                                match SLASH_COMMAND_HANDLER.try_handle(&content, &ctx).await {
+                                    CommandResult::Handled(response) => {
+                                        // 复用 message_done 事件（前端已支持）
+                                        let event = serde_json::json!({
+                                            "type": "message_done",
+                                            "chat_id": chat_id,
+                                            "content": response.content,
+                                            "is_markdown": response.is_markdown,
+                                            "task_id": "",
+                                        });
+                                        let _ = ws_broadcast.send(event.to_string());
+                                        continue; // 不转发给 AgentRuntime
+                                    }
+                                    CommandResult::NotACommand => {
+                                        // 非斜杠命令，继续正常消息处理流程
+                                    }
+                                    CommandResult::PermissionDenied(msg) => {
+                                        let _ = ws_broadcast.send(serde_json::json!({
+                                            "type": "error",
+                                            "chat_id": chat_id,
+                                            "message": format!("权限不足: {}", msg),
+                                        }).to_string());
+                                        continue;
+                                    }
+                                    CommandResult::Error(e) => {
+                                        let _ = ws_broadcast.send(serde_json::json!({
+                                            "type": "error",
+                                            "chat_id": chat_id,
+                                            "message": format!("命令执行错误: {}", e),
+                                        }).to_string());
+                                        continue;
+                                    }
+                                    CommandResult::ExitRequested => {
+                                        // /quit 和 /exit 在 WebSocket 模式下不应该到达这里
+                                        // 因为渠道限制会在 try_handle 中处理
+                                        let _ = ws_broadcast.send(serde_json::json!({
+                                            "type": "error",
+                                            "chat_id": chat_id,
+                                            "message": "此命令仅在 CLI 模式可用",
+                                        }).to_string());
+                                        continue;
+                                    }
+                                    CommandResult::ForwardToRuntime {
+                                        transformed_content,
+                                        original_command,
+                                    } => {
+                                        // 命令需要转发给 AgentRuntime（如 /learn）
+                                        tracing::info!(
+                                            command = %original_command,
+                                            "Forwarding command to AgentRuntime"
+                                        );
+                                        // 使用转换后的内容替代原始内容
+                                        content = transformed_content;
+                                        // 继续正常流程，转发给 AgentRuntime
+                                    }
+                                }
+                            }
 
                             let inbound = InboundMessage {
                                 channel: "ws".to_string(),
@@ -154,11 +225,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
 
                             if let Err(e) = inbound_tx.send(inbound).await {
                                 let _ = ws_broadcast.send(
-                                    serde_json::to_string(&WsEvent::Error {
-                                        chat_id: chat_id.clone(),
-                                        message: format!("{}", e),
-                                    })
-                                    .unwrap_or_default(),
+                                    WsEvent::error(chat_id.clone(), format!("{}", e)).to_json(),
                                 );
                                 break;
                             }
@@ -209,11 +276,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         Ok(agent_id) => with_route_agent_id(inbound, &agent_id),
                                         Err(err) => {
                                             let _ = ws_broadcast.send(
-                                                serde_json::to_string(&WsEvent::Error {
-                                                    chat_id: chat_id.clone(),
-                                                    message: err,
-                                                })
-                                                .unwrap_or_default(),
+                                                WsEvent::error(chat_id.clone(), err).to_json(),
                                             );
                                             continue;
                                         }
@@ -224,11 +287,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
 
                             if let Err(e) = inbound_tx.send(inbound).await {
                                 let _ = ws_broadcast.send(
-                                    serde_json::to_string(&WsEvent::Error {
-                                        chat_id,
-                                        message: format!("{}", e),
-                                    })
-                                    .unwrap_or_default(),
+                                    WsEvent::error(chat_id, format!("{}", e)).to_json(),
                                 );
                             }
                         }

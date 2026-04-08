@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 // ---------------------------------------------------------------------------
 // P1: Memory management endpoints
 // ---------------------------------------------------------------------------
@@ -279,6 +280,7 @@ mod tests {
             web_password: "test-password".to_string(),
             channel_manager,
             evolution_service,
+            response_caches: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

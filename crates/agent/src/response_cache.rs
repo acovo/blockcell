@@ -679,7 +679,7 @@ pub async fn persist_tool_result(
 
     // 验证目录路径仍在工作目录内（防止路径遍历攻击）
     // 注意：由于 session_key 已被清理，这主要是防御性编程
-    let dir_canonical = match std::fs::canonicalize(&dir.parent().unwrap_or(&dir)) {
+    let dir_canonical = match std::fs::canonicalize(dir.parent().unwrap_or(&dir)) {
         Ok(p) => p,
         Err(_) => dir.clone(), // 目录不存在时使用原始路径
     };
