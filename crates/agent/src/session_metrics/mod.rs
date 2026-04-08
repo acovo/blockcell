@@ -252,6 +252,7 @@ macro_rules! memory_event {
                 cache_read_tokens = $cache_read,
                 cache_creation_tokens = $cache_creation,
                 cache_hit_rate = format!("{:.2}%", hit_rate * 100.0),
+                is_auto = true,
                 "Compact completed successfully"
             );
 
@@ -260,6 +261,36 @@ macro_rules! memory_event {
                 $post as u64,
                 $cache_read as u64,
                 $cache_creation as u64
+            );
+        }
+    };
+
+    (layer4, compact_completed, $pre:expr, $post:expr, $cache_read:expr, $cache_creation:expr, $is_auto:expr) => {
+        {
+            let ratio = if $pre > 0 { 1.0 - ($post as f64 / $pre as f64) } else { 0.0 };
+            let hit_rate = if $cache_read + $cache_creation > 0 {
+                $cache_read as f64 / ($cache_read + $cache_creation) as f64
+            } else { 0.0 };
+
+            tracing::info!(
+                target: "blockcell.session_metrics.layer4",
+                event = "compact_completed",
+                pre_compact_tokens = $pre,
+                post_compact_tokens = $post,
+                compression_ratio = format!("{:.2}%", ratio * 100.0),
+                cache_read_tokens = $cache_read,
+                cache_creation_tokens = $cache_creation,
+                cache_hit_rate = format!("{:.2}%", hit_rate * 100.0),
+                is_auto = $is_auto,
+                "Compact completed successfully"
+            );
+
+            $crate::session_metrics::get_memory_metrics().layer4.record_compact_success_with_type(
+                $pre as u64,
+                $post as u64,
+                $cache_read as u64,
+                $cache_creation as u64,
+                $is_auto
             );
         }
     };

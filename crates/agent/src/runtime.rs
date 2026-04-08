@@ -2077,6 +2077,7 @@ impl AgentRuntime {
         messages: &[ChatMessage],
         _session_key: &str,
         compact_ctx: Option<CompactContext<'_>>,
+        is_auto: bool,
     ) -> crate::compact::CompactResult {
         use crate::compact::{CompactResult, generate_compact_summary};
         use crate::session_memory::get_session_memory_path;
@@ -2111,7 +2112,7 @@ impl AgentRuntime {
         let threshold = self.memory_system.as_ref()
             .map(|m| m.config().compact_threshold)
             .unwrap_or(0.8);
-        crate::memory_event!(layer4, compact_started, pre_compact_tokens, threshold, true);
+        crate::memory_event!(layer4, compact_started, pre_compact_tokens, threshold, is_auto);
 
         info!(
             pre_compact_tokens,
@@ -2197,7 +2198,8 @@ impl AgentRuntime {
             pre_compact_tokens,
             post_compact_tokens,
             cache_read_tokens,
-            cache_creation_tokens
+            cache_creation_tokens,
+            is_auto
         );
         circuit_breaker.record_success();
 
@@ -3065,6 +3067,114 @@ impl AgentRuntime {
             return Ok(final_response);
         }
 
+        // ── Handle manual compact request from /compact command ──
+        if msg.content == "__COMPACT_REQUEST__" {
+            info!(
+                session_key = %session_key,
+                channel = %msg.channel,
+                "[compact] Manual compact request received"
+            );
+
+            let compact_ctx = CompactContext {
+                channel: &msg.channel,
+                chat_id: &msg.chat_id,
+                account_id: msg.account_id.as_deref(),
+            };
+
+            // Load session history for compact
+            let history = self.session_store.load(&session_key)?;
+
+            // Execute compact directly (is_auto=false for manual trigger)
+            let result = self
+                .execute_layer4_compact(&history, &session_key, Some(compact_ctx), false)
+                .await;
+
+            if result.success {
+                // Store compacted history
+                let compacted_messages = vec![
+                    ChatMessage::system(&result.to_compact_message()),
+                    ChatMessage::user("请继续当前任务。"),
+                ];
+                self.session_store.save(&session_key, &compacted_messages)?;
+
+                // Clear trackers
+                if let Some(ms) = self.memory_system.as_mut() {
+                    ms.file_tracker_mut().clear();
+                    ms.skill_tracker_mut().clear();
+                }
+
+                // Record compression metrics
+                metrics.record_compression();
+
+                // Send WebSocket notification for ws channel
+                if msg.channel == "ws" {
+                    if let Some(ref event_tx) = self.event_tx {
+                        let compression_ratio = (result.pre_compact_tokens - result.post_compact_tokens)
+                            as f64 / result.pre_compact_tokens as f64 * 100.0;
+                        let notification_content = format!(
+                            "✅ 已压缩对话历史，保留关键信息。\n📊 Token: {} → {} (压缩 {:.0}%)",
+                            result.pre_compact_tokens,
+                            result.post_compact_tokens,
+                            compression_ratio
+                        );
+                        let event = serde_json::json!({
+                            "type": "message_done",
+                            "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                            "chat_id": msg.chat_id,
+                            "task_id": "",
+                            "content": notification_content,
+                            "tool_calls": 0,
+                            "duration_ms": 0,
+                            "media": [],
+                            "is_markdown": true,
+                        });
+                        let _ = event_tx.send(event.to_string());
+                    }
+                }
+            } else {
+                // Log failure for debugging
+                warn!(
+                    session_key = %session_key,
+                    reason = result.error.as_deref().unwrap_or("unknown"),
+                    "[compact] Manual compact request failed"
+                );
+
+                // Send failure notification
+                if msg.channel == "ws" {
+                    if let Some(ref event_tx) = self.event_tx {
+                        let error_msg = result.error.as_deref().unwrap_or("压缩失败，请稍后重试。");
+                        let notification_content = format!("⚠️ 压缩失败: {}", error_msg);
+                        let event = serde_json::json!({
+                            "type": "message_done",
+                            "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                            "chat_id": msg.chat_id,
+                            "task_id": "",
+                            "content": notification_content,
+                            "tool_calls": 0,
+                            "duration_ms": 0,
+                            "media": [],
+                            "is_markdown": true,
+                        });
+                        let _ = event_tx.send(event.to_string());
+                    }
+                } else if let Some(ref tx) = &self.outbound_tx {
+                    let error_msg = result.error.as_deref().unwrap_or("压缩失败，请稍后重试。");
+                    let notification_content = format!("⚠️ 压缩失败: {}", error_msg);
+                    let mut notification = OutboundMessage::new(
+                        &msg.channel,
+                        &msg.chat_id,
+                        &notification_content
+                    );
+                    if let Some(aid) = msg.account_id.as_deref() {
+                        notification.account_id = Some(aid.to_string());
+                    }
+                    let _ = tx.send(notification).await;
+                }
+            }
+
+            return Ok(String::new());
+        }
+
         // Load session history
         let mut history = self.session_store.load(&session_key)?;
         let mut session_metadata = self.session_store.load_metadata(&persist_session_key)?;
@@ -3366,6 +3476,7 @@ impl AgentRuntime {
                         &current_messages,
                         &session_key,
                         Some(compact_ctx),
+                        true, // is_auto for automatic compact
                     ).await;
                     if compact_result.success {
                         current_messages.clear();
@@ -3847,6 +3958,7 @@ impl AgentRuntime {
                             &current_messages,
                             &session_key,
                             Some(compact_ctx),
+                            true, // is_auto for automatic compact
                         ).await;
                         if compact_result.success {
                             // 替换消息历史为压缩后的内容
@@ -4123,6 +4235,7 @@ impl AgentRuntime {
                         &history,
                         &session_key,
                         Some(compact_ctx),
+                        true, // is_auto for automatic compact
                     ).await;
                     if compact_result.success {
                         // 压缩成功，替换历史

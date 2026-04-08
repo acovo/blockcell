@@ -2589,12 +2589,60 @@ fn print_metrics_summary(summary: &MetricsSummary, layer_filter: Option<u8>) {
 - [x] 支持 `--json` 输出
 - [x] 支持 `--reset` 重置
 
-### A.5 Phase 5: 用户通知 (P2) ⏳ 未实现
+#### A.4.1 `/compact` 命令 ✅ 已完成 (2026-04-08)
 
-- [ ] 实现 `CompactContext` 结构体
-- [ ] 压缩开始通知
-- [ ] 压缩成功通知
-- [ ] 压缩失败通知
+- [x] 实现 `CompactCommand` 处理器 - `bin/blockcell/src/commands/slash_commands/handlers/compact.rs`
+- [x] 使用 `ForwardToRuntime` 转发模式
+- [x] 在 `runtime.rs` 中添加 `__COMPACT_REQUEST__` 处理逻辑
+- [x] 复用现有的压缩通知机制
+
+**命令行为**:
+- `/compact` - 手动触发对话历史压缩
+- 压缩过程异步执行，通过通知返回结果
+- 复用 `execute_layer4_compact` 的所有通知逻辑
+
+### A.5 Phase 5: 用户通知 (P2) ✅ 部分实现
+
+> **注意**: 压缩通知功能已在 `crates/agent/src/runtime.rs` 的 `execute_layer4_compact` 方法中实现。
+
+**已实现功能** (无需额外开发):
+
+- [x] 压缩开始通知 - `runtime.rs:2097-2108`
+  - 消息: "🔄 对话历史较长，正在压缩以保持性能..."
+  - 通过 `OutboundMessage` 发送到 WebSocket 和 Channel
+
+- [x] 压缩失败通知 - `runtime.rs:2153-2164`
+  - 消息: "⚠️ 压缩失败，继续使用当前历史。"
+  - 通过 `OutboundMessage` 发送
+
+- [x] 压缩成功通知 - `runtime.rs:2211-2230`
+  - 消息: "✅ 已压缩对话历史，保留关键信息。\n📊 Token: {pre} → {post} (压缩 {ratio}%)"
+  - 包含 Token 详情和压缩比例
+
+**待实现功能** (配置化通知，P3 优先级):
+
+- [ ] `CompactNotificationConfig` 配置结构体
+- [ ] `enabled` 配置项 - 是否启用通知
+- [ ] `show_token_details` 配置项 - 显示 Token 详情
+- [ ] `silent_mode` 配置项 - 静默模式（不发送通知）
+- [ ] 在 `config.json5` 中支持配置
+
+**配置结构定义** (待实现):
+
+```rust
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct CompactNotificationConfig {
+    /// 是否启用通知
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 显示 Token 详情
+    #[serde(default = "default_true")]
+    pub show_token_details: bool,
+    /// 静默模式 (不发送通知)
+    #[serde(default)]
+    pub silent_mode: bool,
+}
+```
 
 ---
 
