@@ -1,23 +1,23 @@
-//! # /session_metrics 命令
+//! # /session-metrics 命令
 //!
 //! 显示记忆系统监控指标。
 //!
 //! ## 用法
 //!
-//! - `/session_metrics` - 显示所有层的指标
-//! - `/session_metrics --json` - JSON 格式输出
-//! - `/session_metrics --reset` - 重置计数器
-//! - `/session_metrics --layer N` - 只显示第 N 层 (N 为 1-7)
+//! - `/session-metrics` - 显示所有层的指标
+//! - `/session-metrics --json` - JSON 格式输出
+//! - `/session-metrics --reset` - 重置计数器
+//! - `/session-metrics --layer N` - 只显示第 N 层 (N 为 1-7)
 
 use crate::commands::slash_commands::*;
 
-/// /session_metrics 命令 - 显示记忆系统监控指标
+/// /session-metrics 命令 - 显示记忆系统监控指标
 pub struct SessionMetricsCommand;
 
 #[async_trait::async_trait]
 impl SlashCommand for SessionMetricsCommand {
     fn name(&self) -> &str {
-        "session_metrics"
+        "session-metrics"
     }
 
     fn description(&self) -> &str {
@@ -61,7 +61,7 @@ impl SlashCommand for SessionMetricsCommand {
                     }
                     _ => {
                         CommandResult::Handled(CommandResponse::markdown(
-                            format!("❌ 无效参数: `{}`\n\n用法:\n- `/session_metrics` - 显示所有层\n- `/session_metrics --json` - JSON 格式\n- `/session_metrics --reset` - 重置计数器\n- `/session_metrics --layer N` - 显示第 N 层 (1-7)", parts[0])
+                            format!("❌ 无效参数: `{}`\n\n用法:\n- `/session-metrics` - 显示所有层\n- `/session-metrics --json` - JSON 格式\n- `/session-metrics --reset` - 重置计数器\n- `/session-metrics --layer N` - 显示第 N 层 (1-7)", parts[0])
                         ))
                     }
                 }
@@ -70,7 +70,7 @@ impl SlashCommand for SessionMetricsCommand {
                 // 2 个参数：只能是 --layer N
                 if parts[0] != "--layer" && parts[0] != "-l" {
                     return CommandResult::Handled(CommandResponse::markdown(
-                        format!("❌ 无效参数组合: `{}` `{}`\n\n用法:\n- `/session_metrics --layer N` - 显示第 N 层 (N 为 1-7)", parts[0], parts[1])
+                        format!("❌ 无效参数组合: `{}` `{}`\n\n用法:\n- `/session-metrics --layer N` - 显示第 N 层 (N 为 1-7)", parts[0], parts[1])
                     ));
                 }
 
@@ -95,7 +95,7 @@ impl SlashCommand for SessionMetricsCommand {
             _ => {
                 // 超过 2 个参数：不支持
                 CommandResult::Handled(CommandResponse::markdown(
-                    "❌ 参数过多\n\n用法:\n- `/session_metrics` - 显示所有层\n- `/session_metrics --json` - JSON 格式\n- `/session_metrics --reset` - 重置计数器\n- `/session_metrics --layer N` - 显示第 N 层 (1-7)".to_string()
+                    "❌ 参数过多\n\n用法:\n- `/session-metrics` - 显示所有层\n- `/session-metrics --json` - JSON 格式\n- `/session-metrics --reset` - 重置计数器\n- `/session-metrics --layer N` - 显示第 N 层 (1-7)".to_string()
                 ))
             }
         }
