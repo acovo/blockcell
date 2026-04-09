@@ -11,9 +11,10 @@ use tokio::time::{timeout, Duration};
 
 /// 获取 Session Memory 目录路径
 pub fn get_session_memory_dir(workspace_dir: &Path, session_id: &str) -> PathBuf {
+    use blockcell_core::session_file_stem;
     workspace_dir
         .join("sessions")
-        .join(session_id)
+        .join(session_file_stem(session_id))
 }
 
 /// 获取 Session Memory 文件路径

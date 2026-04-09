@@ -125,10 +125,15 @@ impl MemorySystem {
     }
 
     /// 获取会话目录路径
+    ///
+    /// 注意：session_id 中的冒号、斜杠等字符会被替换为下划线，以确保跨平台兼容性。
+    /// 例如：`cli:default` -> `cli_default`
     pub fn session_dir(&self) -> PathBuf {
+        use blockcell_core::session_file_stem;
+        let safe_session_id = session_file_stem(&self.session_id);
         self.workspace_dir
             .join("sessions")
-            .join(&self.session_id)
+            .join(safe_session_id)
     }
 
     /// 标记会话为活跃状态

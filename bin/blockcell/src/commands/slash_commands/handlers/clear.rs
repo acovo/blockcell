@@ -57,8 +57,9 @@ impl SlashCommand for ClearCommand {
         }
 
         // 3. 清除 Session Memory 文件
-        // 使用 session_key 作为目录名，与 memory_system 保持一致
-        let session_dir = ctx.paths.workspace().join("sessions").join(&session_key);
+        // 使用 session_file_stem 确保路径兼容性（Windows 不允许冒号）
+        let safe_session_key = blockcell_core::session_file_stem(&session_key);
+        let session_dir = ctx.paths.workspace().join("sessions").join(&safe_session_key);
         let session_memory_path = session_dir.join("memory.md");
 
         if session_memory_path.exists() {

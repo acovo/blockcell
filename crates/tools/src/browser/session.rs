@@ -176,7 +176,10 @@ impl SessionManager {
         let user_data_dir = if let Some(profile) = profile_path {
             PathBuf::from(profile)
         } else {
-            self.base_dir.join("sessions").join(session_name)
+            // Sanitize session_name to prevent Windows path issues
+            // (e.g., session_name "cli:default" would fail on Windows due to colon)
+            let safe_session_name = sanitize_session_name(session_name);
+            self.base_dir.join("sessions").join(safe_session_name)
         };
 
         // Ensure directory exists
@@ -475,4 +478,95 @@ pub async fn get_target_ws_url(port: u16, target_id: &str) -> Result<String, Str
         "No WebSocket URL found for targetId '{}' after retries",
         target_id
     ))
+}
+
+/// Sanitize session name for use in file paths.
+///
+/// Replaces characters that are invalid in Windows paths:
+/// - Reserved characters: `< > : " | ? *`
+/// - Path separators: `/ \`
+///
+/// Also checks for Windows reserved file names (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
+fn sanitize_session_name(name: &str) -> String {
+    // Replace invalid characters with underscore
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    // If empty after sanitization, use default
+    if sanitized.is_empty() {
+        return "default".to_string();
+    }
+
+    // Limit length
+    let result = if sanitized.len() > 64 {
+        sanitized[..64].to_string()
+    } else {
+        sanitized
+    };
+
+    // Check for Windows reserved file names
+    let upper = result.to_uppercase();
+    let is_reserved = matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+        | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
+        | "COM6" | "COM7" | "COM8" | "COM9"
+        | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5"
+        | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    );
+
+    if is_reserved {
+        format!("{}_", result)
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_session_name_normal() {
+        assert_eq!(sanitize_session_name("default"), "default");
+        assert_eq!(sanitize_session_name("my-session"), "my-session");
+        assert_eq!(sanitize_session_name("session_123"), "session_123");
+    }
+
+    #[test]
+    fn test_sanitize_session_name_colon() {
+        // This is the main case: "cli:default" -> "cli_default"
+        assert_eq!(sanitize_session_name("cli:default"), "cli_default");
+        assert_eq!(sanitize_session_name("ws:abc123"), "ws_abc123");
+    }
+
+    #[test]
+    fn test_sanitize_session_name_other_invalid_chars() {
+        assert_eq!(sanitize_session_name("test<>"), "test__");
+        assert_eq!(sanitize_session_name("a|b?c*d"), "a_b_c_d");
+        assert_eq!(sanitize_session_name("path/name"), "path_name");
+        assert_eq!(sanitize_session_name("win\\path"), "win_path");
+    }
+
+    #[test]
+    fn test_sanitize_session_name_reserved_names() {
+        assert_eq!(sanitize_session_name("CON"), "CON_");
+        assert_eq!(sanitize_session_name("aux"), "aux_");
+        assert_eq!(sanitize_session_name("NUL"), "NUL_");
+        assert_eq!(sanitize_session_name("COM1"), "COM1_");
+        assert_eq!(sanitize_session_name("lpt9"), "lpt9_");
+    }
+
+    #[test]
+    fn test_sanitize_session_name_empty() {
+        assert_eq!(sanitize_session_name(""), "default");
+    }
 }
