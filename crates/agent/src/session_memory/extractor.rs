@@ -6,6 +6,7 @@ use crate::token::estimate_tokens;
 use super::MAX_SECTION_LENGTH;
 use super::template::validate_session_memory;
 use crate::forked::{run_forked_agent, ForkedAgentParams, CacheSafeParams, create_memory_file_can_use_tool};
+use crate::memory_event;
 use blockcell_core::types::ChatMessage;
 use blockcell_providers::ProviderPool;
 use std::path::Path;
@@ -229,6 +230,15 @@ pub async fn extract_session_memory(
     current_memory: &str,
     template: &str,
 ) -> Result<(), ExtractionError> {
+    // 记录 Layer 3 提取开始事件
+    let message_count = messages.len();
+    let token_estimate = estimate_message_tokens(&messages);
+    memory_event!(layer3, extraction_started,
+        memory_path.to_string_lossy().as_ref(),
+        message_count,
+        token_estimate
+    );
+
     // 创建工具权限检查
     let can_use_tool = create_memory_file_can_use_tool(memory_path);
 

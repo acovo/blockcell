@@ -11,6 +11,7 @@ use crate::forked::{
     run_forked_agent, ForkedAgentParams, CacheSafeParams,
     create_auto_mem_can_use_tool,
 };
+use crate::memory_event;
 use blockcell_core::types::ChatMessage;
 use blockcell_providers::ProviderPool;
 use std::path::Path;
@@ -174,6 +175,16 @@ impl AutoMemoryExtractor {
                     cursor_save_failed,
                     "[auto_memory] extraction completed"
                 );
+
+                // 记录 Layer 5 memory_written 事件
+                // 读取写入后的文件内容来获取长度
+                if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
+                    memory_event!(layer5, memory_written,
+                        memory_type.name(),
+                        memory_path.to_string_lossy().as_ref(),
+                        updated_content.len()
+                    );
+                }
 
                 ExtractionResult {
                     memory_type,

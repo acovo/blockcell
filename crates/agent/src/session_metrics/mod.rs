@@ -173,6 +173,14 @@ macro_rules! memory_event {
         $crate::session_metrics::get_memory_metrics().layer1.record_budget_exceeded();
     };
 
+    // Layer 1: Config
+    (layer1, config, $max_results:expr, $preview_limit:expr) => {
+        $crate::session_metrics::get_memory_metrics().layer1.record_config(
+            $max_results as u64,
+            $preview_limit as u64
+        );
+    };
+
     // ========== Layer 2: Micro Compact ==========
 
     (layer2, triggered, $gap_minutes:expr, $threshold_minutes:expr) => {
@@ -195,6 +203,14 @@ macro_rules! memory_event {
             "Micro compact content cleared"
         );
         $crate::session_metrics::get_memory_metrics().layer2.record_cleared($cleared as u64, $kept as u64);
+    };
+
+    // Layer 2: Config
+    (layer2, config, $gap_minutes:expr, $keep_recent:expr) => {
+        $crate::session_metrics::get_memory_metrics().layer2.record_config(
+            $gap_minutes as u64,
+            $keep_recent as u64
+        );
     };
 
     // ========== Layer 3: Session Memory ==========
@@ -221,6 +237,14 @@ macro_rules! memory_event {
             "Session memory loaded"
         );
         $crate::session_metrics::get_memory_metrics().layer3.record_load($content_length as u64);
+    };
+
+    // Layer 3: Config
+    (layer3, config, $max_total:expr, $max_section:expr) => {
+        $crate::session_metrics::get_memory_metrics().layer3.record_config(
+            $max_total as u64,
+            $max_section as u64
+        );
     };
 
     // ========== Layer 4: Full Compact ==========
@@ -307,6 +331,20 @@ macro_rules! memory_event {
         $crate::session_metrics::get_memory_metrics().layer4.record_compact_failure();
     };
 
+    // Layer 4: Token usage update (实时状态)
+    (layer4, token_usage, $current:expr, $budget:expr, $threshold:expr) => {
+        $crate::session_metrics::get_memory_metrics().layer4.update_token_usage($current as u64);
+    };
+
+    // Layer 4: Config
+    (layer4, config, $budget:expr, $threshold:expr, $recovery_budget:expr) => {
+        $crate::session_metrics::get_memory_metrics().layer4.record_config(
+            $budget as u64,
+            $threshold as f64,
+            $recovery_budget as u64
+        );
+    };
+
     // ========== Layer 5: Memory Extraction ==========
 
     (layer5, memory_written, $memory_type:expr, $filepath:expr, $content_len:expr) => {
@@ -342,6 +380,15 @@ macro_rules! memory_event {
         );
     };
 
+    // Layer 5: Config
+    (layer5, config, $min_msg:expr, $cooldown:expr, $max_file:expr) => {
+        $crate::session_metrics::get_memory_metrics().layer5.record_config(
+            $min_msg as u64,
+            $cooldown as u64,
+            $max_file as u64
+        );
+    };
+
     // ========== Layer 6: Auto Dream ==========
 
     (layer6, dream_started, $sessions_count:expr, $hours_since_last:expr) => {
@@ -369,8 +416,35 @@ macro_rules! memory_event {
             $created as u64,
             $updated as u64,
             $deleted as u64,
-            $pruned as u64
+            $pruned as u64,
+            0 // sessions_processed - deprecated, use new macro
         );
+    };
+
+    // Layer 6: dream_finished with sessions
+    (layer6, dream_finished_with_sessions, $created:expr, $updated:expr, $deleted:expr, $pruned:expr, $sessions:expr) => {
+        tracing::info!(
+            target: "blockcell.session_metrics.layer6",
+            event = "dream_finished",
+            memories_created = $created,
+            memories_updated = $updated,
+            memories_deleted = $deleted,
+            sessions_pruned = $pruned,
+            sessions_processed = $sessions,
+            "Dream consolidation completed"
+        );
+        $crate::session_metrics::get_memory_metrics().layer6.record_dream_finished(
+            $created as u64,
+            $updated as u64,
+            $deleted as u64,
+            $pruned as u64,
+            $sessions as u64
+        );
+    };
+
+    // Layer 6: Config
+    (layer6, config, $interval_hours:expr) => {
+        $crate::session_metrics::get_memory_metrics().layer6.record_config($interval_hours as u64);
     };
 
     // ========== Layer 7: Forked Agent ==========
@@ -402,6 +476,24 @@ macro_rules! memory_event {
         );
     };
 
+    // Layer 7: agent_completed with duration
+    (layer7, agent_completed_with_duration, $fork_label:expr, $turns:expr, $tokens:expr, $duration_ms:expr) => {
+        tracing::info!(
+            target: "blockcell.session_metrics.layer7",
+            event = "agent_completed",
+            fork_label = $fork_label,
+            turns_used = $turns,
+            total_tokens = $tokens,
+            duration_ms = $duration_ms,
+            "Forked agent completed"
+        );
+        $crate::session_metrics::get_memory_metrics().layer7.record_completed_with_duration(
+            $turns as u64,
+            $tokens as u64,
+            $duration_ms as u64
+        );
+    };
+
     (layer7, agent_failed, $fork_label:expr, $error:expr, $turns:expr) => {
         tracing::warn!(
             target: "blockcell.session_metrics.layer7",
@@ -423,6 +515,11 @@ macro_rules! memory_event {
             "Tool permission denied"
         );
         $crate::session_metrics::get_memory_metrics().layer7.record_tool_denied();
+    };
+
+    // Layer 7: Config
+    (layer7, config, $max_turns:expr) => {
+        $crate::session_metrics::get_memory_metrics().layer7.record_config($max_turns as u64);
     };
 }
 

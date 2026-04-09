@@ -3,6 +3,7 @@
 //! 提供 Post-Compact 恢复和等待提取完成的功能。
 
 use crate::token::estimate_tokens;
+use crate::memory_event;
 use super::{EXTRACTION_WAIT_TIMEOUT_MS, EXTRACTION_STALE_THRESHOLD_MS};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -131,6 +132,16 @@ pub async fn get_session_memory_content_for_compact(
             "[session_memory] truncated for compact"
         );
     }
+
+    // 记录 Layer 3 加载事件
+    let content_length = truncated.len();
+    let line_count = truncated.lines().count() as u64;
+    let section_count = truncated.matches("## ").count() as u64;
+    memory_event!(layer3, loaded, content_length, line_count, section_count);
+    // 单独更新 section_count（宏只记录 content_length）
+    crate::session_metrics::get_memory_metrics()
+        .layer3
+        .update_section_count(section_count);
 
     Ok(truncated)
 }

@@ -1657,6 +1657,7 @@ impl AgentRuntime {
     /// - Marks session as active (creates `.active` file)
     pub async fn init_memory_system(&mut self, session_id: String) -> std::io::Result<()> {
         use crate::memory_system::{MemorySystem, MemorySystemConfig};
+        use crate::compact::{MAX_FILE_RECOVERY_TOKENS, MAX_SKILL_RECOVERY_TOKENS, MAX_SESSION_MEMORY_RECOVERY_TOKENS};
 
         let config = MemorySystemConfig::default();
         // Use paths.base as both workspace and config directory
@@ -1671,6 +1672,48 @@ impl AgentRuntime {
 
         // Perform async initialization: load cursor state + mark session active
         memory_system.initialize().await?;
+
+        // ========== Record config for all layers to metrics ==========
+
+        // Layer 1: Tool Result Storage
+        crate::memory_event!(layer1, config,
+            50, // max_tool_results (default per session)
+            crate::response_cache::PREVIEW_SIZE_BYTES
+        );
+
+        // Layer 2: Micro Compact
+        let layer2_config = crate::history_projector::TimeBasedMCConfig::default();
+        crate::memory_event!(layer2, config,
+            layer2_config.gap_threshold_minutes,
+            layer2_config.keep_recent
+        );
+
+        // Layer 3: Session Memory
+        crate::memory_event!(layer3, config,
+            crate::session_memory::MAX_TOTAL_SESSION_MEMORY_TOKENS,
+            crate::session_memory::MAX_SECTION_LENGTH
+        );
+
+        // Layer 4: Full Compact
+        let recovery_budget = MAX_FILE_RECOVERY_TOKENS + MAX_SKILL_RECOVERY_TOKENS + MAX_SESSION_MEMORY_RECOVERY_TOKENS;
+        crate::memory_event!(layer4, config,
+            memory_system.config().token_budget,
+            memory_system.config().compact_threshold,
+            recovery_budget
+        );
+
+        // Layer 5: Memory Extraction
+        crate::memory_event!(layer5, config,
+            crate::auto_memory::MIN_MESSAGES_FOR_EXTRACTION,
+            crate::auto_memory::EXTRACTION_COOLDOWN_MESSAGES,
+            crate::auto_memory::MAX_MEMORY_FILE_TOKENS
+        );
+
+        // Layer 6: Auto Dream (interval is typically 24 hours)
+        crate::memory_event!(layer6, config, 24);
+
+        // Layer 7: Forked Agent (max_turns default is typically 10)
+        crate::memory_event!(layer7, config, 10);
 
         self.memory_system = Some(memory_system);
 
@@ -3483,7 +3526,13 @@ impl AgentRuntime {
         // 如果从磁盘恢复的历史已经超过阈值，先压缩再进入主循环
         {
             let estimated_tokens = estimate_messages_tokens(&current_messages);
+            // Update Layer 4 token usage metrics
             if let Some(memory_system) = self.memory_system.as_ref() {
+                crate::memory_event!(layer4, token_usage,
+                    estimated_tokens,
+                    memory_system.config().token_budget,
+                    memory_system.config().compact_threshold
+                );
                 if memory_system.should_compact(estimated_tokens) {
                     info!(
                         estimated_tokens,
@@ -3964,7 +4013,13 @@ impl AgentRuntime {
                 // Layer 4: Full Compact - 当 token 超过预算阈值时触发 LLM 语义压缩
                 // 预算阈值: token_budget * compact_threshold (默认 100_000 * 0.8 = 80_000)
                 let estimated_tokens = estimate_messages_tokens(&current_messages);
+                // Update Layer 4 token usage metrics
                 if let Some(memory_system) = self.memory_system.as_ref() {
+                    crate::memory_event!(layer4, token_usage,
+                        estimated_tokens,
+                        memory_system.config().token_budget,
+                        memory_system.config().compact_threshold
+                    );
                     if memory_system.should_compact(estimated_tokens) {
                         info!(
                             estimated_tokens,

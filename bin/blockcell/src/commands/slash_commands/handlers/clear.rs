@@ -90,7 +90,39 @@ impl SlashCommand for ClearCommand {
             }
         }
 
-        // 5. 构建响应
+        // 5. 清除持久化的工具结果目录 (Layer 1 Tool Results)
+        let tool_results_dir = session_dir.join("tool-results");
+
+        if tool_results_dir.exists() {
+            match tokio::fs::remove_dir_all(&tool_results_dir).await {
+                Ok(_) => {
+                    results.push("✅ 工具结果文件已删除".to_string());
+                }
+                Err(e) => results.push(format!(
+                    "⚠️ 工具结果目录删除失败 (session: {}, path: {}): {}",
+                    session_key,
+                    tool_results_dir.display(),
+                    e
+                )),
+            }
+        }
+
+        // 6. 重置 session metrics 的实时状态值
+        // 这些是"当前状态"指标，清除会话后应该归零
+        let metrics = blockcell_agent::session_metrics::get_memory_metrics();
+        // Layer 1: 工具结果存储计数
+        metrics.layer1.update_stored_count(0);
+        // Layer 3: Session Memory 大小和章节数
+        metrics.layer3.record_load(0);
+        metrics.layer3.update_section_count(0);
+        // Layer 4: 当前 token 使用量
+        metrics.layer4.update_token_usage(0);
+        tracing::debug!(
+            session_key = %session_key,
+            "[/clear] Session metrics real-time state reset completed"
+        );
+
+        // 7. 构建响应
         let content = if results.is_empty() {
             "✅ 会话历史已清除 (无持久化数据)\n".to_string()
         } else {

@@ -66,6 +66,13 @@ pub struct Layer1Metrics {
     total_preview_size: AtomicU64,
     /// Number of budget exceeded events.
     budget_exceeded_count: AtomicU64,
+    // --- 新增字段 ---
+    /// Max tool results per message (配置值)
+    max_tool_results: AtomicU64,
+    /// Preview size limit in bytes (配置值)
+    preview_size_limit: AtomicU64,
+    /// Current stored results count (实时状态)
+    current_stored_results: AtomicU64,
 }
 
 impl Layer1Metrics {
@@ -101,6 +108,38 @@ impl Layer1Metrics {
         self.budget_exceeded_count.load(Ordering::Relaxed)
     }
 
+    // --- 新增方法 ---
+    /// Record config settings for Layer 1.
+    pub fn record_config(&self, max_results: u64, preview_limit: u64) {
+        self.max_tool_results.store(max_results, Ordering::Relaxed);
+        self.preview_size_limit.store(preview_limit, Ordering::Relaxed);
+    }
+
+    /// Update current stored results count.
+    pub fn update_stored_count(&self, count: u64) {
+        self.current_stored_results.store(count, Ordering::Relaxed);
+    }
+
+    /// Increment stored results count by 1.
+    pub fn increment_stored_count(&self) {
+        self.current_stored_results.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get max tool results limit.
+    pub fn max_tool_results(&self) -> u64 {
+        self.max_tool_results.load(Ordering::Relaxed)
+    }
+
+    /// Get preview size limit.
+    pub fn preview_size_limit(&self) -> u64 {
+        self.preview_size_limit.load(Ordering::Relaxed)
+    }
+
+    /// Get current stored results count.
+    pub fn current_stored_results(&self) -> u64 {
+        self.current_stored_results.load(Ordering::Relaxed)
+    }
+
     /// Calculate average compression ratio.
     pub fn average_compression(&self) -> f64 {
         let orig = self.total_original_size.load(Ordering::Relaxed);
@@ -118,6 +157,8 @@ impl Layer1Metrics {
         self.total_original_size.store(0, Ordering::Relaxed);
         self.total_preview_size.store(0, Ordering::Relaxed);
         self.budget_exceeded_count.store(0, Ordering::Relaxed);
+        // 新增字段不重置（配置值保留）
+        self.current_stored_results.store(0, Ordering::Relaxed);
     }
 }
 
@@ -134,18 +175,38 @@ pub struct Layer2Metrics {
     cleared_count: AtomicU64,
     /// Number of items kept.
     kept_count: AtomicU64,
+    // --- 新增字段 ---
+    /// Gap threshold in minutes (配置值)
+    gap_threshold_minutes: AtomicU64,
+    /// Keep recent count (配置值)
+    keep_recent: AtomicU64,
+    /// Last trigger timestamp (Unix ms)
+    last_trigger_timestamp: AtomicU64,
 }
 
 impl Layer2Metrics {
     /// Record a trigger event.
     pub fn record_trigger(&self) {
         self.trigger_count.fetch_add(1, Ordering::Relaxed);
+        self.last_trigger_timestamp.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            Ordering::Relaxed
+        );
     }
 
     /// Record cleared items.
     pub fn record_cleared(&self, cleared: u64, kept: u64) {
         self.cleared_count.fetch_add(cleared, Ordering::Relaxed);
         self.kept_count.fetch_add(kept, Ordering::Relaxed);
+    }
+
+    /// Record config settings for Layer 2.
+    pub fn record_config(&self, gap_minutes: u64, keep_recent: u64) {
+        self.gap_threshold_minutes.store(gap_minutes, Ordering::Relaxed);
+        self.keep_recent.store(keep_recent, Ordering::Relaxed);
     }
 
     /// Get the trigger count.
@@ -163,11 +224,27 @@ impl Layer2Metrics {
         self.kept_count.load(Ordering::Relaxed)
     }
 
+    /// Get gap threshold in minutes.
+    pub fn gap_threshold_minutes(&self) -> u64 {
+        self.gap_threshold_minutes.load(Ordering::Relaxed)
+    }
+
+    /// Get keep recent count.
+    pub fn keep_recent(&self) -> u64 {
+        self.keep_recent.load(Ordering::Relaxed)
+    }
+
+    /// Get last trigger timestamp (Unix ms).
+    pub fn last_trigger_timestamp(&self) -> u64 {
+        self.last_trigger_timestamp.load(Ordering::Relaxed)
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.trigger_count.store(0, Ordering::Relaxed);
         self.cleared_count.store(0, Ordering::Relaxed);
         self.kept_count.store(0, Ordering::Relaxed);
+        // 新增字段不重置（配置值和时间戳保留）
     }
 }
 
@@ -186,6 +263,15 @@ pub struct Layer3Metrics {
     total_token_estimate: AtomicU64,
     /// Current session memory size.
     current_size: AtomicU64,
+    // --- 新增字段 ---
+    /// Max total tokens limit (配置值, 默认 12000)
+    max_total_tokens: AtomicU64,
+    /// Max section length (配置值, 默认 2000)
+    max_section_length: AtomicU64,
+    /// Last extraction timestamp (Unix ms)
+    last_extraction_timestamp: AtomicU64,
+    /// Current section count
+    section_count: AtomicU64,
 }
 
 impl Layer3Metrics {
@@ -193,12 +279,30 @@ impl Layer3Metrics {
     pub fn record_extraction(&self, token_estimate: u64) {
         self.extraction_count.fetch_add(1, Ordering::Relaxed);
         self.total_token_estimate.fetch_add(token_estimate, Ordering::Relaxed);
+        self.last_extraction_timestamp.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            Ordering::Relaxed
+        );
     }
 
     /// Record a load event.
     pub fn record_load(&self, size: u64) {
         self.load_count.fetch_add(1, Ordering::Relaxed);
         self.current_size.store(size, Ordering::Relaxed);
+    }
+
+    /// Record config settings for Layer 3.
+    pub fn record_config(&self, max_total: u64, max_section: u64) {
+        self.max_total_tokens.store(max_total, Ordering::Relaxed);
+        self.max_section_length.store(max_section, Ordering::Relaxed);
+    }
+
+    /// Update section count.
+    pub fn update_section_count(&self, count: u64) {
+        self.section_count.store(count, Ordering::Relaxed);
     }
 
     /// Get the extraction count.
@@ -221,12 +325,34 @@ impl Layer3Metrics {
         self.total_token_estimate.load(Ordering::Relaxed)
     }
 
+    /// Get max total tokens limit.
+    pub fn max_total_tokens(&self) -> u64 {
+        self.max_total_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Get max section length.
+    pub fn max_section_length(&self) -> u64 {
+        self.max_section_length.load(Ordering::Relaxed)
+    }
+
+    /// Get last extraction timestamp.
+    pub fn last_extraction_timestamp(&self) -> u64 {
+        self.last_extraction_timestamp.load(Ordering::Relaxed)
+    }
+
+    /// Get section count.
+    pub fn section_count(&self) -> u64 {
+        self.section_count.load(Ordering::Relaxed)
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.extraction_count.store(0, Ordering::Relaxed);
         self.load_count.store(0, Ordering::Relaxed);
         self.total_token_estimate.store(0, Ordering::Relaxed);
         self.current_size.store(0, Ordering::Relaxed);
+        self.section_count.store(0, Ordering::Relaxed);
+        // 配置值和时间戳保留
     }
 }
 
@@ -255,6 +381,17 @@ pub struct Layer4Metrics {
     total_cache_read_tokens: AtomicU64,
     /// Total cache creation tokens.
     total_cache_creation_tokens: AtomicU64,
+    // --- 新增字段 ---
+    /// Token budget (配置值, 默认 100000)
+    token_budget: AtomicU64,
+    /// Threshold ratio (存储为整数, 0.8 -> 800)
+    threshold_ratio: AtomicU64,
+    /// Current tokens in use (实时状态)
+    current_tokens: AtomicU64,
+    /// Last compact timestamp (Unix ms)
+    last_compact_timestamp: AtomicU64,
+    /// Total recovery budget (文件 50K + 技能 25K + Session 12K = 87K)
+    total_recovery_budget: AtomicU64,
 }
 
 impl Layer4Metrics {
@@ -289,12 +426,32 @@ impl Layer4Metrics {
         self.total_post_compact_tokens.fetch_add(post_tokens, Ordering::Relaxed);
         self.total_cache_read_tokens.fetch_add(cache_read, Ordering::Relaxed);
         self.total_cache_creation_tokens.fetch_add(cache_creation, Ordering::Relaxed);
+        // 更新时间戳
+        self.last_compact_timestamp.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            Ordering::Relaxed
+        );
     }
 
     /// Record a failed compact.
     pub fn record_compact_failure(&self) {
         self.compact_failed_count.fetch_add(1, Ordering::Relaxed);
         self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record config settings for Layer 4.
+    pub fn record_config(&self, budget: u64, threshold: f64, recovery_budget: u64) {
+        self.token_budget.store(budget, Ordering::Relaxed);
+        self.threshold_ratio.store((threshold * 1000.0) as u64, Ordering::Relaxed);
+        self.total_recovery_budget.store(recovery_budget, Ordering::Relaxed);
+    }
+
+    /// Update current token usage (实时状态).
+    pub fn update_token_usage(&self, current: u64) {
+        self.current_tokens.store(current, Ordering::Relaxed);
     }
 
     /// Get the compact count.
@@ -355,6 +512,56 @@ impl Layer4Metrics {
         self.total_post_compact_tokens.load(Ordering::Relaxed)
     }
 
+    /// Get token budget.
+    pub fn token_budget(&self) -> u64 {
+        self.token_budget.load(Ordering::Relaxed)
+    }
+
+    /// Get threshold ratio (as float, 800 -> 0.8).
+    pub fn threshold_ratio(&self) -> f64 {
+        self.threshold_ratio.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+
+    /// Get threshold tokens (budget * threshold_ratio).
+    pub fn threshold_tokens(&self) -> u64 {
+        let budget = self.token_budget.load(Ordering::Relaxed);
+        let ratio = self.threshold_ratio.load(Ordering::Relaxed);
+        (budget * ratio) / 1000
+    }
+
+    /// Get current tokens.
+    pub fn current_tokens(&self) -> u64 {
+        self.current_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Get remaining tokens (budget - current).
+    pub fn remaining_tokens(&self) -> u64 {
+        let budget = self.token_budget.load(Ordering::Relaxed);
+        let current = self.current_tokens.load(Ordering::Relaxed);
+        budget.saturating_sub(current)
+    }
+
+    /// Get usage percentage.
+    pub fn usage_percentage(&self) -> f64 {
+        let budget = self.token_budget.load(Ordering::Relaxed);
+        let current = self.current_tokens.load(Ordering::Relaxed);
+        if budget > 0 {
+            (current as f64 / budget as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Get last compact timestamp.
+    pub fn last_compact_timestamp(&self) -> u64 {
+        self.last_compact_timestamp.load(Ordering::Relaxed)
+    }
+
+    /// Get total recovery budget.
+    pub fn total_recovery_budget(&self) -> u64 {
+        self.total_recovery_budget.load(Ordering::Relaxed)
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.compact_count.store(0, Ordering::Relaxed);
@@ -366,6 +573,8 @@ impl Layer4Metrics {
         self.total_post_compact_tokens.store(0, Ordering::Relaxed);
         self.total_cache_read_tokens.store(0, Ordering::Relaxed);
         self.total_cache_creation_tokens.store(0, Ordering::Relaxed);
+        // 新增字段：配置值保留，状态值重置
+        self.current_tokens.store(0, Ordering::Relaxed);
     }
 }
 
@@ -388,6 +597,23 @@ pub struct Layer5Metrics {
     reference_memories: AtomicU64,
     /// Total bytes written.
     total_bytes_written: AtomicU64,
+    // --- 新增字段 ---
+    /// Min messages for extraction (配置值, 默认 10)
+    min_messages: AtomicU64,
+    /// Cooldown messages (配置值, 默认 5)
+    cooldown_messages: AtomicU64,
+    /// Max file tokens (配置值, 默认 4000)
+    max_file_tokens: AtomicU64,
+    /// Last extraction timestamp (Unix ms)
+    last_extraction_timestamp: AtomicU64,
+    /// User memory bytes
+    user_bytes: AtomicU64,
+    /// Project memory bytes
+    project_bytes: AtomicU64,
+    /// Feedback memory bytes
+    feedback_bytes: AtomicU64,
+    /// Reference memory bytes
+    reference_bytes: AtomicU64,
 }
 
 impl Layer5Metrics {
@@ -395,13 +621,32 @@ impl Layer5Metrics {
     pub fn record_memory_written(&self, memory_type: &str, content_len: u64) {
         self.extraction_count.fetch_add(1, Ordering::Relaxed);
         self.total_bytes_written.fetch_add(content_len, Ordering::Relaxed);
+        self.last_extraction_timestamp.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            Ordering::Relaxed
+        );
 
         match memory_type {
-            "user" => self.user_memories.fetch_add(1, Ordering::Relaxed),
-            "project" => self.project_memories.fetch_add(1, Ordering::Relaxed),
-            "feedback" => self.feedback_memories.fetch_add(1, Ordering::Relaxed),
-            "reference" => self.reference_memories.fetch_add(1, Ordering::Relaxed),
-            _ => 0,
+            "user" => {
+                self.user_memories.fetch_add(1, Ordering::Relaxed);
+                self.user_bytes.fetch_add(content_len, Ordering::Relaxed);
+            }
+            "project" => {
+                self.project_memories.fetch_add(1, Ordering::Relaxed);
+                self.project_bytes.fetch_add(content_len, Ordering::Relaxed);
+            }
+            "feedback" => {
+                self.feedback_memories.fetch_add(1, Ordering::Relaxed);
+                self.feedback_bytes.fetch_add(content_len, Ordering::Relaxed);
+            }
+            "reference" => {
+                self.reference_memories.fetch_add(1, Ordering::Relaxed);
+                self.reference_bytes.fetch_add(content_len, Ordering::Relaxed);
+            }
+            _ => {}
         };
     }
 
@@ -411,6 +656,13 @@ impl Layer5Metrics {
         self.project_memories.fetch_add(project, Ordering::Relaxed);
         self.feedback_memories.fetch_add(feedback, Ordering::Relaxed);
         self.reference_memories.fetch_add(reference, Ordering::Relaxed);
+    }
+
+    /// Record config settings for Layer 5.
+    pub fn record_config(&self, min_msg: u64, cooldown: u64, max_file: u64) {
+        self.min_messages.store(min_msg, Ordering::Relaxed);
+        self.cooldown_messages.store(cooldown, Ordering::Relaxed);
+        self.max_file_tokens.store(max_file, Ordering::Relaxed);
     }
 
     /// Get the extraction count.
@@ -443,6 +695,46 @@ impl Layer5Metrics {
         self.reference_memories.load(Ordering::Relaxed)
     }
 
+    /// Get min messages for extraction.
+    pub fn min_messages(&self) -> u64 {
+        self.min_messages.load(Ordering::Relaxed)
+    }
+
+    /// Get cooldown messages.
+    pub fn cooldown_messages(&self) -> u64 {
+        self.cooldown_messages.load(Ordering::Relaxed)
+    }
+
+    /// Get max file tokens.
+    pub fn max_file_tokens(&self) -> u64 {
+        self.max_file_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Get last extraction timestamp.
+    pub fn last_extraction_timestamp(&self) -> u64 {
+        self.last_extraction_timestamp.load(Ordering::Relaxed)
+    }
+
+    /// Get user memory bytes.
+    pub fn user_bytes(&self) -> u64 {
+        self.user_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Get project memory bytes.
+    pub fn project_bytes(&self) -> u64 {
+        self.project_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Get feedback memory bytes.
+    pub fn feedback_bytes(&self) -> u64 {
+        self.feedback_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Get reference memory bytes.
+    pub fn reference_bytes(&self) -> u64 {
+        self.reference_bytes.load(Ordering::Relaxed)
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.extraction_count.store(0, Ordering::Relaxed);
@@ -451,6 +743,12 @@ impl Layer5Metrics {
         self.feedback_memories.store(0, Ordering::Relaxed);
         self.reference_memories.store(0, Ordering::Relaxed);
         self.total_bytes_written.store(0, Ordering::Relaxed);
+        // 新增字段
+        self.user_bytes.store(0, Ordering::Relaxed);
+        self.project_bytes.store(0, Ordering::Relaxed);
+        self.feedback_bytes.store(0, Ordering::Relaxed);
+        self.reference_bytes.store(0, Ordering::Relaxed);
+        // 配置值保留
     }
 }
 
@@ -471,20 +769,40 @@ pub struct Layer6Metrics {
     memories_deleted: AtomicU64,
     /// Sessions pruned.
     sessions_pruned: AtomicU64,
+    // --- 新增字段 ---
+    /// Dream interval hours (配置值)
+    dream_interval_hours: AtomicU64,
+    /// Last dream timestamp (Unix ms)
+    last_dream_timestamp: AtomicU64,
+    /// Sessions processed
+    sessions_processed: AtomicU64,
 }
 
 impl Layer6Metrics {
     /// Record a dream started event.
     pub fn record_dream_started(&self) {
         self.dream_count.fetch_add(1, Ordering::Relaxed);
+        self.last_dream_timestamp.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            Ordering::Relaxed
+        );
     }
 
     /// Record a dream finished event.
-    pub fn record_dream_finished(&self, created: u64, updated: u64, deleted: u64, pruned: u64) {
+    pub fn record_dream_finished(&self, created: u64, updated: u64, deleted: u64, pruned: u64, sessions: u64) {
         self.memories_created.fetch_add(created, Ordering::Relaxed);
         self.memories_updated.fetch_add(updated, Ordering::Relaxed);
         self.memories_deleted.fetch_add(deleted, Ordering::Relaxed);
         self.sessions_pruned.fetch_add(pruned, Ordering::Relaxed);
+        self.sessions_processed.fetch_add(sessions, Ordering::Relaxed);
+    }
+
+    /// Record config settings for Layer 6.
+    pub fn record_config(&self, interval_hours: u64) {
+        self.dream_interval_hours.store(interval_hours, Ordering::Relaxed);
     }
 
     /// Get the dream count.
@@ -512,6 +830,33 @@ impl Layer6Metrics {
         self.sessions_pruned.load(Ordering::Relaxed)
     }
 
+    /// Get dream interval hours.
+    pub fn dream_interval_hours(&self) -> u64 {
+        self.dream_interval_hours.load(Ordering::Relaxed)
+    }
+
+    /// Get last dream timestamp.
+    pub fn last_dream_timestamp(&self) -> u64 {
+        self.last_dream_timestamp.load(Ordering::Relaxed)
+    }
+
+    /// Get sessions processed.
+    pub fn sessions_processed(&self) -> u64 {
+        self.sessions_processed.load(Ordering::Relaxed)
+    }
+
+    /// Calculate consolidation rate.
+    pub fn consolidation_rate(&self) -> f64 {
+        let processed = self.sessions_processed.load(Ordering::Relaxed);
+        let created = self.memories_created.load(Ordering::Relaxed);
+        let updated = self.memories_updated.load(Ordering::Relaxed);
+        if processed > 0 {
+            (created + updated) as f64 / processed as f64
+        } else {
+            0.0
+        }
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.dream_count.store(0, Ordering::Relaxed);
@@ -519,6 +864,8 @@ impl Layer6Metrics {
         self.memories_updated.store(0, Ordering::Relaxed);
         self.memories_deleted.store(0, Ordering::Relaxed);
         self.sessions_pruned.store(0, Ordering::Relaxed);
+        self.sessions_processed.store(0, Ordering::Relaxed);
+        // 配置值和时间戳保留
     }
 }
 
@@ -541,12 +888,20 @@ pub struct Layer7Metrics {
     total_tokens_used: AtomicU64,
     /// Total turns used.
     total_turns_used: AtomicU64,
+    // --- 新增字段 ---
+    /// Max turns per agent (配置值)
+    max_turns: AtomicU64,
+    /// Current active agents
+    active_count: AtomicU64,
+    /// Total completion time in ms
+    total_completion_time_ms: AtomicU64,
 }
 
 impl Layer7Metrics {
     /// Record an agent spawned event.
     pub fn record_spawned(&self) {
         self.spawned_count.fetch_add(1, Ordering::Relaxed);
+        self.active_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record an agent completed event.
@@ -554,16 +909,32 @@ impl Layer7Metrics {
         self.completed_count.fetch_add(1, Ordering::Relaxed);
         self.total_turns_used.fetch_add(turns, Ordering::Relaxed);
         self.total_tokens_used.fetch_add(tokens, Ordering::Relaxed);
+        self.active_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Record an agent completed event with duration.
+    pub fn record_completed_with_duration(&self, turns: u64, tokens: u64, duration_ms: u64) {
+        self.completed_count.fetch_add(1, Ordering::Relaxed);
+        self.total_turns_used.fetch_add(turns, Ordering::Relaxed);
+        self.total_tokens_used.fetch_add(tokens, Ordering::Relaxed);
+        self.total_completion_time_ms.fetch_add(duration_ms, Ordering::Relaxed);
+        self.active_count.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Record an agent failed event.
     pub fn record_failed(&self) {
         self.failed_count.fetch_add(1, Ordering::Relaxed);
+        self.active_count.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Record a tool denied event.
     pub fn record_tool_denied(&self) {
         self.tool_denied_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record config settings for Layer 7.
+    pub fn record_config(&self, max_turns: u64) {
+        self.max_turns.store(max_turns, Ordering::Relaxed);
     }
 
     /// Get the spawned count.
@@ -596,6 +967,66 @@ impl Layer7Metrics {
         self.total_turns_used.load(Ordering::Relaxed)
     }
 
+    /// Get max turns per agent.
+    pub fn max_turns(&self) -> u64 {
+        self.max_turns.load(Ordering::Relaxed)
+    }
+
+    /// Get current active count.
+    pub fn active_count(&self) -> u64 {
+        self.active_count.load(Ordering::Relaxed)
+    }
+
+    /// Get total completion time in ms.
+    pub fn total_completion_time_ms(&self) -> u64 {
+        self.total_completion_time_ms.load(Ordering::Relaxed)
+    }
+
+    /// Calculate average completion time in ms.
+    pub fn avg_completion_time_ms(&self) -> f64 {
+        let completed = self.completed_count.load(Ordering::Relaxed);
+        let total_time = self.total_completion_time_ms.load(Ordering::Relaxed);
+        if completed > 0 {
+            total_time as f64 / completed as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Calculate average tokens per agent.
+    pub fn avg_tokens_per_agent(&self) -> f64 {
+        let completed = self.completed_count.load(Ordering::Relaxed);
+        let total_tokens = self.total_tokens_used.load(Ordering::Relaxed);
+        if completed > 0 {
+            total_tokens as f64 / completed as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Calculate average turns per agent.
+    pub fn avg_turns(&self) -> f64 {
+        let completed = self.completed_count.load(Ordering::Relaxed);
+        let total_turns = self.total_turns_used.load(Ordering::Relaxed);
+        if completed > 0 {
+            total_turns as f64 / completed as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Calculate success rate.
+    pub fn success_rate(&self) -> f64 {
+        let completed = self.completed_count.load(Ordering::Relaxed);
+        let failed = self.failed_count.load(Ordering::Relaxed);
+        let total = completed + failed;
+        if total > 0 {
+            completed as f64 / total as f64
+        } else {
+            1.0 // No agents run means 100% success
+        }
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.spawned_count.store(0, Ordering::Relaxed);
@@ -604,6 +1035,9 @@ impl Layer7Metrics {
         self.tool_denied_count.store(0, Ordering::Relaxed);
         self.total_tokens_used.store(0, Ordering::Relaxed);
         self.total_turns_used.store(0, Ordering::Relaxed);
+        self.active_count.store(0, Ordering::Relaxed);
+        self.total_completion_time_ms.store(0, Ordering::Relaxed);
+        // 配置值保留
     }
 }
 

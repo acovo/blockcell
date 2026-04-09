@@ -23,6 +23,7 @@ use blockcell_agent::forked::{
     run_forked_agent, ForkedAgentParams, CacheSafeParams,
     create_dream_can_use_tool,
 };
+use blockcell_agent::memory_event;
 
 /// 门控配置
 pub const TIME_GATE_THRESHOLD_HOURS: u64 = 24;
@@ -34,6 +35,32 @@ pub const DREAM_STATE_FILE: &str = ".dream_state.json";
 pub const SESSION_MEMORY_EXPIRY_DAYS: u64 = 7;
 /// 每次处理的最大 session memory 文件数
 pub const MAX_SESSIONS_TO_PROCESS: usize = 10;
+
+/// Dream 执行统计数据
+#[derive(Debug, Clone, Default)]
+pub struct DreamStats {
+    /// 创建的记忆数
+    pub memories_created: usize,
+    /// 更新的记忆数
+    pub memories_updated: usize,
+    /// 删除的记忆数
+    pub memories_deleted: usize,
+    /// 修剪的会话数
+    pub sessions_pruned: usize,
+    /// 处理的会话数
+    pub sessions_processed: usize,
+}
+
+/// Memory 目录状态快照
+#[derive(Debug, Clone, Default)]
+struct MemoryDirState {
+    /// 文件数量
+    file_count: usize,
+    /// 总字节数
+    total_bytes: u64,
+    /// 文件名 -> 修改时间映射
+    file_mtimes: std::collections::HashMap<String, u64>,
+}
 
 /// 梦境状态
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -185,6 +212,19 @@ impl DreamConsolidator {
         // 获取锁
         self.acquire_lock().await?;
 
+        // 记录 Layer 6 dream_started 事件
+        let sessions_count = self.state.current_session_count;
+        let hours_since_last = self.state.last_consolidation_time
+            .map(|t| {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                (now.saturating_sub(t)) / 3600
+            })
+            .unwrap_or(24);
+        memory_event!(layer6, dream_started, sessions_count, hours_since_last);
+
         // 标记开始
         self.state.is_consolidating = true;
         if let Err(e) = self.state.save(&self.config_dir).await {
@@ -196,12 +236,23 @@ impl DreamConsolidator {
 
         let start_time = Instant::now();
 
-        // 执行四阶段
+        // 在 consolidate 前扫描 memory 目录
+        let memory_dir = self.config_dir.join("memory");
+        let pre_memory_state = self.scan_memory_dir(&memory_dir).await;
+
+        // 执行四阶段，收集统计
+        let mut stats = DreamStats::default();
         let result = async {
             self.orient().await?;
             let signals = self.gather().await?;
             self.consolidate(&signals).await?;
-            self.prune().await?;
+            // 在 consolidate 后计算 memory 变化
+            let post_memory_state = self.scan_memory_dir(&memory_dir).await;
+            stats = self.compute_memory_diff(&pre_memory_state, &post_memory_state);
+            // prune 返回修剪统计
+            let prune_stats = self.prune().await?;
+            stats.sessions_pruned = prune_stats.sessions_pruned;
+            stats.sessions_processed = prune_stats.sessions_processed;
             Ok::<(), DreamError>(())
         }
         .await;
@@ -240,9 +291,21 @@ impl DreamConsolidator {
         let elapsed = start_time.elapsed();
         match &result {
             Ok(()) => {
+                // 记录 Layer 6 dream_finished 事件（成功，传递实际统计数据）
+                memory_event!(
+                    layer6, dream_finished_with_sessions,
+                    stats.memories_created,
+                    stats.memories_updated,
+                    stats.memories_deleted,
+                    stats.sessions_pruned,
+                    stats.sessions_processed
+                );
                 tracing::info!(
                     elapsed_ms = elapsed.as_millis() as u64,
                     consolidation_count = self.state.consolidation_count,
+                    memories_created = stats.memories_created,
+                    memories_updated = stats.memories_updated,
+                    sessions_pruned = stats.sessions_pruned,
                     "[dream] consolidation completed"
                 );
             }
@@ -778,21 +841,19 @@ impl DreamConsolidator {
     }
 
     /// 阶段 4: 修剪索引
-    async fn prune(&self) -> Result<(), DreamError> {
+    async fn prune(&self) -> Result<DreamStats, DreamError> {
         tracing::debug!("[dream] Phase 4: Pruning indexes");
 
         // 清理过期的 session memory 文件
-        self.prune_expired_session_memories().await?;
-
-        Ok(())
+        self.prune_expired_session_memories().await
     }
 
     /// 清理过期的 session memory 文件
-    async fn prune_expired_session_memories(&self) -> Result<(), DreamError> {
+    async fn prune_expired_session_memories(&self) -> Result<DreamStats, DreamError> {
         let sessions_dir = self.config_dir.join("sessions");
 
         if !fs::try_exists(&sessions_dir).await? {
-            return Ok(());
+            return Ok(DreamStats::default());
         }
 
         let expiry_threshold = SESSION_MEMORY_EXPIRY_DAYS * 24 * 3600; // 转换为秒
@@ -845,7 +906,11 @@ impl DreamConsolidator {
             skipped_active
         );
 
-        Ok(())
+        Ok(DreamStats {
+            sessions_pruned: pruned_count,
+            sessions_processed: pruned_count + skipped_active,
+            ..Default::default()
+        })
     }
 
     /// 检查会话是否仍在活跃运行
@@ -883,6 +948,85 @@ impl DreamConsolidator {
                 }
             }
             Err(_) => Ok(false),
+        }
+    }
+
+    /// 扫描 memory 目录，获取文件状态
+    ///
+    /// 返回 (文件数量, 总字节数, 文件修改时间映射)
+    async fn scan_memory_dir(&self, memory_dir: &Path) -> MemoryDirState {
+        let mut file_count = 0;
+        let mut total_bytes = 0u64;
+        let mut file_mtimes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+        if !fs::try_exists(memory_dir).await.unwrap_or(false) {
+            return MemoryDirState::default();
+        }
+
+        let Ok(mut entries) = fs::read_dir(memory_dir).await else {
+            return MemoryDirState::default();
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().map(|e| e == "md").unwrap_or(false) {
+                file_count += 1;
+                if let Ok(metadata) = fs::metadata(&path).await {
+                    total_bytes += metadata.len();
+                    if let Ok(modified) = metadata.modified() {
+                        let mtime = modified
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            file_mtimes.insert(name.to_string(), mtime);
+                        }
+                    }
+                }
+            }
+        }
+
+        MemoryDirState {
+            file_count,
+            total_bytes,
+            file_mtimes,
+        }
+    }
+
+    /// 计算前后 memory 目录的差异
+    fn compute_memory_diff(&self, pre: &MemoryDirState, post: &MemoryDirState) -> DreamStats {
+        let mut created = 0;
+        let mut updated = 0;
+        let mut deleted = 0;
+
+        // 检查新增和更新
+        for (name, post_mtime) in &post.file_mtimes {
+            match pre.file_mtimes.get(name) {
+                Some(pre_mtime) => {
+                    // 文件已存在，检查是否更新
+                    if post_mtime > pre_mtime {
+                        updated += 1;
+                    }
+                }
+                None => {
+                    // 新文件
+                    created += 1;
+                }
+            }
+        }
+
+        // 检查删除
+        for name in pre.file_mtimes.keys() {
+            if !post.file_mtimes.contains_key(name) {
+                deleted += 1;
+            }
+        }
+
+        DreamStats {
+            memories_created: created,
+            memories_updated: updated,
+            memories_deleted: deleted,
+            ..Default::default()
         }
     }
 
