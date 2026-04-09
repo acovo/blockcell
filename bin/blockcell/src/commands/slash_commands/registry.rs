@@ -6,8 +6,8 @@ use super::*;
 use std::sync::Arc;
 
 use crate::commands::slash_commands::handlers::{
-    ClearCommand, ClearSkillsCommand, ExitCommand, ForgetSkillCommand, HelpCommand,
-    LearnCommand, QuitCommand, SkillsCommand, TasksCommand, ToolsCommand,
+    ClearCommand, ClearSkillsCommand, CompactCommand, ExitCommand, ForgetSkillCommand, HelpCommand,
+    LearnCommand, QuitCommand, SessionMetricsCommand, SkillsCommand, TasksCommand, ToolsCommand,
 };
 
 /// 创建默认命令处理器
@@ -25,8 +25,12 @@ pub fn create_default_handler() -> SlashCommandHandler {
     handler.register(ToolsCommand);
     handler.register(LearnCommand);
     handler.register(ClearCommand);
+    handler.register(CompactCommand);
     handler.register(ClearSkillsCommand);
     handler.register(ForgetSkillCommand);
+
+    // 监控命令
+    handler.register(SessionMetricsCommand);
 
     // 渠道限制命令
     handler.register(QuitCommand);
@@ -91,5 +95,21 @@ mod tests {
         let result = SLASH_COMMAND_HANDLER.try_handle("/tools", &ctx).await;
 
         assert!(matches!(result, CommandResult::Handled(_)));
+    }
+
+    #[tokio::test]
+    async fn test_global_handler_compact() {
+        let ctx = CommandContext::test_context();
+        let result = SLASH_COMMAND_HANDLER.try_handle("/compact", &ctx).await;
+
+        assert!(matches!(result, CommandResult::ForwardToRuntime { .. }));
+        if let CommandResult::ForwardToRuntime {
+            transformed_content,
+            original_command,
+        } = result
+        {
+            assert_eq!(transformed_content, "__COMPACT_REQUEST__");
+            assert_eq!(original_command, "/compact");
+        }
     }
 }
