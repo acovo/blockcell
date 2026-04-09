@@ -305,6 +305,12 @@ impl Layer3Metrics {
         self.section_count.store(count, Ordering::Relaxed);
     }
 
+    /// Update current size (without incrementing load_count).
+    /// Use this for resetting state values, not for recording load events.
+    pub fn update_current_size(&self, size: u64) {
+        self.current_size.store(size, Ordering::Relaxed);
+    }
+
     /// Get the extraction count.
     pub fn extraction_count(&self) -> u64 {
         self.extraction_count.load(Ordering::Relaxed)

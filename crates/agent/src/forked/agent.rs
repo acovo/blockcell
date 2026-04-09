@@ -766,16 +766,36 @@ pub async fn run_forked_agent(params: ForkedAgentParams) -> Result<ForkedAgentRe
     );
 
     // 获取 Provider（带重试和指数退避）
-    let provider_pool = params.provider_pool
-        .as_ref()
-        .ok_or(ForkedAgentError::NoProviderAvailable)?;
+    let provider_pool = match params.provider_pool.as_ref() {
+        Some(pool) => pool,
+        None => {
+            // 记录 Layer 7 agent_failed 事件（Provider 未配置）
+            memory_event!(layer7, agent_failed,
+                params.fork_label,
+                "no_provider",
+                0
+            );
+            return Err(ForkedAgentError::NoProviderAvailable);
+        }
+    };
 
-    let provider = acquire_provider_with_retry(
+    let provider = match acquire_provider_with_retry(
         provider_pool,
         PROVIDER_RETRY_MAX_ATTEMPTS,
         PROVIDER_RETRY_INITIAL_DELAY_MS,
         PROVIDER_RETRY_MAX_DELAY_MS,
-    ).await?;
+    ).await {
+        Ok(p) => p,
+        Err(e) => {
+            // 记录 Layer 7 agent_failed 事件（Provider 获取失败）
+            memory_event!(layer7, agent_failed,
+                params.fork_label,
+                "provider_acquire_failed",
+                0
+            );
+            return Err(e);
+        }
+    };
 
     let max_turns = params.max_turns.unwrap_or(5);
     let mut current_messages = messages.clone();

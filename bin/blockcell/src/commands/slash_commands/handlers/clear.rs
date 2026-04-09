@@ -112,8 +112,8 @@ impl SlashCommand for ClearCommand {
         let metrics = blockcell_agent::session_metrics::get_memory_metrics();
         // Layer 1: 工具结果存储计数
         metrics.layer1.update_stored_count(0);
-        // Layer 3: Session Memory 大小和章节数
-        metrics.layer3.record_load(0);
+        // Layer 3: Session Memory 大小和章节数 (使用 update 方法避免增加计数)
+        metrics.layer3.update_current_size(0);
         metrics.layer3.update_section_count(0);
         // Layer 4: 当前 token 使用量
         metrics.layer4.update_token_usage(0);
@@ -122,11 +122,15 @@ impl SlashCommand for ClearCommand {
             "[/clear] Session metrics real-time state reset completed"
         );
 
-        // 7. 构建响应
+        // 7. 构建响应 (使用 Markdown 列表格式)
         let content = if results.is_empty() {
             "✅ 会话历史已清除 (无持久化数据)\n".to_string()
         } else {
-            format!("📋 会话清除结果:\n{}\n", results.join("\n"))
+            // 使用 Markdown 列表语法，每条记录前加 `-` 前缀
+            let formatted_results: Vec<String> = results.iter()
+                .map(|r| format!("- {}", r))
+                .collect();
+            format!("📋 会话清除结果:\n{}\n", formatted_results.join("\n"))
         };
 
         CommandResult::Handled(CommandResponse::markdown(content))
