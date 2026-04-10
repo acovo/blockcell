@@ -30,7 +30,7 @@ pub use injector::{
 };
 
 /// 记忆提取配置
-pub const MIN_MESSAGES_FOR_EXTRACTION: usize = 10;
+pub const MIN_MESSAGES_FOR_EXTRACTION: usize = 15;
 pub const EXTRACTION_COOLDOWN_MESSAGES: usize = 5;
 pub const MAX_MEMORY_FILE_TOKENS: usize = 4000;
 

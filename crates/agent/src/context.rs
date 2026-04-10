@@ -309,6 +309,10 @@ impl ContextBuilder {
             let injection = injector.build_injection_content();
             if !injection.is_empty() {
                 prompt.push_str(&injection);
+
+                // 记录 Layer 5 injection_completed 事件
+                let (user, project, feedback, reference) = injector.memory_counts();
+                crate::memory_event!(layer5, injection_completed, user, project, feedback, reference);
             }
         }
 

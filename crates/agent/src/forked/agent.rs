@@ -16,6 +16,7 @@ use std::sync::Arc;
 use blockcell_core::types::ChatMessage;
 use blockcell_providers::ProviderPool;
 use super::{CacheSafeParams, CanUseToolFn, SubagentOverrides, create_subagent_context, ToolPermission};
+use crate::memory_event;
 
 /// Provider 获取重试配置
 const PROVIDER_RETRY_MAX_ATTEMPTS: usize = 3;
@@ -469,6 +470,8 @@ async fn execute_forked_tool(
     match can_use_tool(tool_name, input) {
         ToolPermission::Allow => {},
         ToolPermission::Deny { message } => {
+            // 记录 Layer 7 tool_denied 事件
+            crate::memory_event!(layer7, tool_denied, tool_name, &message);
             return Ok(format!("Tool '{}' denied: {}", tool_name, message));
         }
     }
@@ -755,17 +758,44 @@ pub async fn run_forked_agent(params: ForkedAgentParams) -> Result<ForkedAgentRe
         "[forked_agent] starting"
     );
 
-    // 获取 Provider（带重试和指数退避）
-    let provider_pool = params.provider_pool
-        .as_ref()
-        .ok_or(ForkedAgentError::NoProviderAvailable)?;
+    // 记录 Layer 7 agent_spawned 事件
+    memory_event!(layer7, agent_spawned,
+        params.fork_label,
+        params.max_turns.unwrap_or(5),
+        "main"
+    );
 
-    let provider = acquire_provider_with_retry(
+    // 获取 Provider（带重试和指数退避）
+    let provider_pool = match params.provider_pool.as_ref() {
+        Some(pool) => pool,
+        None => {
+            // 记录 Layer 7 agent_failed 事件（Provider 未配置）
+            memory_event!(layer7, agent_failed,
+                params.fork_label,
+                "no_provider",
+                0
+            );
+            return Err(ForkedAgentError::NoProviderAvailable);
+        }
+    };
+
+    let provider = match acquire_provider_with_retry(
         provider_pool,
         PROVIDER_RETRY_MAX_ATTEMPTS,
         PROVIDER_RETRY_INITIAL_DELAY_MS,
         PROVIDER_RETRY_MAX_DELAY_MS,
-    ).await?;
+    ).await {
+        Ok(p) => p,
+        Err(e) => {
+            // 记录 Layer 7 agent_failed 事件（Provider 获取失败）
+            memory_event!(layer7, agent_failed,
+                params.fork_label,
+                "provider_acquire_failed",
+                0
+            );
+            return Err(e);
+        }
+    };
 
     let max_turns = params.max_turns.unwrap_or(5);
     let mut current_messages = messages.clone();
@@ -778,6 +808,12 @@ pub async fn run_forked_agent(params: ForkedAgentParams) -> Result<ForkedAgentRe
                 fork_label = params.fork_label,
                 turn,
                 "[forked_agent] aborted"
+            );
+            // 记录 Layer 7 agent_failed 事件
+            memory_event!(layer7, agent_failed,
+                params.fork_label,
+                "aborted",
+                turn
             );
             return Err(ForkedAgentError::Aborted(
                 context.abort_controller.reason().unwrap_or_else(|| "Aborted".to_string())
@@ -793,6 +829,12 @@ pub async fn run_forked_agent(params: ForkedAgentParams) -> Result<ForkedAgentRe
                     turn,
                     error = %e,
                     "[forked_agent] LLM call failed"
+                );
+                // 记录 Layer 7 agent_failed 事件
+                memory_event!(layer7, agent_failed,
+                    params.fork_label,
+                    "llm_error",
+                    turn
                 );
                 return Err(ForkedAgentError::ProviderError(format!("{}", e)));
             }
@@ -914,6 +956,14 @@ pub async fn run_forked_agent(params: ForkedAgentParams) -> Result<ForkedAgentRe
         output_tokens = total_usage.output_tokens,
         cache_hit_rate = total_usage.cache_hit_rate(),
         "[forked_agent] completed"
+    );
+
+    // 记录 Layer 7 agent_completed 事件（带 duration）
+    memory_event!(layer7, agent_completed_with_duration,
+        params.fork_label,
+        max_turns,
+        total_usage.input_tokens + total_usage.output_tokens,
+        duration_ms
     );
 
     Ok(ForkedAgentResult {

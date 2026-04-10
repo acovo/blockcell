@@ -176,6 +176,16 @@ impl MemoryInjector {
     pub fn get_memory(&self, memory_type: MemoryType) -> Option<&String> {
         self.cache.get(&memory_type)
     }
+
+    /// 获取各类型记忆的统计信息 (user, project, feedback, reference)
+    /// 用于 Layer 5 injection_completed 事件
+    pub fn memory_counts(&self) -> (u64, u64, u64, u64) {
+        let user = if self.cache.contains_key(&MemoryType::User) { 1 } else { 0 };
+        let project = if self.cache.contains_key(&MemoryType::Project) { 1 } else { 0 };
+        let feedback = if self.cache.contains_key(&MemoryType::Feedback) { 1 } else { 0 };
+        let reference = if self.cache.contains_key(&MemoryType::Reference) { 1 } else { 0 };
+        (user, project, feedback, reference)
+    }
 }
 
 /// 截断内容到指定 token 数

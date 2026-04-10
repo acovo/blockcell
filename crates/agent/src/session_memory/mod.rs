@@ -48,7 +48,8 @@ pub fn get_session_memory_base_dir(workspace_dir: &std::path::Path) -> PathBuf {
 
 /// 获取 Session Memory 文件路径
 pub fn get_session_memory_file_path(workspace_dir: &std::path::Path, session_id: &str) -> PathBuf {
+    use blockcell_core::session_file_stem;
     get_session_memory_base_dir(workspace_dir)
-        .join(session_id)
+        .join(session_file_stem(session_id))
         .join("memory.md")
 }

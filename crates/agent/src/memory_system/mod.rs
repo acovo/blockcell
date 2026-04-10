@@ -11,6 +11,7 @@ use crate::session_memory::{
 use crate::response_cache::ContentReplacementState;
 use blockcell_core::types::ChatMessage;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 /// 后台任务句柄类型
@@ -60,6 +61,8 @@ pub struct MemorySystemState {
     pub skill_tracker: SkillTracker,
     /// 后台任务句柄列表 (用于追踪和取消)
     pub background_tasks: Vec<BackgroundTaskHandle>,
+    /// 是否需要重新加载游标状态（后台提取完成后设置）
+    pub needs_cursor_reload: bool,
 }
 
 impl Default for MemorySystemState {
@@ -72,6 +75,7 @@ impl Default for MemorySystemState {
             file_tracker: FileTracker::new(),
             skill_tracker: SkillTracker::new(),
             background_tasks: Vec::new(),
+            needs_cursor_reload: false,
         }
     }
 }
@@ -94,6 +98,8 @@ pub struct MemorySystem {
     session_id: String,
     /// 自动记忆提取游标管理器（缓存已加载的状态）
     cursor_manager: ExtractionCursorManager,
+    /// 游标重新加载标志（用于后台任务通知主线程）
+    cursor_reload_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MemorySystem {
@@ -114,6 +120,7 @@ impl MemorySystem {
             config_dir,
             session_id,
             cursor_manager,
+            cursor_reload_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -124,11 +131,25 @@ impl MemorySystem {
         self.mark_session_active().await
     }
 
+    /// 重新加载游标状态
+    ///
+    /// 在后台提取任务完成后调用，确保下次检查使用最新的游标状态。
+    pub async fn reload_cursors(&mut self) -> std::io::Result<()> {
+        self.cursor_manager.load().await?;
+        tracing::trace!("[memory_system] Cursor state reloaded");
+        Ok(())
+    }
+
     /// 获取会话目录路径
+    ///
+    /// 注意：session_id 中的冒号、斜杠等字符会被替换为下划线，以确保跨平台兼容性。
+    /// 例如：`cli:default` -> `cli_default`
     pub fn session_dir(&self) -> PathBuf {
+        use blockcell_core::session_file_stem;
+        let safe_session_id = session_file_stem(&self.session_id);
         self.workspace_dir
             .join("sessions")
-            .join(&self.session_id)
+            .join(safe_session_id)
     }
 
     /// 标记会话为活跃状态
@@ -255,6 +276,28 @@ impl MemorySystem {
     /// 检查是否有待处理的提取任务
     pub fn has_pending_extraction(&self) -> bool {
         self.state.has_pending_extraction
+    }
+
+    /// 标记需要重新加载游标状态
+    pub fn set_needs_cursor_reload(&mut self, needs_reload: bool) {
+        self.state.needs_cursor_reload = needs_reload;
+    }
+
+    /// 检查是否需要重新加载游标状态
+    pub fn needs_cursor_reload(&self) -> bool {
+        self.state.needs_cursor_reload
+    }
+
+    /// 获取游标重新加载标志（用于后台任务通知）
+    pub fn cursor_reload_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.cursor_reload_flag)
+    }
+
+    /// 检查并清除游标重新加载标志
+    ///
+    /// 如果后台任务设置了标志，返回 true 并清除标志。
+    fn check_and_clear_cursor_reload(&self) -> bool {
+        self.cursor_reload_flag.swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 获取配置
@@ -505,11 +548,28 @@ pub enum PostSamplingAction {
 }
 
 /// 检查是否应该触发记忆操作
+///
+/// ## 游标状态同步
+/// 如果后台任务设置了 `cursor_reload_flag`，会先重新加载游标状态。
+/// 这确保了后台提取任务完成后，主线程使用最新的游标状态。
 pub fn evaluate_memory_hooks(
-    memory_system: &MemorySystem,
+    memory_system: &mut MemorySystem,
     messages: &[ChatMessage],
     current_tokens: usize,
 ) -> PostSamplingAction {
+    // 检查是否需要重新加载游标状态（后台提取完成后）
+    if memory_system.check_and_clear_cursor_reload() {
+        // 注意：这里使用 block_in_place 是安全的，因为：
+        // 1. 这是在主 runtime 循环中调用，tokio runtime 已经存在
+        // 2. cursor_manager.load() 是快速操作（读取一个小文件）
+        // 3. 我们需要同步地获取最新状态才能做决策
+        if let Err(e) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(memory_system.reload_cursors())
+        }) {
+            tracing::warn!(error = %e, "[evaluate_memory_hooks] Failed to reload cursor state");
+        }
+    }
+
     // 1. 检查 Compact (最高优先级)
     if memory_system.should_compact(current_tokens) {
         return PostSamplingAction::Compact;

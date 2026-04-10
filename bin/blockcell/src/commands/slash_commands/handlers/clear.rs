@@ -57,8 +57,9 @@ impl SlashCommand for ClearCommand {
         }
 
         // 3. 清除 Session Memory 文件
-        // 使用 session_key 作为目录名，与 memory_system 保持一致
-        let session_dir = ctx.paths.workspace().join("sessions").join(&session_key);
+        // 使用 session_file_stem 确保路径兼容性（Windows 不允许冒号）
+        let safe_session_key = blockcell_core::session_file_stem(&session_key);
+        let session_dir = ctx.paths.workspace().join("sessions").join(&safe_session_key);
         let session_memory_path = session_dir.join("memory.md");
 
         if session_memory_path.exists() {
@@ -90,11 +91,49 @@ impl SlashCommand for ClearCommand {
             }
         }
 
-        // 5. 构建响应
+        // 5. 清除持久化的工具结果目录 (Layer 1 Tool Results)
+        let tool_results_dir = session_dir.join("tool-results");
+
+        if tool_results_dir.exists() {
+            match tokio::fs::remove_dir_all(&tool_results_dir).await {
+                Ok(_) => {
+                    results.push("✅ 工具结果文件已删除".to_string());
+                }
+                Err(e) => results.push(format!(
+                    "⚠️ 工具结果目录删除失败 (session: {}, path: {}): {}",
+                    session_key,
+                    tool_results_dir.display(),
+                    e
+                )),
+            }
+        }
+
+        // 6. 重置 session metrics 的实时状态值
+        // 这些是"当前状态"指标，清除会话后应该归零
+        let metrics = blockcell_agent::session_metrics::get_memory_metrics();
+        // Layer 1: 工具结果存储计数
+        metrics.layer1.update_stored_count(0);
+        // Layer 3: Session Memory 大小和章节数 (使用 update 方法避免增加计数)
+        metrics.layer3.update_current_size(0);
+        metrics.layer3.update_section_count(0);
+        // Layer 4: 当前 token 使用量
+        metrics.layer4.update_token_usage(0);
+        // Layer 7: Forked Agent 统计 (Spawned, Active, Completed, Failed 等)
+        metrics.layer7.reset();
+        tracing::debug!(
+            session_key = %session_key,
+            "[/clear] Session metrics real-time state reset completed"
+        );
+
+        // 7. 构建响应 (使用 Markdown 列表格式)
         let content = if results.is_empty() {
             "✅ 会话历史已清除 (无持久化数据)\n".to_string()
         } else {
-            format!("📋 会话清除结果:\n{}\n", results.join("\n"))
+            // 使用 Markdown 列表语法，每条记录前加 `-` 前缀
+            let formatted_results: Vec<String> = results.iter()
+                .map(|r| format!("- {}", r))
+                .collect();
+            format!("📋 会话清除结果:\n{}\n", formatted_results.join("\n"))
         };
 
         CommandResult::Handled(CommandResponse::markdown(content))

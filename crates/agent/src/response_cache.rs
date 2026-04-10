@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 
+// Import memory_event macro for Layer 1 metrics
+use crate::memory_event;
+
 /// Per-session cache for large list/table responses.
 ///
 /// When the LLM returns a long numbered/bulleted list, storing the full text in history
@@ -589,10 +592,15 @@ fn sanitize_tool_use_id(tool_use_id: &str) -> String {
 /// 清理 session_key 防止路径遍历攻击
 ///
 /// 清理策略：
-/// 1. 只保留字母、数字、连字符和下划线
-/// 2. 限制长度
+/// 1. 使用 session_file_stem 替换特殊字符为下划线
+/// 2. 只保留字母、数字、连字符和下划线
+/// 3. 限制长度
 fn sanitize_session_key(session_key: &str) -> String {
-    let sanitized: String = session_key
+    // 首先使用 session_file_stem 替换特殊字符（保持语义一致性）
+    let stem = blockcell_core::session_file_stem(session_key);
+
+    // 然后过滤掉任何剩余的危险字符（防御性编程）
+    let sanitized: String = stem
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
         .collect();
@@ -1191,6 +1199,9 @@ pub async fn apply_budget_async(
         return messages.to_vec();
     }
 
+    // 预算超限，记录 Layer 1 事件
+    memory_event!(layer1, budget_exceeded, total_size, budget, candidates.len());
+
     // 需要持久化哪些结果？
     let mut sorted_candidates: Vec<_> = candidates.iter().collect();
     sorted_candidates.sort_by(|a, b| b.size.cmp(&a.size));
@@ -1232,6 +1243,16 @@ pub async fn apply_budget_async(
         .await
         {
             Ok(result) => {
+                // 记录 Layer 1 持久化事件
+                memory_event!(layer1, persisted,
+                    &candidate.tool_use_id,
+                    result.original_size,
+                    result.preview.len()
+                );
+                // 更新当前存储计数
+                crate::session_metrics::get_memory_metrics()
+                    .layer1
+                    .increment_stored_count();
                 let message = build_large_tool_result_message(&result);
                 replacements.insert(candidate.tool_use_id.clone(), message);
             }

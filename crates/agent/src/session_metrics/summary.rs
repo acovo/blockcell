@@ -44,6 +44,10 @@ pub struct Layer1Summary {
     pub total_preview_size: u64,
     pub budget_exceeded_count: u64,
     pub average_compression: f64,
+    // 新增字段
+    pub max_tool_results: u64,
+    pub preview_size_limit: u64,
+    pub current_stored_results: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,6 +55,10 @@ pub struct Layer2Summary {
     pub trigger_count: u64,
     pub cleared_count: u64,
     pub kept_count: u64,
+    // 新增字段
+    pub gap_threshold_minutes: u64,
+    pub keep_recent: u64,
+    pub last_trigger_timestamp: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +66,11 @@ pub struct Layer3Summary {
     pub extraction_count: u64,
     pub load_count: u64,
     pub current_size: u64,
+    // 新增字段
+    pub max_total_tokens: u64,
+    pub max_section_length: u64,
+    pub last_extraction_timestamp: u64,
+    pub section_count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +82,15 @@ pub struct Layer4Summary {
     pub consecutive_failures: u64,
     pub average_compression_ratio: f64,
     pub cache_hit_rate: f64,
+    // 新增字段
+    pub token_budget: u64,
+    pub threshold_ratio: f64,
+    pub threshold_tokens: u64,
+    pub current_tokens: u64,
+    pub remaining_tokens: u64,
+    pub usage_percentage: f64,
+    pub last_compact_timestamp: u64,
+    pub total_recovery_budget: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +101,15 @@ pub struct Layer5Summary {
     pub feedback_memories: u64,
     pub reference_memories: u64,
     pub total_bytes_written: u64,
+    // 新增字段
+    pub min_messages: u64,
+    pub cooldown_messages: u64,
+    pub max_file_tokens: u64,
+    pub last_extraction_timestamp: u64,
+    pub user_bytes: u64,
+    pub project_bytes: u64,
+    pub feedback_bytes: u64,
+    pub reference_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +119,11 @@ pub struct Layer6Summary {
     pub memories_updated: u64,
     pub memories_deleted: u64,
     pub sessions_pruned: u64,
+    // 新增字段
+    pub dream_interval_hours: u64,
+    pub last_dream_timestamp: u64,
+    pub sessions_processed: u64,
+    pub consolidation_rate: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +134,13 @@ pub struct Layer7Summary {
     pub tool_denied_count: u64,
     pub total_tokens_used: u64,
     pub total_turns_used: u64,
+    // 新增字段
+    pub max_turns: u64,
+    pub active_count: u64,
+    pub avg_completion_time_ms: f64,
+    pub avg_tokens_per_agent: f64,
+    pub avg_turns: f64,
+    pub success_rate: f64,
 }
 
 /// Get a snapshot of all memory metrics.
@@ -114,16 +157,26 @@ pub fn get_metrics_summary() -> MetricsSummary {
             total_preview_size: m.layer1.total_preview_size(),
             budget_exceeded_count: m.layer1.budget_exceeded_count(),
             average_compression: m.layer1.average_compression(),
+            max_tool_results: m.layer1.max_tool_results(),
+            preview_size_limit: m.layer1.preview_size_limit(),
+            current_stored_results: m.layer1.current_stored_results(),
         },
         layer2: Layer2Summary {
             trigger_count: m.layer2.trigger_count(),
             cleared_count: m.layer2.cleared_count(),
             kept_count: m.layer2.kept_count(),
+            gap_threshold_minutes: m.layer2.gap_threshold_minutes(),
+            keep_recent: m.layer2.keep_recent(),
+            last_trigger_timestamp: m.layer2.last_trigger_timestamp(),
         },
         layer3: Layer3Summary {
             extraction_count: m.layer3.extraction_count(),
             load_count: m.layer3.load_count(),
             current_size: m.layer3.current_size(),
+            max_total_tokens: m.layer3.max_total_tokens(),
+            max_section_length: m.layer3.max_section_length(),
+            last_extraction_timestamp: m.layer3.last_extraction_timestamp(),
+            section_count: m.layer3.section_count(),
         },
         layer4: Layer4Summary {
             compact_count: m.layer4.compact_count(),
@@ -133,6 +186,14 @@ pub fn get_metrics_summary() -> MetricsSummary {
             consecutive_failures: m.layer4.consecutive_failures(),
             average_compression_ratio: m.layer4.average_compression_ratio(),
             cache_hit_rate: m.layer4.cache_hit_rate(),
+            token_budget: m.layer4.token_budget(),
+            threshold_ratio: m.layer4.threshold_ratio(),
+            threshold_tokens: m.layer4.threshold_tokens(),
+            current_tokens: m.layer4.current_tokens(),
+            remaining_tokens: m.layer4.remaining_tokens(),
+            usage_percentage: m.layer4.usage_percentage(),
+            last_compact_timestamp: m.layer4.last_compact_timestamp(),
+            total_recovery_budget: m.layer4.total_recovery_budget(),
         },
         layer5: Layer5Summary {
             extraction_count: m.layer5.extraction_count(),
@@ -141,6 +202,14 @@ pub fn get_metrics_summary() -> MetricsSummary {
             feedback_memories: m.layer5.feedback_memories(),
             reference_memories: m.layer5.reference_memories(),
             total_bytes_written: m.layer5.total_bytes_written(),
+            min_messages: m.layer5.min_messages(),
+            cooldown_messages: m.layer5.cooldown_messages(),
+            max_file_tokens: m.layer5.max_file_tokens(),
+            last_extraction_timestamp: m.layer5.last_extraction_timestamp(),
+            user_bytes: m.layer5.user_bytes(),
+            project_bytes: m.layer5.project_bytes(),
+            feedback_bytes: m.layer5.feedback_bytes(),
+            reference_bytes: m.layer5.reference_bytes(),
         },
         layer6: Layer6Summary {
             dream_count: m.layer6.dream_count(),
@@ -148,6 +217,10 @@ pub fn get_metrics_summary() -> MetricsSummary {
             memories_updated: m.layer6.memories_updated(),
             memories_deleted: m.layer6.memories_deleted(),
             sessions_pruned: m.layer6.sessions_pruned(),
+            dream_interval_hours: m.layer6.dream_interval_hours(),
+            last_dream_timestamp: m.layer6.last_dream_timestamp(),
+            sessions_processed: m.layer6.sessions_processed(),
+            consolidation_rate: m.layer6.consolidation_rate(),
         },
         layer7: Layer7Summary {
             spawned_count: m.layer7.spawned_count(),
@@ -156,6 +229,12 @@ pub fn get_metrics_summary() -> MetricsSummary {
             tool_denied_count: m.layer7.tool_denied_count(),
             total_tokens_used: m.layer7.total_tokens_used(),
             total_turns_used: m.layer7.total_turns_used(),
+            max_turns: m.layer7.max_turns(),
+            active_count: m.layer7.active_count(),
+            avg_completion_time_ms: m.layer7.avg_completion_time_ms(),
+            avg_tokens_per_agent: m.layer7.avg_tokens_per_agent(),
+            avg_turns: m.layer7.avg_turns(),
+            success_rate: m.layer7.success_rate(),
         },
         compact_circuit_breaker: CircuitBreakerSummary {
             state: compact_cb.state(),
@@ -219,21 +298,20 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
         output.push_str("║                                                               ║\n");
         output.push_str("║  📁 Layer 1: Tool Result Storage\n");
         output.push_str(&format!(
-            "║  ├─ Persisted: {} files\n",
-            summary.layer1.persisted_count
-        ));
-        output.push_str(&format!(
-            "║  ├─ Original: {} → Preview: {}\n",
-            format_bytes(summary.layer1.total_original_size),
-            format_bytes(summary.layer1.total_preview_size)
-        ));
-        output.push_str(&format!(
-            "║  ├─ Budget exceeded: {} times\n",
+            "║  ├─ Persisted: {} files | Budget exceeded: {}\n",
+            summary.layer1.persisted_count,
             summary.layer1.budget_exceeded_count
         ));
         output.push_str(&format!(
-            "║  └─ Compression: {:.1}%\n",
+            "║  ├─ Size: {} → {} preview ({:.1}% compression)\n",
+            format_bytes(summary.layer1.total_original_size),
+            format_bytes(summary.layer1.total_preview_size),
             summary.layer1.average_compression * 100.0
+        ));
+        output.push_str(&format!(
+            "║  └─ Limits: max_results={}, preview_limit={}\n",
+            summary.layer1.max_tool_results,
+            format_bytes(summary.layer1.preview_size_limit)
         ));
     }
 
@@ -242,14 +320,16 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
         output.push_str("║                                                               ║\n");
         output.push_str("║  ⚡ Layer 2: Micro Compact\n");
         output.push_str(&format!(
-            "║  ├─ Triggered: {} times\n",
-            summary.layer2.trigger_count
+            "║  ├─ Triggered: {} times | Cleared: {} | Kept: {}\n",
+            summary.layer2.trigger_count,
+            summary.layer2.cleared_count,
+            summary.layer2.kept_count
         ));
         output.push_str(&format!(
-            "║  ├─ Cleared: {} items\n",
-            summary.layer2.cleared_count
+            "║  └─ Config: gap={}min, keep_recent={}\n",
+            summary.layer2.gap_threshold_minutes,
+            summary.layer2.keep_recent
         ));
-        output.push_str(&format!("║  └─ Kept: {} items\n", summary.layer2.kept_count));
     }
 
     // Layer 3
@@ -257,17 +337,23 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
         output.push_str("║                                                               ║\n");
         output.push_str("║  📝 Layer 3: Session Memory\n");
         output.push_str(&format!(
-            "║  ├─ Extractions: {}\n",
-            summary.layer3.extraction_count
+            "║  ├─ Extractions: {} | Loads: {}\n",
+            summary.layer3.extraction_count,
+            summary.layer3.load_count
         ));
-        output.push_str(&format!("║  ├─ Loads: {}\n", summary.layer3.load_count));
         output.push_str(&format!(
-            "║  └─ Current size: {}\n",
-            format_bytes(summary.layer3.current_size)
+            "║  ├─ Current: {} ({} sections)\n",
+            format_bytes(summary.layer3.current_size),
+            summary.layer3.section_count
+        ));
+        output.push_str(&format!(
+            "║  └─ Limits: max_total={:.0}K tokens, max_section={} chars\n",
+            summary.layer3.max_total_tokens as f64 / 1000.0,
+            summary.layer3.max_section_length
         ));
     }
 
-    // Layer 4
+    // Layer 4 - 重点层
     if layer_filter.is_none() || layer_filter == Some(4) {
         let success_rate = if summary.layer4.compact_count > 0 {
             1.0 - (summary.layer4.failed_count as f64 / summary.layer4.compact_count as f64)
@@ -277,8 +363,27 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
 
         output.push_str("║                                                               ║\n");
         output.push_str("║  🗜️  Layer 4: Full Compact\n");
+        // Token Budget 信息
         output.push_str(&format!(
-            "║  ├─ Total: {} (auto: {}, manual: {})\n",
+            "║  ├─ Token Budget: {}\n",
+            summary.layer4.token_budget
+        ));
+        output.push_str(&format!(
+            "║  │   ├─ Threshold: {} ({:.0}%)\n",
+            summary.layer4.threshold_tokens,
+            summary.layer4.threshold_ratio * 100.0
+        ));
+        output.push_str(&format!(
+            "║  │   ├─ Current: {} ({:.1}%)\n",
+            summary.layer4.current_tokens,
+            summary.layer4.usage_percentage
+        ));
+        output.push_str(&format!(
+            "║  │   └─ Remaining: {}\n",
+            summary.layer4.remaining_tokens
+        ));
+        output.push_str(&format!(
+            "║  ├─ Compacts: {} (auto: {}, manual: {})\n",
             summary.layer4.compact_count,
             summary.layer4.auto_compact_count,
             summary.layer4.manual_compact_count
@@ -307,15 +412,21 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
             summary.layer5.extraction_count
         ));
         output.push_str(&format!(
-            "║  ├─ Memories: user({}), project({}), feedback({}), ref({})\n",
+            "║  ├─ Memories: user({})/project({})/feedback({})/ref({})\n",
             summary.layer5.user_memories,
             summary.layer5.project_memories,
             summary.layer5.feedback_memories,
             summary.layer5.reference_memories
         ));
         output.push_str(&format!(
-            "║  └─ Storage: {}\n",
+            "║  ├─ Storage: {} total\n",
             format_bytes(summary.layer5.total_bytes_written)
+        ));
+        output.push_str(&format!(
+            "║  └─ Config: min_msg={}, cooldown={}, max_file={:.0}K tokens\n",
+            summary.layer5.min_messages,
+            summary.layer5.cooldown_messages,
+            summary.layer5.max_file_tokens as f64 / 1000.0
         ));
     }
 
@@ -334,8 +445,13 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
             summary.layer6.memories_deleted
         ));
         output.push_str(&format!(
-            "║  └─ Sessions pruned: {}\n",
+            "║  ├─ Sessions processed: {} | Pruned: {}\n",
+            summary.layer6.sessions_processed,
             summary.layer6.sessions_pruned
+        ));
+        output.push_str(&format!(
+            "║  └─ Consolidation rate: {:.1}\n",
+            summary.layer6.consolidation_rate
         ));
     }
 
@@ -344,20 +460,28 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
         output.push_str("║                                                               ║\n");
         output.push_str("║  🤖 Layer 7: Forked Agent\n");
         output.push_str(&format!(
-            "║  ├─ Spawned: {}\n",
-            summary.layer7.spawned_count
+            "║  ├─ Spawned: {} | Active: {} | Completed: {} | Failed: {}\n",
+            summary.layer7.spawned_count,
+            summary.layer7.active_count,
+            summary.layer7.completed_count,
+            summary.layer7.failed_count
         ));
         output.push_str(&format!(
-            "║  ├─ Completed: {} / Failed: {}\n",
-            summary.layer7.completed_count, summary.layer7.failed_count
+            "║  ├─ Success rate: {:.1}%\n",
+            summary.layer7.success_rate * 100.0
         ));
         output.push_str(&format!(
-            "║  ├─ Tool denied: {}\n",
+            "║  ├─ Avg tokens: {:.0} | Avg turns: {:.1}\n",
+            summary.layer7.avg_tokens_per_agent,
+            summary.layer7.avg_turns
+        ));
+        output.push_str(&format!(
+            "║  ├─ Avg duration: {:.1}s\n",
+            summary.layer7.avg_completion_time_ms / 1000.0
+        ));
+        output.push_str(&format!(
+            "║  └─ Tool denied: {}\n",
             summary.layer7.tool_denied_count
-        ));
-        output.push_str(&format!(
-            "║  └─ Tokens used: {}\n",
-            format_bytes(summary.layer7.total_tokens_used)
         ));
     }
 

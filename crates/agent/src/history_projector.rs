@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 use crate::token::{estimate_tokens};
+use crate::memory_event;
 
 /// 历史分析结果
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,7 +218,13 @@ impl<'a> HistoryProjector<'a> {
         query_source: Option<&str>,
         config: &TimeBasedMCConfig,
     ) -> Option<Vec<ChatMessage>> {
-        let _trigger = self.evaluate_time_based_trigger(last_assistant_timestamp, query_source, config)?;
+        let trigger = self.evaluate_time_based_trigger(last_assistant_timestamp, query_source, config)?;
+
+        // 记录 Layer 2 触发事件
+        memory_event!(layer2, triggered,
+            trigger.gap_minutes,
+            config.gap_threshold_minutes
+        );
 
         // 收集可压缩的工具 ID
         let compactable_ids = collect_compactable_tool_ids(self.history);
@@ -245,12 +252,18 @@ impl<'a> HistoryProjector<'a> {
             return None;
         }
 
+        let cleared_count = clear_set.len() as u64;
+        let kept_count = keep_set.len() as u64;
+
         // 修改消息内容
         let result = self
             .history
             .iter()
             .map(|message| maybe_clear_tool_result(message, &clear_set))
             .collect();
+
+        // 记录 Layer 2 清理完成事件
+        memory_event!(layer2, cleared, cleared_count, kept_count);
 
         Some(result)
     }
