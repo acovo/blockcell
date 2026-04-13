@@ -228,6 +228,87 @@ BlockCell 支持多种 AI 智能体应用场景：
 | `providers` | OpenAI/DeepSeek/Anthropic 等 LLM 客户端        |
 | `storage`   | SQLite 持久化 (会话、记忆、审计日志)           |
 
+---
+
+<!-- currentDate: 2026/04/13 -->
+
+## Intent 分类器详解
+
+BlockCell 使用意图分类器来智能选择工具集，根据用户消息内容自动判断需要加载哪些工具。
+
+### Intent 分类流程
+
+```text
+用户消息 → IntentClassifier.classify() → IntentCategory[]
+         → IntentToolResolver.resolve_tool_names() → 工具列表
+```
+
+### Intent 配置
+
+在 `config.json5` 中配置意图路由：
+
+```json
+{
+  "intentRouter": {
+    "enabled": true,           // 是否启用意图分类（默认 true）
+    "loadAllTools": false,     // 当 enabled=false 时，是否全量加载
+    "defaultProfile": "default",
+    "profiles": {
+      "default": {
+        "coreTools": ["read_file", "write_file"],
+        "intentTools": {
+          "Chat": { "inheritBase": false, "tools": [] },
+          "FileOps": ["edit_file", "exec"],
+          "WebSearch": ["web_search", "web_fetch"]
+        },
+        "denyTools": ["delete_file"]
+      }
+    }
+  }
+}
+```
+
+### loadAllTools 配置项 (v0.1.5+)
+
+当 `enabled=false` 时，可选择工具加载策略：
+
+| enabled | loadAllTools | 行为 |
+| ------- | ------------ | ---- |
+| true | * | 意图分类 + 按意图加载工具（默认） |
+| false | false | 不分类 + 走 Unknown profile |
+| false | true | 不分类 + 全量加载所有工具 |
+
+**使用场景**:
+
+- `loadAllTools=true`: 让 LLM 自己选择工具，适合支持 Prompt Caching 的场景
+- `loadAllTools=false`: 由 Unknown profile 配置决定工具，适合精细化控制
+
+### Intent 分类类别
+
+| 类别 | 触发关键词 | 典型工具 |
+| ---- | ---------- | -------- |
+| Chat | 闲聊、问候 | 无（纯对话） |
+| FileOps | 文件、代码、编辑 | read_file, write_file, exec |
+| WebSearch | 搜索、查询、网页 | web_search, web_fetch |
+| Finance | 股票、行情、告警 | alert_rule |
+| DataAnalysis | 数据、图表、分析 | data_process |
+| Communication | 邮件、消息、通知 | email, message |
+| Organization | 日程、任务、记忆 | cron, memory_* |
+
+### deny_tools 安全过滤
+
+无论使用哪种模式，`deny_tools` 配置都会生效，确保危险工具被过滤：
+
+```json
+{
+  "profiles": {
+    "default": {
+      "denyTools": ["exec", "delete_file", "shell"]
+    }
+  }
+}
+```
+
 ## 常用命令
 
 ```bash
