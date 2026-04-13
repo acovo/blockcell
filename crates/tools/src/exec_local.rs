@@ -92,6 +92,17 @@ pub(crate) fn resolve_script_path(skill_dir: &Path, relative_path: &str) -> Resu
         ));
     }
 
+    // Strip \\?\ prefix on Windows for command-line compatibility.
+    // canonicalize() adds this prefix on Windows for long path support,
+    // but it causes issues when passed to subprocess via command line.
+    #[cfg(windows)]
+    {
+        let path_str = canonical_target.to_string_lossy();
+        if let Some(stripped) = path_str.strip_prefix("\\\\?\\") {
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+
     Ok(canonical_target)
 }
 
@@ -211,6 +222,24 @@ impl Tool for ExecLocalTool {
 
         let mut command = if let Some(runner) = effective_runner {
             let mut command = Command::new(runner);
+            // For `uv`, use `uv run -- python3 -X utf8 <script>` to:
+            // 1. Enable uv's dependency management
+            // 2. Force UTF-8 mode (uv doesn't pass PYTHONIOENCODING to subprocess)
+            if runner == "uv" {
+                command.arg("run");
+                command.arg("--");
+                command.arg("python3");
+                command.arg("-X");
+                command.arg("utf8");
+            } else if runner == "python3" || runner == "python" {
+                // On Windows, python3 needs -X utf8 flag to handle UTF-8 output properly
+                // (MSYS2/MinGW python3 ignores PYTHONIOENCODING env var)
+                #[cfg(windows)]
+                {
+                    command.arg("-X");
+                    command.arg("utf8");
+                }
+            }
             command.arg(&resolved_path);
             command
         } else {
@@ -246,18 +275,43 @@ impl Tool for ExecLocalTool {
             "... (stderr truncated)",
         );
 
-        let command_parts = std::iter::once(
-            effective_runner
-                .map(str::to_string)
-                .unwrap_or_else(|| resolved_path.display().to_string()),
-        )
-        .chain(if effective_runner.is_some() {
-            Some(resolved_path.display().to_string())
+        // Build command_parts for logging/output: `runner [run -- python3 -X utf8] script [args...]`
+        let command_parts: Vec<String> = if effective_runner == Some("uv") {
+            vec![
+                "uv".to_string(),
+                "run".to_string(),
+                "--".to_string(),
+                "python3".to_string(),
+                "-X".to_string(),
+                "utf8".to_string(),
+                resolved_path.display().to_string(),
+            ]
+            .into_iter()
+            .chain(args.iter().cloned())
+            .collect()
+        } else if effective_runner == Some("python3") || effective_runner == Some("python") {
+            // On Windows, python3 needs -X utf8 flag to handle UTF-8 output properly
+            std::iter::once(effective_runner.map(str::to_string))
+                .flatten()
+                .chain(if cfg!(windows) {
+                    vec!["-X".to_string(), "utf8".to_string()]
+                } else {
+                    vec![]
+                })
+                .chain(Some(resolved_path.display().to_string()))
+                .chain(args.iter().cloned())
+                .collect()
         } else {
-            None
-        })
-        .chain(args.iter().cloned())
-        .collect::<Vec<_>>();
+            std::iter::once(effective_runner.map(str::to_string))
+                .flatten()
+                .chain(if effective_runner.is_some() {
+                    Some(resolved_path.display().to_string())
+                } else {
+                    None
+                })
+                .chain(args.iter().cloned())
+                .collect()
+        };
 
         Ok(json!({
             "exit_code": output.status.code(),
