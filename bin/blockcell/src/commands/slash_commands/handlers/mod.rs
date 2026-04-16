@@ -5,8 +5,8 @@
 mod clear;
 mod compact;
 mod help;
-mod log;
 mod learn;
+mod log;
 mod quit;
 mod session_metrics;
 mod skill_mgmt;

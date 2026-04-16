@@ -3,9 +3,7 @@ use blockcell_core::Paths;
 /// Check if file is a log file (agent.log or agent.log.YYYY-MM-DD)
 fn is_log_file(path: &std::path::Path) -> bool {
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    file_name == "agent.log"
-        || file_name.starts_with("agent.log.")
-        || file_name.ends_with(".jsonl")
+    file_name == "agent.log" || file_name.starts_with("agent.log.") || file_name.ends_with(".jsonl")
 }
 
 /// Show recent agent logs.
@@ -176,7 +174,7 @@ pub async fn clear(force: bool) -> anyhow::Result<()> {
 
     if !logs_dir.exists() {
         println!("(No logs)");
-        return Ok(())
+        return Ok(());
     }
 
     if !force {

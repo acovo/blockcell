@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use crate::commands::slash_commands::handlers::{
     ClearCommand, ClearSkillsCommand, CompactCommand, ExitCommand, ForgetSkillCommand, HelpCommand,
-    LearnCommand, LogCommand, QuitCommand, SessionMetricsCommand, SkillsCommand, TasksCommand, ToolsCommand,
+    LearnCommand, LogCommand, QuitCommand, SessionMetricsCommand, SkillsCommand, TasksCommand,
+    ToolsCommand,
 };
 
 /// 创建默认命令处理器

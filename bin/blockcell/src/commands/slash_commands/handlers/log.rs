@@ -3,20 +3,24 @@
 //! 动态控制日志系统。
 
 use crate::commands::slash_commands::*;
-use blockcell_core::logging::{LOG_CONTROLLER, clear_all_logs};
-use blockcell_core::{Paths, Config};
+use blockcell_core::logging::{clear_all_logs, LOG_CONTROLLER};
+use blockcell_core::{Config, Paths};
 
 /// /log 命令 - 控制日志系统
 pub struct LogCommand;
 
 /// 同步日志配置到配置文件
-fn sync_config_to_file(level: Option<&str>, console_enabled: Option<bool>, file_enabled: Option<bool>) -> Result<(), String> {
+fn sync_config_to_file(
+    level: Option<&str>,
+    console_enabled: Option<bool>,
+    file_enabled: Option<bool>,
+) -> Result<(), String> {
     let paths = Paths::default();
     let config_path = paths.config_file();
 
     // 加载现有配置
-    let mut config = Config::load(&config_path)
-        .map_err(|e| format!("Failed to load config: {}", e))?;
+    let mut config =
+        Config::load(&config_path).map_err(|e| format!("Failed to load config: {}", e))?;
 
     // 更新日志配置
     if let Some(level) = level {
@@ -30,7 +34,8 @@ fn sync_config_to_file(level: Option<&str>, console_enabled: Option<bool>, file_
     }
 
     // 保存配置
-    config.save(&config_path)
+    config
+        .save(&config_path)
         .map_err(|e| format!("Failed to save config: {}", e))?;
 
     Ok(())
@@ -66,30 +71,31 @@ impl SlashCommand for LogCommand {
                         if let Err(e) = sync_config_to_file(Some(&level), None, None) {
                             tracing::warn!("Failed to sync log config: {}", e);
                         }
-                        CommandResult::Handled(CommandResponse::markdown(
-                            format!("✓ Log level set to {} (config saved)", level)
-                        ))
-                    },
+                        CommandResult::Handled(CommandResponse::markdown(format!(
+                            "✓ Log level set to {} (config saved)",
+                            level
+                        )))
+                    }
                     Err(e) => CommandResult::Error(e),
                 }
             }
-            LogAction::SetFilter(filter) => {
-                match controller.set_filter(&filter) {
-                    Ok(_) => CommandResult::Handled(CommandResponse::markdown(
-                        format!("✓ Filter set: {}", filter)
-                    )),
-                    Err(e) => CommandResult::Error(e),
-                }
-            }
+            LogAction::SetFilter(filter) => match controller.set_filter(&filter) {
+                Ok(_) => CommandResult::Handled(CommandResponse::markdown(format!(
+                    "✓ Filter set: {}",
+                    filter
+                ))),
+                Err(e) => CommandResult::Error(e),
+            },
             LogAction::Console(on) => {
                 controller.set_console(on);
                 // 同步配置到文件
                 if let Err(e) = sync_config_to_file(None, Some(on), None) {
                     tracing::warn!("Failed to sync log config: {}", e);
                 }
-                CommandResult::Handled(CommandResponse::markdown(
-                    format!("✓ Console output: {} (config saved)", if on { "ON" } else { "OFF" })
-                ))
+                CommandResult::Handled(CommandResponse::markdown(format!(
+                    "✓ Console output: {} (config saved)",
+                    if on { "ON" } else { "OFF" }
+                )))
             }
             LogAction::File(on) => {
                 controller.set_file(on);
@@ -97,20 +103,22 @@ impl SlashCommand for LogCommand {
                 if let Err(e) = sync_config_to_file(None, None, Some(on)) {
                     tracing::warn!("Failed to sync log config: {}", e);
                 }
-                CommandResult::Handled(CommandResponse::markdown(
-                    format!("✓ File output: {} (config saved)", if on { "ON" } else { "OFF" })
-                ))
+                CommandResult::Handled(CommandResponse::markdown(format!(
+                    "✓ File output: {} (config saved)",
+                    if on { "ON" } else { "OFF" }
+                )))
             }
             LogAction::Clear => {
                 let paths = Paths::default();
                 let (count, size) = clear_all_logs(&paths.logs_dir());
                 let size_mb = size as f64 / 1024.0 / 1024.0;
-                CommandResult::Handled(CommandResponse::markdown(
-                    format!("✓ Cleared {} log files ({:.2} MB)", count, size_mb)
-                ))
+                CommandResult::Handled(CommandResponse::markdown(format!(
+                    "✓ Cleared {} log files ({:.2} MB)",
+                    count, size_mb
+                )))
             }
             LogAction::Unknown => CommandResult::Handled(CommandResponse::markdown(
-                "Unknown /log command. Use /log help for usage.".to_string()
+                "Unknown /log command. Use /log help for usage.".to_string(),
             )),
         }
     }
@@ -173,7 +181,8 @@ enum LogAction {
 
 /// 显示帮助
 fn show_help() -> CommandResult {
-    CommandResult::Handled(CommandResponse::markdown(r#"## /log 命令帮助
+    CommandResult::Handled(CommandResponse::markdown(
+        r#"## /log 命令帮助
 
 ### 基本用法
 - `/log status` - 显示当前日志配置（包括文件统计）
@@ -236,7 +245,9 @@ fn show_help() -> CommandResult {
 # 清理所有日志文件
 /log clear
 ```
-"#.to_string()))
+"#
+        .to_string(),
+    ))
 }
 
 /// 显示状态（包括日志文件统计）
@@ -255,8 +266,7 @@ fn show_status(controller: &blockcell_core::logging::LogController) -> CommandRe
             let path = entry.path();
             // 匹配 agent.log 或 agent.log.YYYY-MM-DD 格式
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let is_log_file = file_name == "agent.log"
-                || file_name.starts_with("agent.log.");
+            let is_log_file = file_name == "agent.log" || file_name.starts_with("agent.log.");
 
             if path.is_file() && is_log_file {
                 if let Ok(metadata) = entry.metadata() {
@@ -285,7 +295,9 @@ fn show_status(controller: &blockcell_core::logging::LogController) -> CommandRe
         if status.module_filters.is_empty() {
             "(none)".to_string()
         } else {
-            status.module_filters.iter()
+            status
+                .module_filters
+                .iter()
                 .map(|f| format!("`{}`", f))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -316,18 +328,33 @@ mod tests {
 
     #[test]
     fn test_parse_log_command_console() {
-        assert!(matches!(parse_log_command("console on"), LogAction::Console(true)));
-        assert!(matches!(parse_log_command("console off"), LogAction::Console(false)));
+        assert!(matches!(
+            parse_log_command("console on"),
+            LogAction::Console(true)
+        ));
+        assert!(matches!(
+            parse_log_command("console off"),
+            LogAction::Console(false)
+        ));
     }
 
     #[test]
     fn test_parse_log_command_file() {
-        assert!(matches!(parse_log_command("file on"), LogAction::File(true)));
-        assert!(matches!(parse_log_command("file off"), LogAction::File(false)));
+        assert!(matches!(
+            parse_log_command("file on"),
+            LogAction::File(true)
+        ));
+        assert!(matches!(
+            parse_log_command("file off"),
+            LogAction::File(false)
+        ));
     }
 
     #[test]
     fn test_parse_log_command_filter() {
-        assert!(matches!(parse_log_command("blockcell_agent=trace"), LogAction::SetFilter(_)));
+        assert!(matches!(
+            parse_log_command("blockcell_agent=trace"),
+            LogAction::SetFilter(_)
+        ));
     }
 }

@@ -6,16 +6,19 @@
 //! - 日志等级动态调整（trace/debug/info/warn/error/off）
 //! - 模块过滤（如 blockcell_agent=trace）
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, Duration};
-use std::io::Write;
+use std::time::{Duration, SystemTime};
 
 use tracing::Subscriber;
-use tracing_subscriber::{reload, EnvFilter, Registry, layer::{Layer, Context}};
-use tracing_subscriber::registry::LookupSpan;
 use tracing_appender::rolling::RollingFileAppender;
 use tracing_appender::rolling::Rotation;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{
+    layer::{Context, Layer},
+    reload, EnvFilter, Registry,
+};
 
 /// 全局日志控制器单例
 pub static LOG_CONTROLLER: OnceLock<LogController> = OnceLock::new();
@@ -84,17 +87,20 @@ impl LogController {
 
     /// 获取当前状态
     pub fn status(&self) -> LogStatus {
-        let current_filter = self.filter_handle.with_current(|f| {
-            f.to_string()
-        }).unwrap_or_default();
+        let current_filter = self
+            .filter_handle
+            .with_current(|f| f.to_string())
+            .unwrap_or_default();
 
         let parts: Vec<&str> = current_filter.split(',').collect();
-        let level = parts.first()
+        let level = parts
+            .first()
             .map(|s| s.split('=').next().unwrap_or("info"))
             .unwrap_or("info")
             .to_string();
 
-        let module_filters = parts.iter()
+        let module_filters = parts
+            .iter()
             .filter(|p| p.contains('='))
             .map(|s| s.to_string())
             .collect();
@@ -143,10 +149,7 @@ where
         let _ = writeln!(
             stdout,
             "{} [{}] {}: {}",
-            timestamp,
-            level,
-            module,
-            visitor.message
+            timestamp, level, module, visitor.message
         );
     }
 }
@@ -188,10 +191,7 @@ where
         let _ = writeln!(
             writer,
             "{} [{}] {}: {}",
-            timestamp,
-            level,
-            module,
-            visitor.message
+            timestamp, level, module, visitor.message
         );
     }
 }
@@ -203,7 +203,9 @@ struct MessageVisitor {
 
 impl MessageVisitor {
     fn new() -> Self {
-        Self { message: String::new() }
+        Self {
+            message: String::new(),
+        }
     }
 }
 
@@ -254,12 +256,11 @@ pub fn init_logging(
         filter_handle,
         console_enabled: console_enabled_flag,
         file_enabled: file_enabled_flag,
-        current_file: Arc::new(Mutex::new(
-            logs_dir.join("agent.log").display().to_string()
-        )),
+        current_file: Arc::new(Mutex::new(logs_dir.join("agent.log").display().to_string())),
     };
 
-    LOG_CONTROLLER.set(controller)
+    LOG_CONTROLLER
+        .set(controller)
         .map_err(|_| "Log controller already initialized")?;
 
     Ok(())
@@ -274,8 +275,7 @@ pub fn cleanup_old_logs(logs_dir: &Path, retention_days: u64) {
             let path = entry.path();
             // 匹配 agent.log 或 agent.log.YYYY-MM-DD 格式
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let is_log_file = file_name == "agent.log"
-                || file_name.starts_with("agent.log.");
+            let is_log_file = file_name == "agent.log" || file_name.starts_with("agent.log.");
 
             if path.is_file() && is_log_file {
                 if let Ok(metadata) = entry.metadata() {
@@ -300,8 +300,7 @@ pub fn clear_all_logs(logs_dir: &Path) -> (usize, u64) {
             let path = entry.path();
             // 匹配 agent.log 或 agent.log.YYYY-MM-DD 格式
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let is_log_file = file_name == "agent.log"
-                || file_name.starts_with("agent.log.");
+            let is_log_file = file_name == "agent.log" || file_name.starts_with("agent.log.");
 
             if path.is_file() && is_log_file {
                 // 先获取文件大小

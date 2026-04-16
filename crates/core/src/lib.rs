@@ -1,7 +1,7 @@
-pub mod logging;
 pub mod capability;
 pub mod config;
 pub mod error;
+pub mod logging;
 pub mod mcp_config;
 pub mod message;
 pub mod path_policy;

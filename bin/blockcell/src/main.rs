@@ -1,8 +1,8 @@
 mod commands;
 
-use clap::{Parser, Subcommand};
 use blockcell_core::logging;
 use blockcell_core::Paths;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "blockcell")]

@@ -2172,11 +2172,15 @@ impl Config {
                 } else {
                     // log section exists, check for missing fields
                     if !raw.contains("consoleEnabled") {
-                        tracing::info!("Adding missing consoleEnabled field to log config (default: true)");
+                        tracing::info!(
+                            "Adding missing consoleEnabled field to log config (default: true)"
+                        );
                         needs_save = true;
                     }
                     if !raw.contains("fileEnabled") {
-                        tracing::info!("Adding missing fileEnabled field to log config (default: false)");
+                        tracing::info!(
+                            "Adding missing fileEnabled field to log config (default: false)"
+                        );
                         needs_save = true;
                     }
                     if !raw.contains("level") {
