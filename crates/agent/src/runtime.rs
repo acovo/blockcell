@@ -2780,7 +2780,7 @@ impl AgentRuntime {
             return Ok(final_response.to_string());
         }
 
-        if msg.channel == "ws" {
+        if msg.channel == "ws" || msg.channel == "cli" {
             if let Some(ref event_tx) = self.event_tx {
                 let event = serde_json::json!({
                     "type": "message_done",
@@ -3717,9 +3717,6 @@ impl AgentRuntime {
                 finish_reason = %response.finish_reason,
                 "LLM response received"
             );
-            if let Some(ref content) = response.content {
-                info!(target: "chat::response", content = %content, "LLM response content");
-            }
             debug!(target: "chat::response", response = serde_json::to_string(&response).unwrap_or_default(), "Response detail");
 
             // Handle tool calls
