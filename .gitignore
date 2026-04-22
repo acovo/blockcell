@@ -93,3 +93,6 @@ Thumbs.db
 *.temp
 *.log
 *.bak
+# Added by code-review-graph
+.code-review-graph/
+.mcp.json

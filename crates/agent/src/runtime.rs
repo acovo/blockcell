@@ -2706,6 +2706,7 @@ impl AgentRuntime {
             cron_deliver_target,
         } = ctx;
         let final_response = strip_fake_tool_calls(final_response.trim());
+        info!(target: "chat::output", content = %final_response, "Final response");
 
         if let Some(stub) = self
             .response_cache
@@ -2779,7 +2780,7 @@ impl AgentRuntime {
             return Ok(final_response.to_string());
         }
 
-        if msg.channel == "ws" {
+        if msg.channel == "ws" || msg.channel == "cli" {
             if let Some(ref event_tx) = self.event_tx {
                 let event = serde_json::json!({
                     "type": "message_done",
@@ -3062,6 +3063,7 @@ impl AgentRuntime {
             session_key.clone()
         };
         info!(session_key = %session_key, "Processing message");
+        info!(target: "chat::user", content = %msg.content, "User input");
         self.update_main_session_target(&msg);
 
         // ── Refresh memory injector cache if Layer 5 extraction completed ──

@@ -457,12 +457,14 @@ pub async fn run(
         let event_handler = tokio::spawn(async move {
             use std::io::Write;
             let mut stdout = std::io::stdout();
+            let mut emitted_text_delta = false;
             while let Ok(event_str) = event_rx.recv().await {
                 if let Ok(event) = serde_json::from_str::<serde_json::Value>(&event_str) {
                     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     match event_type {
                         "token" => {
                             if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                emitted_text_delta = true;
                                 print!("{}", delta);
                                 let _ = stdout.flush();
                             }
@@ -479,7 +481,16 @@ pub async fn run(
                             }
                         }
                         "message_done" => {
+                            if !emitted_text_delta {
+                                if let Some(content) = event.get("content").and_then(|v| v.as_str())
+                                {
+                                    if !content.is_empty() {
+                                        println!("\n{}", content);
+                                    }
+                                }
+                            }
                             println!();
+                            emitted_text_delta = false;
                         }
                         _ => {}
                     }
@@ -701,6 +712,10 @@ pub async fn run(
         let event_handler_handle = tokio::spawn(async move {
             use std::io::Write;
             let mut stdout = std::io::stdout();
+            // Track whether streaming tokens were emitted for the current response.
+            // If true, message_done should NOT reprint the content (avoid duplicate).
+            // If false (non-streaming path like skill loops), message_done prints content.
+            let mut emitted_text_delta = false;
             while let Ok(event_str) = event_rx.recv().await {
                 if let Ok(event) = serde_json::from_str::<serde_json::Value>(&event_str) {
                     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -708,6 +723,7 @@ pub async fn run(
                         "token" => {
                             // Streaming text token - print immediately
                             if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                emitted_text_delta = true;
                                 print!("{}", delta);
                                 let _ = stdout.flush();
                             }
@@ -729,8 +745,18 @@ pub async fn run(
                             }
                         }
                         "message_done" => {
+                            if !emitted_text_delta {
+                                // Non-streaming response (e.g. skill loops): print content
+                                if let Some(content) = event.get("content").and_then(|v| v.as_str())
+                                {
+                                    if !content.is_empty() {
+                                        println!("\n{}", content);
+                                    }
+                                }
+                            }
                             // Message complete - print newline
                             println!();
+                            emitted_text_delta = false;
                         }
                         _ => {}
                     }
@@ -751,10 +777,8 @@ pub async fn run(
             while let Some(msg) = outbound_rx.recv().await {
                 match msg.channel.as_str() {
                     "cli" => {
-                        // Print content if present (skill loops use non-streaming calls)
-                        if !msg.content.is_empty() {
-                            let _ = printer_tx.send(msg).await;
-                        }
+                        // CLI messages are already printed via streaming events (token),
+                        // skip to avoid duplicate output.
                     }
                     "cron" => {
                         let _ = printer_tx.send(msg).await;
