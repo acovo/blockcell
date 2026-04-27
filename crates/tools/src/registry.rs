@@ -31,6 +31,7 @@ use crate::network_monitor::NetworkMonitorTool;
 use crate::ocr::OcrTool;
 use crate::office_write::OfficeWriteTool;
 use crate::session_recall::SessionRecallTool;
+use crate::skill_manage::SkillManageTool;
 use crate::skills::ListSkillsTool;
 use crate::spawn::SpawnTool;
 use crate::stream_subscribe::StreamSubscribeTool;
@@ -51,6 +52,7 @@ pub const GLOBAL_CORE_TOOL_NAMES: &[&str] = &[
     "list_tasks",
     "agent_status",
     "list_skills",
+    "skill_manage",
     "cron",
     "toggle_manage",
     "web_fetch",
@@ -110,6 +112,7 @@ impl ToolRegistry {
 
         // Skill evolution tools
         registry.register(Arc::new(ListSkillsTool));
+        registry.register(Arc::new(SkillManageTool));
 
         // System info & capability evolution tools
         registry.register(Arc::new(SystemInfoTool));

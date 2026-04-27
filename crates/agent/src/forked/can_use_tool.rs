@@ -169,6 +169,405 @@ pub fn create_compact_can_use_tool() -> CanUseToolFn {
     )
 }
 
+/// 创建 Skill Review 的工具权限检查
+///
+/// Review Agent 只能使用有限的工具:
+/// - skill_manage: 创建/修补 Skill
+/// - list_skills: 查看 Skill 列表
+/// - read_file: 读取 Skill 内容
+/// - grep/glob: 搜索 Skill 文件
+///
+/// 关键: Review Agent **不能** 执行 exec、write_file 等危险操作,
+/// 只能通过 `skill_manage` 的安全通道修改 Skill 文件。
+pub fn create_skill_review_can_use_tool() -> CanUseToolFn {
+    Arc::new(|tool_name: &str, _input: &serde_json::Value| {
+        match tool_name {
+            "skill_manage" | "list_skills" | "read_file" | "grep" | "glob" => {
+                ToolPermission::Allow
+            }
+            _ => ToolPermission::Deny {
+                message: format!(
+                    "Skill Review only allows skill_manage/list_skills/read_file/grep/glob, attempted: {}",
+                    tool_name
+                ),
+            },
+        }
+    })
+}
+
+/// 创建 Flush (Memory Flush) 的工具权限检查
+///
+/// Flush Agent 只能保存记忆, 不能查询或删除:
+/// - memory_upsert: 写入/更新记忆项
+///
+/// 与 Hermes 一致: flush 仅暴露 memory 工具 (等价于 memory_upsert)
+pub fn create_flush_can_use_tool() -> CanUseToolFn {
+    Arc::new(
+        |tool_name: &str, _input: &serde_json::Value| match tool_name {
+            "memory_upsert" => ToolPermission::Allow,
+            _ => ToolPermission::Deny {
+                message: format!(
+                    "Flush mode only allows memory_upsert, attempted: {}",
+                    tool_name
+                ),
+            },
+        },
+    )
+}
+
+/// 创建 Memory Review 的工具权限检查
+///
+/// Memory Review Agent 只能使用记忆工具和只读文件工具:
+/// - memory_upsert: 写入/更新记忆项
+/// - memory_query: 查询记忆项
+/// - memory_search: 搜索记忆项
+/// - memory_forget: 删除记忆项
+/// - read_file: 读取文件内容
+/// - grep/glob: 搜索文件
+pub fn create_memory_review_can_use_tool() -> CanUseToolFn {
+    Arc::new(|tool_name: &str, _input: &serde_json::Value| {
+        match tool_name {
+            "memory_upsert" | "memory_query" | "memory_search" | "memory_forget"
+            | "read_file" | "grep" | "glob" => {
+                ToolPermission::Allow
+            }
+            _ => ToolPermission::Deny {
+                message: format!(
+                    "Memory Review only allows memory_upsert/memory_query/memory_search/memory_forget/read_file/grep/glob, attempted: {}",
+                    tool_name
+                ),
+            },
+        }
+    })
+}
+
+/// 创建 Combined Review (Skill + Memory) 的工具权限检查
+///
+/// Combined Review Agent 可以使用 Skill 工具和 Memory 工具:
+/// - skill_manage: 创建/修补 Skill
+/// - list_skills: 查看 Skill 列表
+/// - memory_upsert: 写入/更新记忆项
+/// - memory_query: 查询记忆项
+/// - memory_search: 搜索记忆项
+/// - memory_forget: 删除记忆项
+/// - read_file: 读取文件内容
+/// - grep/glob: 搜索文件
+pub fn create_combined_review_can_use_tool() -> CanUseToolFn {
+    Arc::new(|tool_name: &str, _input: &serde_json::Value| {
+        match tool_name {
+            "skill_manage" | "list_skills"
+            | "memory_upsert" | "memory_query" | "memory_search" | "memory_forget"
+            | "read_file" | "grep" | "glob" => {
+                ToolPermission::Allow
+            }
+            _ => ToolPermission::Deny {
+                message: format!(
+                    "Combined Review only allows skill_manage/list_skills/memory_upsert/memory_query/memory_search/memory_forget/read_file/grep/glob, attempted: {}",
+                    tool_name
+                ),
+            },
+        }
+    })
+}
+
+/// 构建 Skill Review 模式的 LLM 工具 schema 列表
+///
+/// 这些 schema 会传给 provider.chat() 的 tools 参数，让 LLM 知道可用的工具及其参数。
+pub fn build_skill_review_tool_schemas() -> Vec<serde_json::Value> {
+    vec![
+        build_skill_manage_schema(),
+        build_list_skills_schema(),
+        build_read_file_schema(),
+        build_grep_schema(),
+        build_glob_schema(),
+    ]
+}
+
+/// 构建 Memory Review 模式的 LLM 工具 schema 列表
+pub fn build_memory_review_tool_schemas() -> Vec<serde_json::Value> {
+    vec![
+        build_memory_upsert_schema(),
+        build_memory_query_schema(),
+        build_memory_search_schema(),
+        build_memory_forget_schema(),
+        build_read_file_schema(),
+        build_grep_schema(),
+        build_glob_schema(),
+    ]
+}
+
+/// 构建 Combined Review 模式的 LLM 工具 schema 列表
+pub fn build_combined_review_tool_schemas() -> Vec<serde_json::Value> {
+    vec![
+        build_skill_manage_schema(),
+        build_list_skills_schema(),
+        build_memory_upsert_schema(),
+        build_memory_query_schema(),
+        build_memory_search_schema(),
+        build_memory_forget_schema(),
+        build_read_file_schema(),
+        build_grep_schema(),
+        build_glob_schema(),
+    ]
+}
+
+// ── 工具 Schema 定义 ──────────────────────────────────────────────
+
+fn wrap_tool_schema(
+    name: &str,
+    description: &str,
+    parameters: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        }
+    })
+}
+
+fn build_skill_manage_schema() -> serde_json::Value {
+    wrap_tool_schema(
+        "skill_manage",
+        "Manage skills: create, patch, view, delete, edit, write_file, or remove_file. Use 'view' to read a skill, 'create' to create a new skill, 'patch' to make targeted edits, 'edit' to replace entire content, 'delete' to remove a skill.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "patch", "view", "delete", "edit", "write_file", "remove_file"],
+                    "description": "The action to perform on the skill"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "The skill name (lowercase letters, digits, dots, underscores, hyphens)"
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Optional category folder for the skill (e.g., 'data', 'web', 'automation'). Defaults to no category."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The content for create/edit actions (Markdown format with YAML frontmatter)"
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "The old string to replace (for patch action)"
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "The new string to replace with (for patch action)"
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "If true, replace ALL occurrences of old_string (for patch action). Default: false."
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "The file path within the skill (for patch/write_file/remove_file)"
+                },
+                "file_content": {
+                    "type": "string",
+                    "description": "The file content (for write_file action)"
+                },
+            },
+            "required": ["action", "name"]
+        }),
+    )
+}
+
+fn build_list_skills_schema() -> serde_json::Value {
+    wrap_tool_schema(
+        "list_skills",
+        "List all available skills. Returns skill names and whether they have a SKILL.md file.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional search query to filter skills",
+                },
+            },
+        }),
+    )
+}
+
+fn build_memory_upsert_schema() -> serde_json::Value {
+    wrap_tool_schema(
+        "memory_upsert",
+        "Write or update a memory item. Creates a new entry or updates an existing one.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Optional ID for the memory item. If provided, updates existing item."
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Category of the memory item (e.g., 'preference', 'fact', 'instruction')"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The content to store"
+                },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional tags for categorization"
+                },
+            },
+            "required": ["content"]
+        }),
+    )
+}
+
+fn build_memory_query_schema() -> serde_json::Value {
+    wrap_tool_schema(
+        "memory_query",
+        "Query memory items by category, tags, or keyword search.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "Filter by category"
+                },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Filter by tags"
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Keyword search query"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return"
+                },
+            },
+        }),
+    )
+}
+
+fn build_memory_search_schema() -> serde_json::Value {
+    wrap_tool_schema(
+        "memory_search",
+        "Search memory items by keyword. Alias for memory_query with a search focus.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query to find matching memory items"
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Optional filter by category"
+                },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional filter by tags"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return"
+                },
+            },
+            "required": ["query"]
+        }),
+    )
+}
+
+fn build_memory_forget_schema() -> serde_json::Value {
+    wrap_tool_schema(
+        "memory_forget",
+        "Delete a memory item by ID or batch delete by filter. Provide 'id' for single delete, or 'category'/'tags' for batch delete.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "The ID of the memory item to delete (for single delete)"
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Delete all items in this category (batch mode)"
+                },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Delete items matching these tags (batch mode)"
+                },
+            },
+            "required": []
+        }),
+    )
+}
+
+fn build_read_file_schema() -> serde_json::Value {
+    wrap_tool_schema(
+        "read_file",
+        "Read the contents of a file.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The path to the file to read"
+                },
+            },
+            "required": ["file_path"]
+        }),
+    )
+}
+
+fn build_grep_schema() -> serde_json::Value {
+    wrap_tool_schema(
+        "grep",
+        "Search for a pattern in a file. Returns matching lines.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "The pattern to search for"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "The file path to search in"
+                },
+            },
+            "required": ["pattern"]
+        }),
+    )
+}
+
+fn build_glob_schema() -> serde_json::Value {
+    wrap_tool_schema(
+        "glob",
+        "Match files by pattern in a directory. Supports basic wildcards like *.md.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "The glob pattern to match (e.g., '*.md', '*')"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "The directory to search in"
+                },
+            },
+            "required": ["pattern"]
+        }),
+    )
+}
+
 /// 检查是否只读命令
 ///
 /// 安全检查：
@@ -214,19 +613,43 @@ fn is_read_only_command(cmd: &str) -> bool {
     let cmd_lower = cmd_trimmed.to_lowercase();
 
     // 安全检查：检测危险符号
-    // 1. 输出重定向 (>, >>) - 可能覆盖或追加文件
-    // 2. 管道 (|) - 可能将数据传递给写入命令
-    // 3. 命令替换 ($(), ``) - 可能执行任意命令
-    // 4. 分号 (;) 和逻辑运算符 (&&, ||) - 可能链接多个命令
-    // 5. 后台执行 (&) - 可能在后台执行危险操作
-    // 6. 换行转义 (\n, \r) - 可能注入新命令
+    // 1. 管道 (|) - 可能将数据传递给写入命令
+    // 2. 命令替换 ($(), ``) - 可能执行任意命令
+    // 3. 分号 (;) 和逻辑运算符 (&&, ||) - 可能链接多个命令
+    // 4. 后台执行 (&) - 可能在后台执行危险操作
+    // 5. 换行转义 (\n, \r) - 可能注入新命令
     let dangerous_patterns = [
-        ">>", ">", "|", "$(", "`", ";", "&&", "||", "&", "\\n", "\\r", "\n", "\r",
+        "|", "$(", "`", ";", "&&", "||", "&", "\\n", "\\r", "\n", "\r",
     ];
 
     for pattern in &dangerous_patterns {
         if cmd_lower.contains(pattern) {
             return false;
+        }
+    }
+
+    // 输出重定向 (>, >>) - 需要更精确的检测
+    // 排除 >= (比较运算符) 和 => (箭头函数)
+    // 简单策略: 如果 > 后面紧跟 =, 或前面紧跟 =, 则不是重定向
+    if cmd_lower.contains('>') {
+        // >> 追加重定向
+        if cmd_lower.contains(">>") {
+            return false;
+        }
+        // 检查每个 > 是否是重定向
+        let bytes = cmd_lower.as_bytes();
+        let len = bytes.len();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'>' {
+                let next_is_eq = i + 1 < len && bytes[i + 1] == b'=';
+                let prev_is_eq = i > 0 && bytes[i - 1] == b'=';
+                // >= 或 => 不是重定向
+                if next_is_eq || prev_is_eq {
+                    continue;
+                }
+                // 其他 > 视为重定向
+                return false;
+            }
         }
     }
 
@@ -273,8 +696,16 @@ fn is_auto_mem_path(path: &str, memory_dir: &Path) -> bool {
                 }
             }
         }
-        // 无法验证，保守拒绝（安全优先）
-        return false;
+        // 路径以 memory_dir 开头但文件和父目录都不存在
+        // 这是创建新文件的情况，允许在验证目录内创建新文件
+        // 但必须拒绝包含 .. 组件的路径（防止路径遍历逃逸）
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        return true;
     }
 
     // 路径不以 memory_dir 开头，保守拒绝（安全优先）

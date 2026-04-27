@@ -483,6 +483,7 @@ mod tests {
             event_emitter: None,
             channel_contacts_file: None,
             response_cache: None,
+            skill_mutex: None,
         }
     }
 
