@@ -153,6 +153,33 @@ impl AutoMemoryExtractor {
 
         match result {
             Ok(forked_result) => {
+                // 安全扫描: 检查写入后的记忆文件内容
+                if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
+                    let scan_result =
+                        crate::auto_memory::scanner::scan_memory_content(&updated_content);
+                    if let Err(threats) = scan_result {
+                        tracing::warn!(
+                            memory_type = memory_type.name(),
+                            threat_count = threats.len(),
+                            "[auto_memory] 安全扫描发现威胁, 回滚记忆文件"
+                        );
+                        // 回滚到提取前的内容
+                        let _ = tokio::fs::write(&memory_path, &current_content).await;
+                        return ExtractionResult {
+                            memory_type,
+                            success: false,
+                            input_tokens: forked_result.total_usage.input_tokens as usize,
+                            output_tokens: forked_result.total_usage.output_tokens as usize,
+                            error: Some(format!(
+                                "安全扫描发现 {} 个威胁, 记忆文件已回滚: {}",
+                                threats.len(),
+                                crate::auto_memory::scanner::format_threats(&threats)
+                            )),
+                            cursor_save_failed: false,
+                        };
+                    }
+                }
+
                 // 更新游标
                 let mut cursor = self.cursor_manager.get_cursor(memory_type);
                 cursor.update(last_message_uuid, message_count);
@@ -221,6 +248,21 @@ impl AutoMemoryExtractor {
     }
 }
 
+/// 收敛规则 + Memory/Skill 边界规则 (参考 Hermes MEMORY_GUIDANCE)
+const EXTRACTION_ENHANCEMENT: &str = r#"
+## Convergence Rules
+- If nothing has changed since the last extraction, do NOT modify the file — just stop.
+- Do not duplicate information already present in the file.
+- Do not add trivial or obvious information.
+
+## Memory vs Skill Boundary
+- Memory stores declarative facts: preferences, environment, conventions, user background.
+- Skill stores procedural knowledge: steps, workflows, pitfalls, how-to guides.
+- "User prefers concise responses" → memory (save here)
+- "Deploy to K8s requires pushing image first" → skill (use `skill_manage action=create`)
+- If you've discovered a new way to do something that involves multiple steps, save it as a skill, NOT as memory.
+"#;
+
 /// 构建提取 prompt
 fn build_extraction_prompt(memory_type: MemoryType, current_content: &str) -> String {
     format!(
@@ -240,13 +282,14 @@ fn build_extraction_prompt(memory_type: MemoryType, current_content: &str) -> St
 - Keep the total content under {} tokens
 - Preserve all existing important information
 - Add new information that matches this memory type's purpose
-
+{}
 Use the file_edit tool to update the memory file at the configured path.
 "#,
         memory_type.name(),
         current_content,
         memory_type.usage_guide(),
         MAX_MEMORY_FILE_TOKENS,
+        EXTRACTION_ENHANCEMENT,
     )
 }
 
@@ -354,6 +397,32 @@ pub async fn extract_auto_memory(
 
     match result {
         Ok(forked_result) => {
+            // 安全扫描: 检查写入后的记忆文件内容
+            if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
+                let scan_result =
+                    crate::auto_memory::scanner::scan_memory_content(&updated_content);
+                if let Err(threats) = scan_result {
+                    tracing::warn!(
+                        memory_type = memory_type.name(),
+                        threat_count = threats.len(),
+                        "[auto_memory] 安全扫描发现威胁, 回滚记忆文件"
+                    );
+                    // 回滚到提取前的内容
+                    let _ = tokio::fs::write(&memory_path, &current_content).await;
+                    return ExtractionResult {
+                        memory_type,
+                        success: false,
+                        input_tokens: forked_result.total_usage.input_tokens as usize,
+                        output_tokens: forked_result.total_usage.output_tokens as usize,
+                        error: Some(format!(
+                            "安全扫描发现 {} 个威胁, 记忆文件已回滚",
+                            threats.len()
+                        )),
+                        cursor_save_failed: false,
+                    };
+                }
+            }
+
             tracing::info!(
                 memory_type = memory_type.name(),
                 input_tokens = forked_result.total_usage.input_tokens,

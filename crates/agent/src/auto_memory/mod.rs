@@ -17,6 +17,7 @@ mod cursor;
 mod extractor;
 mod injector;
 mod memory_type;
+pub mod scanner;
 
 pub use cursor::{ExtractionCursor, ExtractionCursorManager};
 pub use extractor::{

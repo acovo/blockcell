@@ -297,14 +297,26 @@ pub fn expand_tilde(path_str: &str) -> PathBuf {
 /// Check whether `path` starts with `base`, after normalizing both sides.
 /// Falls back to lexicographic normalization when `canonicalize` fails
 /// (e.g. for paths that don't exist yet).
+///
+/// On Windows, `canonicalize` returns UNC paths (`\\?\C:\...`) for existing
+/// paths, but `normalize_path` returns regular paths (`C:\...`) for non-existing
+/// ones. To ensure consistent comparison, if either side fails to canonicalize,
+/// both sides fall back to `normalize_path`.
 pub fn path_starts_with_normalized(path: &Path, base: &Path) -> bool {
-    let path_c = canonical_or_normalize(path);
-    let base_c = canonical_or_normalize(base);
-    path_c.starts_with(&base_c)
-}
+    // Try canonicalize on both sides first
+    let path_canonical = std::fs::canonicalize(path);
+    let base_canonical = std::fs::canonicalize(base);
 
-fn canonical_or_normalize(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| normalize_path(p))
+    // If both canonicalize succeeded, compare canonical forms
+    if let (Ok(p), Ok(b)) = (path_canonical, base_canonical) {
+        return p.starts_with(&b);
+    }
+
+    // If either failed (path doesn't exist), fall back to normalize for BOTH
+    // to ensure consistent representation (e.g. avoid mixing \\?\C:\ with C:\)
+    let path_n = normalize_path(path);
+    let base_n = normalize_path(base);
+    path_n.starts_with(&base_n)
 }
 
 fn normalize_path(p: &Path) -> PathBuf {

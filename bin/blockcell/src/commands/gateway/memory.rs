@@ -40,6 +40,7 @@ async fn execute_memory_create_via_tool(
         event_emitter: None,
         channel_contacts_file: Some(agent_paths.channel_contacts_file()),
         response_cache: None,
+        skill_mutex: None,
     };
 
     state.tool_registry.execute("memory_upsert", ctx, req).await

@@ -17,7 +17,10 @@ pub mod session_memory;
 pub mod session_metrics;
 pub mod skill_decision;
 pub mod skill_executor;
+pub mod skill_index;
 pub mod skill_kernel;
+pub mod skill_mutex;
+pub mod skill_nudge;
 pub mod skill_summary;
 pub mod summary_queue;
 pub mod system_event_orchestrator;
@@ -41,8 +44,8 @@ pub use context::ContextBuilder;
 pub use forked::{
     create_auto_mem_can_use_tool, create_cache_safe_params, create_cache_safe_params_with_tools,
     create_compact_can_use_tool, create_dream_can_use_tool, create_memory_file_can_use_tool,
-    run_forked_agent, CacheSafeParams, CanUseToolFn, ForkedAgentParams, ForkedAgentResult,
-    ToolDefinition, ToolPermission, UsageMetrics,
+    create_skill_review_can_use_tool, run_forked_agent, CacheSafeParams, CanUseToolFn,
+    ForkedAgentParams, ForkedAgentResult, ToolDefinition, ToolPermission, UsageMetrics,
 };
 pub use health::HealthChecker;
 pub use intent::{IntentCategory, IntentClassifier};
