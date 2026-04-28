@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 const GHOST_SYSTEM_PROMPT: &str = r#"You are Ghost, Blockcell's background maintenance agent.
 Constraints: background-only, restricted permissions, minimize tokens.
 Tools: memory_maintenance, community_hub, list_dir, file_ops, notification (critical only).
-Rules: NEVER save routine logs to memory. Only save genuine user-relevant discoveries to long-term memory.
+Rules: NEVER save routine logs to memory. Maintain SQLite long-term memory only for genuine durable facts. Do not create skills.
 Output: respond with a brief JSON summary at the end (see routine prompt for format).
 "#;
 
@@ -113,7 +113,7 @@ impl GhostMaintenanceService {
     /// Optimized for minimal token usage (P2-2): concise instructions + JSON output format.
     pub fn build_routine_prompt(config: &GhostMaintenanceServiceConfig) -> String {
         let mut steps = vec![
-            "1. memory_maintenance(action=\"garden\") → follow returned instructions. Extract important facts to long-term, delete trivial entries.".to_string(),
+            "1. memory_maintenance(action=\"garden\") → follow returned instructions. Promote only stable facts to SQLite long_term memory; delete trivial entries. Do not create skills.".to_string(),
             "2. list_dir workspace/media + workspace/downloads → file_ops delete files >7 days old. Skip if age unknown.".to_string(),
         ];
 
@@ -126,7 +126,7 @@ impl GhostMaintenanceService {
         let steps_str = steps.join("\n");
         format!(
             "Ghost routine. Execute steps in order:\n{}\n\n\
-             Rules: NEVER memory_upsert routine logs. Only save genuine user-relevant discoveries.\n\n\
+             Rules: NEVER memory_upsert routine logs. Only maintain genuine durable facts/preferences/projects/tasks in SQLite long_term memory. Do not create skills.\n\n\
              After all steps, output ONLY this JSON (no other text):\n\
              {{\"memory\":{{\"gardened\":N,\"promoted\":N,\"deleted\":N}},\
              \"cleanup\":{{\"files_deleted\":N}},\
@@ -316,5 +316,22 @@ mod tests {
         assert!(ghost_config.model.is_none());
         assert_eq!(ghost_config.max_syncs_per_day, 10);
         assert!(ghost_config.auto_social);
+    }
+
+    #[test]
+    fn test_routine_prompt_allows_sqlite_long_term_maintenance() {
+        let config = GhostMaintenanceServiceConfig {
+            enabled: true,
+            model: None,
+            schedule: "0 0 */4 * * *".to_string(),
+            max_syncs_per_day: 10,
+            auto_social: false,
+        };
+        let prompt = GhostMaintenanceService::build_routine_prompt(&config);
+
+        assert!(prompt.contains("memory_maintenance"));
+        assert!(prompt.contains("SQLite long_term memory"));
+        assert!(prompt.contains(&format!("memory_{}", "upsert")));
+        assert!(prompt.contains("Do not create skills"));
     }
 }

@@ -7,7 +7,7 @@
 
 An interactive agent is great at “you ask, I answer”. But a long-running AI system also needs **low-frequency, background, maintenance** work, for example:
 
-- Gardening the memory store (deduplicate, compress, extract long-term facts)
+- Maintaining the SQLite memory store (deduplicate, compact, remove expired entries, and keep stable facts in `long_term`)
 - Cleaning up temporary files in the workspace (`media` / `downloads`)
 - Staying socially connected on the Community Hub and tracking new skills
 
@@ -85,9 +85,10 @@ Field meanings (mapped to `GhostConfig` in `crates/core/src/config.rs`):
 
 On each run, Ghost Maintenance builds a routine prompt and dispatches it into the system. The core steps are:
 
-1. **Memory gardening**
-   - Call `memory_maintenance(action="garden")`, then follow the returned instruction to process entries
-   - Key rule: routine logs/summaries should **not** be saved as long-term memory
+1. **SQLite memory maintenance**
+   - Call `memory_maintenance(action="garden")` to clean short-term noise, deduplicate, purge expired entries, and maintain SQLite `long_term` memory
+   - Key rule: only stable user preferences, project facts, recurring patterns, and durable lessons should be written to `long_term`; routine logs, one-off task status, and temporary TODOs should not be saved
+   - Skill creation and `USER.md` / `MEMORY.md` file memory remain owned by embedded Ghost learning
 
 2. **File cleanup**
    - Check `workspace/media` and `workspace/downloads`

@@ -7,7 +7,7 @@
 
 交互式智能体擅长“你问我答”，但一个长期运行的 AI 系统还需要做很多**低频、后台、维护型**工作，例如：
 
-- 记忆库的日常整理（去重、压缩、提炼长期事实）
+- SQLite 记忆库的日常维护（去重、压缩、清理过期内容，并把稳定事实维护到 `long_term`）
 - 清理工作区的临时文件（media/downloads）
 - 在社区 Hub 上保持节点活跃，获取最新技能动态
 
@@ -103,9 +103,10 @@ Ghost Maintenance 的配置位于 `config.json5` 的 `agents.ghost`：
 
 每次执行时，Ghost Maintenance 会构建一段例行维护提示词并投递到系统消息队列，核心步骤包括：
 
-1. **记忆整理**
-   - 调用 `memory_maintenance(action="garden")`，按返回指令整理近期记忆
-   - 重要原则：维护过程的日志与总结**不应写入长期记忆**
+1. **SQLite 记忆维护**
+   - 调用 `memory_maintenance(action="garden")`，清理短期噪音、去重、过期回收，并维护 SQLite `long_term` 记忆
+   - 重要原则：只把稳定用户偏好、项目事实、重复模式和长期经验写入 `long_term`；维护日志、一次性任务状态和临时 TODO 不应写入长期记忆
+   - 技能创建和 `USER.md` / `MEMORY.md` 文件记忆仍由嵌入式 Ghost 自学习负责
 
 2. **文件清理**
    - 检查 `workspace/media` 与 `workspace/downloads`
