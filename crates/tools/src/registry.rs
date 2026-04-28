@@ -56,6 +56,7 @@ pub const GLOBAL_CORE_TOOL_NAMES: &[&str] = &[
     "cron",
     "toggle_manage",
     "web_fetch",
+    "session_recall",
 ];
 
 pub fn global_core_tool_names() -> &'static [&'static str] {
