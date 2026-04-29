@@ -53,6 +53,58 @@ const TOOL_ROUND_THROTTLE_MS: u64 = 600;
 const TOOL_ROUND_THROTTLE_AFTER_RATE_LIMIT_MS: u64 = 2_500;
 const ACTIVATE_SKILL_TOOL_NAME: &str = "activate_skill";
 
+/// Review 模式枚举
+///
+/// 用于 NudgeEngine 触发后台 Review 时决定审查范围：
+/// - Skill: 仅审查 Skill 库
+/// - Memory: 仅审查用户记忆
+/// - Combined: 同时审查 Skill 库和用户记忆
+#[derive(Debug, Clone)]
+enum ReviewMode {
+    /// 审查 Skill 库，判断是否需要创建/修补 Skill
+    Skill,
+    /// 审查对话历史，保存用户偏好和重要信息
+    Memory,
+    /// 同时审查 Skill 库和用户记忆
+    Combined,
+}
+
+/// Memory Review 提示词
+/// Memory Review 提示词 (与 Hermes _MEMORY_REVIEW_PROMPT 一致)
+const MEMORY_REVIEW_PROMPT: &str = "\
+Review the conversation above and consider saving to memory if appropriate.\n\n\
+Focus on:\n\
+1. Has the user revealed things about themselves — their persona, desires, \
+preferences, or personal details worth remembering?\n\
+2. Has the user expressed expectations about how you should behave, their work \
+style, or ways they want you to operate?\n\n\
+If something stands out, save it using the memory tool. \
+If nothing is worth saving, just say 'Nothing to save.' and stop.";
+
+/// Skill Review 提示词 (与 Hermes _SKILL_REVIEW_PROMPT 一致)
+const SKILL_REVIEW_PROMPT: &str = "\
+Review the conversation above and consider saving or updating a skill if appropriate.\n\n\
+Focus on: was a non-trivial approach used to complete a task that required trial \
+and error, or changing course due to experiential findings along the way, or did \
+the user expect or desire a different method or outcome?\n\n\
+If a relevant skill already exists, update it with what you learned. \
+Otherwise, create a new skill if the approach is reusable.\n\
+If nothing is worth saving, just say 'Nothing to save.' and stop.";
+
+/// Combined Review 提示词 (与 Hermes _COMBINED_REVIEW_PROMPT 一致)
+const COMBINED_REVIEW_PROMPT: &str = "\
+Review the conversation above and consider two things:\n\n\
+**Memory**: Has the user revealed things about themselves — their persona, \
+desires, preferences, or personal details? Has the user expressed expectations \
+about how you should behave, their work style, or ways they want you to operate? \
+If so, save using the memory tool.\n\n\
+**Skills**: Was a non-trivial approach used to complete a task that required trial \
+and error, or changing course due to experiential findings along the way, or did \
+the user expect or desire a different method or outcome? If a relevant skill \
+already exists, update it. Otherwise, create a new one if the approach is reusable.\n\n\
+Only act if there's something genuinely worth saving. \
+If nothing stands out, just say 'Nothing to save.' and stop.";
+
 /// Compact execution context - contains info needed for notifications.
 ///
 /// Used to send user notifications before/after compression operations.
@@ -1728,6 +1780,10 @@ pub struct AgentRuntime {
     /// Flag to signal that memory injector cache needs refresh after Layer 5 extraction.
     /// Uses Arc<AtomicBool> because background tasks need to set this flag.
     memory_injector_needs_reload: Arc<std::sync::atomic::AtomicBool>,
+    /// Skill Nudge 引擎 — 跟踪工具使用次数并在阈值到达时触发 Skill Review
+    skill_nudge_engine: crate::skill_nudge::SkillNudgeEngine,
+    /// Skill 操作互斥锁 — 防止 Skill 并发修改冲突
+    skill_mutex: crate::skill_mutex::SkillMutex,
 }
 
 impl AgentRuntime {
@@ -1770,6 +1826,18 @@ impl AgentRuntime {
         );
         ghost_memory_lifecycle.initialize_all("runtime", "primary");
 
+        // 构建 Skill 索引摘要并注入到系统提示词
+        let skills_dir = paths.skills_dir();
+        if skills_dir.exists() {
+            let index = crate::skill_index::SkillIndex::build_from_dir(&skills_dir);
+            if !index.entries().is_empty() {
+                context_builder.set_skill_index_summary(index.to_prompt_summary());
+            }
+        }
+
+        // 从 config 中提取 nudge 配置 (在 config 被 move 之前)
+        let nudge_config = crate::skill_nudge::NudgeConfig::from_config(&config.self_improve.nudge);
+
         Ok(Self {
             config,
             paths,
@@ -1801,6 +1869,8 @@ impl AgentRuntime {
             response_cache: crate::response_cache::ResponseCache::new(),
             memory_system: None,
             memory_injector_needs_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            skill_nudge_engine: crate::skill_nudge::SkillNudgeEngine::new(nudge_config),
+            skill_mutex: crate::skill_mutex::SkillMutex::new(),
         })
     }
 
@@ -2209,6 +2279,342 @@ impl AgentRuntime {
         let store = SkillFileStore::open(&self.paths)?;
         self.skill_file_store = Some(Arc::new(store));
         Ok(())
+    }
+
+    /// 后台触发 Review (参考 Hermes nudge_engine)
+    ///
+    /// 根据审查模式 (Skill / Memory / Combined) 在后台启动 ForkedAgent，
+    /// 审查 Skill 库或用户记忆，并根据对话上下文创建/修补 Skill 或保存记忆。
+    ///
+    /// 如果提供了 `notify_channel`，Review 完成后会通过 outbound_tx 发送摘要通知。
+    fn spawn_review(
+        &self,
+        mode: ReviewMode,
+        messages: Vec<ChatMessage>,
+        notify_channel: Option<(String, String)>,
+    ) {
+        let label = match mode {
+            ReviewMode::Skill => "skill_nudge_review",
+            ReviewMode::Memory => "memory_nudge_review",
+            ReviewMode::Combined => "combined_nudge_review",
+        };
+        tracing::info!("[Nudge] 阈值到达, 启动后台 {:?} Review", mode);
+
+        let skills_dir = self.paths.skills_dir();
+        // 克隆一份供 ForkedAgent 使用（spawn_blocking 会 move 原始值）
+        let skills_dir_clone = skills_dir.clone();
+        let builtin_skills_dir = self.paths.builtin_skills_dir();
+        let external_skills_dirs = vec![builtin_skills_dir];
+        let provider_pool = self.provider_pool.clone();
+        let model = self.config.agents.defaults.model.clone();
+        let max_review_rounds = self.config.self_improve.review.max_rounds;
+        let memory_store = self.memory_store.clone();
+        let skill_mutex = Arc::new(self.skill_mutex.clone());
+        let mode_clone = mode.clone();
+        // 与 Hermes 一致: review_agent 继承主 agent 的 system prompt
+        let system_prompt = self.context_builder.build_system_prompt();
+        let outbound_tx = self.outbound_tx.clone();
+        // 共享 skill_index_summary Arc, 供后台 Review 完成后刷新
+        let skill_index_cache = self.context_builder.skill_index_summary_arc();
+
+        tokio::spawn(async move {
+            // 构建 Skill 索引（仅在 Skill/Combined 模式下需要）
+            let skill_summary = match mode_clone {
+                ReviewMode::Memory => String::new(),
+                ReviewMode::Skill | ReviewMode::Combined => {
+                    if !skills_dir.exists() {
+                        tracing::info!("[Nudge] Skills 目录不存在, 跳过 Skill 部分");
+                        String::new()
+                    } else {
+                        let index = match tokio::task::spawn_blocking(move || {
+                            crate::skill_index::SkillIndex::build_from_dir(&skills_dir)
+                        })
+                        .await
+                        {
+                            Ok(idx) => idx,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "[Nudge] 构建索引任务失败");
+                                return;
+                            }
+                        };
+
+                        if index.entries().is_empty() {
+                            tracing::info!("[Nudge] 无可用 Skill, 跳过 Skill 部分");
+                            String::new()
+                        } else {
+                            index.to_prompt_summary()
+                        }
+                    }
+                }
+            };
+
+            // 构建 Review 提示词 (与 Hermes 一致: 选择对应模式的 prompt)
+            let review_prompt = match mode_clone {
+                ReviewMode::Skill => SKILL_REVIEW_PROMPT.to_string(),
+                ReviewMode::Memory => MEMORY_REVIEW_PROMPT.to_string(),
+                ReviewMode::Combined => COMBINED_REVIEW_PROMPT.to_string(),
+            };
+
+            // 构建工具权限
+            // 与 Hermes 一致: review_agent 继承主 agent 的 system prompt，不设自定义系统提示词
+            // Hermes: review_agent = AIAgent(model=self.model, ...) → 使用默认 system prompt
+            let can_use_tool = match mode_clone {
+                ReviewMode::Skill => crate::forked::create_skill_review_can_use_tool(),
+                ReviewMode::Memory => crate::forked::create_memory_review_can_use_tool(),
+                ReviewMode::Combined => crate::forked::create_combined_review_can_use_tool(),
+            };
+
+            // 构建工具 Schema (传给 provider.chat() 让 LLM 知道可用工具)
+            let tool_schemas = match mode_clone {
+                ReviewMode::Skill => crate::forked::build_skill_review_tool_schemas(),
+                ReviewMode::Memory => crate::forked::build_memory_review_tool_schemas(),
+                ReviewMode::Combined => crate::forked::build_combined_review_tool_schemas(),
+            };
+
+            // 构建 ForkedAgent 参数 (与 Hermes 一致: 传入对话历史 + review prompt 作为用户消息)
+            // Hermes: review_agent.run_conversation(user_message=prompt, conversation_history=messages_snapshot)
+            let mut review_messages = messages.clone();
+            // 如果有 Skill 索引，在 prompt 前附加
+            let full_prompt = if skill_summary.is_empty() {
+                review_prompt
+            } else {
+                format!("{}\n\n## Existing Skills\n{}", review_prompt, skill_summary)
+            };
+            review_messages.push(ChatMessage::user(&full_prompt));
+
+            let cache_safe = crate::forked::CacheSafeParams::new(system_prompt, &model);
+            let mut params =
+                crate::forked::ForkedAgentParams::new(provider_pool, review_messages, cache_safe)
+                    .with_can_use_tool(can_use_tool)
+                    .with_tool_schemas(tool_schemas)
+                    .with_query_source("review")
+                    .with_fork_label(label)
+                    .with_max_turns(max_review_rounds);
+
+            // 传入 memory_store（Memory/Combined 模式需要）
+            if let Some(store) = memory_store {
+                params = params.with_memory_store(store);
+            }
+
+            // 传入 skill_mutex（防止 review agent 与主 agent 并发修改同一 Skill）
+            params = params.with_skill_mutex(skill_mutex);
+
+            // 传入 skills_dir（Skill/Combined 模式需要，否则 skill_manage/list_skills 无法工作）
+            match mode_clone {
+                ReviewMode::Skill | ReviewMode::Combined => {
+                    // skills_dir 已在上方被 move 到 spawn_blocking 中用于构建索引，
+                    // 但 ForkedAgent 也需要它来执行 skill_manage 工具。
+                    // 由于 PathBuf 实现了 Clone，我们在 spawn_blocking 之前克隆一份。
+                    // 注意: 此处 skills_dir_clone 是从外层闭包捕获的。
+                    params = params.with_skills_dir(skills_dir_clone.clone());
+                    // 传入 external_skills_dirs (builtin_skills_dir) 以支持跨目录搜索
+                    params = params.with_external_skills_dirs(external_skills_dirs.clone());
+                }
+                ReviewMode::Memory => {}
+            }
+
+            match crate::forked::run_forked_agent(params).await {
+                Ok(result) => {
+                    tracing::info!(
+                        mode = ?mode_clone,
+                        tokens_out = result.total_usage.output_tokens,
+                        "[Nudge] Review 完成"
+                    );
+                    if let Some(content) = &result.final_content {
+                        let preview: String = content.chars().take(200).collect();
+                        tracing::info!("[Nudge] Review 结果: {}", preview);
+                    }
+                    // 提取 Review 摘要并通知用户 (与 Hermes 一致)
+                    if let Some((channel, chat_id)) = &notify_channel {
+                        if let Some(tx) = &outbound_tx {
+                            if let Some(summary) = Self::extract_review_summary(&result.messages) {
+                                let outbound = OutboundMessage::new(channel, chat_id, &summary);
+                                let _ = tx.send(outbound).await;
+                                tracing::info!("[Nudge] Review 通知已发送: {}", summary);
+                            }
+                        }
+                    }
+
+                    // 刷新父 Agent 的 Skill 索引缓存 (后台 Review 可能创建/修改了 Skill)
+                    // 与 Hermes 一致: 系统提示词在下次 LLM 调用时反映最新的 Skill 列表
+                    if matches!(mode_clone, ReviewMode::Skill | ReviewMode::Combined)
+                        && skills_dir_clone.exists()
+                    {
+                        if let Ok(index) = tokio::task::spawn_blocking(move || {
+                            crate::skill_index::SkillIndex::build_from_dir(&skills_dir_clone)
+                        })
+                        .await
+                        {
+                            let mut cache =
+                                skill_index_cache.write().unwrap_or_else(|e| e.into_inner());
+                            *cache = if index.entries().is_empty() {
+                                None
+                            } else {
+                                Some(index.to_prompt_summary())
+                            };
+                            tracing::info!("[Nudge] Skill 索引缓存已刷新");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(mode = ?mode_clone, error = %e, "[Nudge] Review 失败");
+                }
+            }
+        });
+    }
+
+    /// 从 Review Agent 的 tool 结果中提取操作摘要 (参考 Hermes 行为)
+    ///
+    /// Hermes 扫描 review_agent._session_messages 中的 tool 结果,
+    /// 查找 created/updated/deleted 等操作，汇总为用户可见的摘要。
+    fn extract_review_summary(messages: &[ChatMessage]) -> Option<String> {
+        let mut actions: Vec<String> = Vec::new();
+
+        for msg in messages {
+            if msg.role != "tool" {
+                continue;
+            }
+            let content = match msg.content.as_str() {
+                Some(c) => c,
+                None => continue,
+            };
+            // 解析 JSON (skill_manage 和 memory 工具返回 JSON，但格式不同)
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(content) {
+                // ── skill_manage 结果: {"success": true, "message": "Skill 'xxx' created", ...} ──
+                let is_skill_success = data
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                if is_skill_success {
+                    if let Some(msg_text) = data.get("message").and_then(|v| v.as_str()) {
+                        let lower = msg_text.to_lowercase();
+                        if lower.contains("created")
+                            || lower.contains("deleted")
+                            || lower.contains("updated")
+                            || lower.contains("patched")
+                            || lower.contains("edited")
+                            || lower.contains("added")
+                            || lower.contains("removed")
+                            || lower.contains("replaced")
+                        {
+                            actions.push(msg_text.to_string());
+                        }
+                    }
+
+                    // memory 工具 (Hermes 格式): {"target": "memory", "success": true, ...}
+                    if let Some(target) = data.get("target").and_then(|v| v.as_str()) {
+                        if !target.is_empty() && data.get("message").is_none() {
+                            let label = match target {
+                                "memory" => "Memory updated",
+                                "user" => "User profile updated",
+                                other => other,
+                            };
+                            actions.push(label.to_string());
+                        }
+                    }
+                }
+
+                // ── memory_upsert 结果: {"status": "saved", "item": {...}} ──
+                if data.get("status").and_then(|v| v.as_str()) == Some("saved") {
+                    actions.push("Memory updated".to_string());
+                }
+
+                // ── memory_forget 结果: {"action": "delete", "deleted": true, ...} ──
+                match data.get("action").and_then(|v| v.as_str()) {
+                    Some("delete") => {
+                        if data
+                            .get("deleted")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            actions.push("Memory updated".to_string());
+                        }
+                    }
+                    Some("batch_delete") => {
+                        let count = data
+                            .get("deleted_count")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        if count > 0 {
+                            actions.push(format!("Memory updated ({} items forgotten)", count));
+                        }
+                    }
+                    Some("restore") => {
+                        if data
+                            .get("restored")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            actions.push("Memory item restored".to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if actions.is_empty() {
+            None
+        } else {
+            Some(format!("\u{1F4BE} {}", actions.join(" \u{00B7} ")))
+        }
+    }
+
+    /// 在上下文压缩前，让 LLM 保存重要信息到 Memory Store
+    ///
+    /// 参考 Hermes `flush_memories()` — 使用 ForkedAgent 执行，
+    /// 只允许 memory_upsert 和 memory_query 工具。
+    /// 与 Hermes 一致: 传入完整对话历史 + flush 提示作为用户消息
+    async fn flush_memory_store_before_compact(&self, messages: &[ChatMessage]) {
+        if self.memory_store.is_none() {
+            tracing::debug!("[flush] 无 Memory Store, 跳过 flush");
+            return;
+        }
+
+        tracing::info!("[flush] 上下文压缩前保存重要信息...");
+
+        // 与 Hermes 一致: 传入完整对话历史，追加 flush 提示作为用户消息
+        // Hermes: messages + user_message="[System: The session is being compressed...]"
+        let mut flush_messages = messages.to_vec();
+        flush_messages.push(ChatMessage::user(
+            "[System: The session is being compressed. \
+             Save anything worth remembering — prioritize user preferences, \
+             corrections, and recurring patterns over task-specific details.]",
+        ));
+
+        let model = self.config.agents.defaults.model.clone();
+        // 与 Hermes 一致: flush_agent 继承主 agent 的 system prompt
+        let system_prompt = self.context_builder.build_system_prompt();
+        let cache_safe = crate::forked::CacheSafeParams::new(&system_prompt, &model);
+
+        let can_use_tool = crate::forked::create_flush_can_use_tool();
+
+        let mut params = crate::forked::ForkedAgentParams::new(
+            self.provider_pool.clone(),
+            flush_messages,
+            cache_safe,
+        )
+        .with_can_use_tool(can_use_tool)
+        .with_query_source("memory_flush")
+        .with_fork_label("memory_flush")
+        .with_max_turns(1); // 与 Hermes 一致: flush 仅单次 API 调用, 无需多轮
+
+        if let Some(store) = &self.memory_store {
+            params = params.with_memory_store(store.clone());
+        }
+
+        match crate::forked::run_forked_agent(params).await {
+            Ok(result) => {
+                tracing::info!(
+                    tokens_out = result.total_usage.output_tokens,
+                    "[flush] Memory flush 完成"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "[flush] Memory flush 失败, 继续压缩");
+            }
+        }
     }
 
     /// Initialize and load Layer 5 memory injector (7-layer memory system).
@@ -2778,6 +3184,7 @@ impl AgentRuntime {
             event_emitter: None,
             channel_contacts_file: Some(self.paths.channel_contacts_file()),
             response_cache: None,
+            skill_mutex: None,
         })
     }
 
@@ -2989,7 +3396,7 @@ impl AgentRuntime {
     async fn execute_layer4_compact(
         &self,
         messages: &[ChatMessage],
-        _session_key: &str,
+        session_key: &str,
         compact_ctx: Option<CompactContext<'_>>,
         is_auto: bool,
     ) -> crate::compact::CompactResult {
@@ -2998,6 +3405,15 @@ impl AgentRuntime {
         use crate::session_metrics::get_compact_circuit_breaker;
 
         let pre_compact_tokens = estimate_messages_tokens(messages);
+
+        // ========== 0. Memory Flush — 压缩前保存重要信息 ==========
+        self.flush_memory_store_before_compact(messages).await;
+        if let Err(err) = self
+            .flush_memories(session_key, messages, "layer4_compact")
+            .await
+        {
+            warn!(error = %err, session_key = %session_key, "[layer4] Ghost memory file flush failed before compact");
+        }
 
         // ========== 1. 熔断器检查 ==========
         let circuit_breaker = get_compact_circuit_breaker();
@@ -3504,10 +3920,25 @@ impl AgentRuntime {
         let final_response = strip_fake_tool_calls(final_response.trim());
         info!(target: "chat::output", content = %final_response, "Final response");
 
-        if let Some(stub) = self
-            .response_cache
-            .maybe_cache_and_stub(persist_session_key, &final_response)
-        {
+        // Only cache if this turn had substantive tool results — prevents caching
+        // LLM-hallucinated lists from empty/error tool results.
+        // A tool message with empty/null content (e.g. memory_query returning [])
+        // should not qualify as "real" data backing the assistant's list.
+        let has_tool_results = history.iter().any(|m| {
+            m.role == "tool"
+                && match &m.content {
+                    serde_json::Value::String(s) => {
+                        !s.is_empty() && s != "[]" && !s.starts_with("{\"error\"")
+                    }
+                    serde_json::Value::Null => false,
+                    _ => true,
+                }
+        });
+        if let Some(stub) = self.response_cache.maybe_cache_and_stub(
+            persist_session_key,
+            &final_response,
+            has_tool_results,
+        ) {
             overwrite_last_assistant_message(history, &stub);
         }
 
@@ -3879,6 +4310,12 @@ impl AgentRuntime {
                 })
                 .unwrap_or(1);
             manager.on_turn_start(turn_number, &msg.content, &session_key);
+        }
+
+        // Skill Nudge: 记录一次用户轮次 (Memory nudge 基于用户轮次, 不是工具迭代)
+        // 与 Hermes 一致: 仅真实用户消息递增计数器, cron/system/heartbeat 等内部消息不计
+        if msg.channel != "system" && msg.channel != "cron" {
+            self.skill_nudge_engine.record_user_turn();
         }
 
         // ── Refresh memory injector cache if Layer 5 extraction completed ──
@@ -4532,8 +4969,30 @@ impl AgentRuntime {
         // Only dynamic supplement (below) mutates the `tools` vec — no redundant reload.
         let mut _schema_cache_dirty = false;
 
+        // 延迟 Review 状态 (与 Hermes 一致: 在响应发送后触发后台 Review)
+        let mut deferred_review_mode: Option<ReviewMode> = None;
+        let mut deferred_review_snapshot: Vec<ChatMessage> = Vec::new();
+
+        // Memory Nudge: 在 LLM 循环前检查 (与 Hermes 一致: 在 run_conversation 开头检查)
+        // Memory nudge 基于用户轮次，不应在工具迭代中重复触发
+        {
+            let memory_nudge = self.skill_nudge_engine.check_memory_nudge();
+            let has_memory_store = self.memory_store.is_some();
+            let memory_due =
+                memory_nudge != crate::skill_nudge::NudgeResult::NoNudge && has_memory_store;
+            if memory_due {
+                deferred_review_mode = Some(ReviewMode::Memory);
+                deferred_review_snapshot = current_messages.clone();
+                self.skill_nudge_engine.reset_memory();
+            }
+        }
+
         loop {
             debug!(iteration = ?tool_call_counts, "LLM call iteration");
+            // Skill Nudge: 每次迭代 (一次 LLM 调用 + 工具执行) 递增计数器
+            // 参考 Hermes _iters_since_skill 语义: 每轮 iteration 递增 1, 不是每次 tool call
+            self.skill_nudge_engine.record_iteration();
+
             debug!(
                 iteration = ?tool_call_counts,
                 current_messages_len = current_messages.len(),
@@ -4607,16 +5066,25 @@ impl AgentRuntime {
                     .find(|call| call.name == ACTIVATE_SKILL_TOOL_NAME)
                     .cloned();
 
-                // Add assistant message with tool calls
+                // Add assistant message with tool calls — use direct struct literal
+                // to atomically preserve reasoning_content and tool_calls, avoiding
+                // the fragile create-then-mutate pattern that silently loses data
+                // if any field assignment is accidentally removed.
                 let assistant_content = response.content.as_deref().unwrap_or("");
                 let assistant_content = if is_tool_trace_content(assistant_content) {
                     ""
                 } else {
                     assistant_content
                 };
-                let mut assistant_msg = ChatMessage::assistant(assistant_content);
-                assistant_msg.reasoning_content = response.reasoning_content.clone();
-                assistant_msg.tool_calls = Some(response.tool_calls.clone());
+                let assistant_msg = ChatMessage {
+                    id: Some(uuid::Uuid::new_v4().to_string()),
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String(assistant_content.to_string()),
+                    reasoning_content: response.reasoning_content.clone(),
+                    tool_calls: Some(response.tool_calls.clone()),
+                    tool_call_id: None,
+                    name: None,
+                };
                 current_messages.push(assistant_msg.clone());
                 history.push(assistant_msg);
 
@@ -5040,6 +5508,26 @@ impl AgentRuntime {
                     }
                 }
 
+                // Nudge: 每次迭代结束后检查 Skill nudge (与 Hermes 一致: 每轮迭代检查一次)
+                // Memory nudge 已在 LLM 循环前检查 (与 Hermes 一致: 在 run_conversation 开头)
+                let skill_nudge = self.skill_nudge_engine.check_skill_nudge();
+                let has_skill_tool = self.tool_registry.get("skill_manage").is_some();
+                let skill_due =
+                    skill_nudge != crate::skill_nudge::NudgeResult::NoNudge && has_skill_tool;
+
+                if skill_due {
+                    // 如果 Memory nudge 也已触发，升级为 Combined (与 Hermes 一致)
+                    if matches!(deferred_review_mode, Some(ReviewMode::Memory)) {
+                        deferred_review_mode = Some(ReviewMode::Combined);
+                        // 使用最新的 messages snapshot (迭代中的消息更新)
+                        deferred_review_snapshot = current_messages.clone();
+                    } else if deferred_review_mode.is_none() {
+                        deferred_review_mode = Some(ReviewMode::Skill);
+                        deferred_review_snapshot = current_messages.clone();
+                    }
+                    self.skill_nudge_engine.reset_skill();
+                }
+
                 if !over_iteration && !short_circuit_after_tools {
                     should_throttle_next_tool_round = true;
                 }
@@ -5082,7 +5570,11 @@ impl AgentRuntime {
                     match chat_result {
                         Ok(r) => {
                             final_response = r.content.unwrap_or_default();
-                            history.push(ChatMessage::assistant(&final_response));
+                            // 保留 reasoning_content，避免 DeepSeek thinking mode 400 错误
+                            history.push(ChatMessage::assistant_with_reasoning(
+                                &final_response,
+                                r.reasoning_content.clone(),
+                            ));
                         }
                         Err(e) => {
                             warn!(error = %e, "Final no-tools LLM call failed");
@@ -5097,9 +5589,24 @@ impl AgentRuntime {
                 // No tool calls, we have the final response
                 final_response = response.content.unwrap_or_default();
 
-                // Add to history
-                history.push(ChatMessage::assistant(&final_response));
+                // 保留 reasoning_content，避免 DeepSeek thinking mode 400 错误
+                history.push(ChatMessage::assistant_with_reasoning(
+                    &final_response,
+                    response.reasoning_content.clone(),
+                ));
                 break;
+            }
+        }
+
+        // ── 延迟后台 Review (与 Hermes 一致: 在响应发送后触发) ──
+        // 与 Hermes 一致: 只在有完整响应时才触发后台审查
+        // Hermes: `if final_response and not interrupted`
+        if !final_response.is_empty() {
+            if let Some(mode) = deferred_review_mode.take() {
+                if self.config.self_improve.review.enabled {
+                    let notify = Some((msg.channel.clone(), msg.chat_id.clone()));
+                    self.spawn_review(mode, deferred_review_snapshot, notify);
+                }
             }
         }
 
@@ -5832,6 +6339,9 @@ impl AgentRuntime {
             response_cache: Some(
                 Arc::new(self.response_cache.clone()) as blockcell_tools::ResponseCacheHandle
             ),
+            skill_mutex: Some(
+                Arc::new(self.skill_mutex.clone()) as blockcell_tools::SkillMutexHandle
+            ),
         };
 
         // Emit tool_call_start event to WebSocket clients
@@ -5886,6 +6396,8 @@ impl AgentRuntime {
                     if !new_skills.is_empty() {
                         info!(skills = ?new_skills, "🔄 Hot-reloaded new skills");
                     }
+                    // 刷新 Skill 索引摘要 (使下次 LLM 调用获取最新 Skill 列表)
+                    self.context_builder.refresh_skill_index_summary();
                     // Always broadcast so Dashboard refreshes (even for updates to existing skills)
                     if let Some(ref event_tx) = self.event_tx {
                         let event = serde_json::json!({
@@ -5895,6 +6407,25 @@ impl AgentRuntime {
                         let _ = event_tx.send(event.to_string());
                     }
                 }
+            }
+        }
+
+        // Detect skill_manage changes and refresh Skill index summary
+        if !is_error && tool_call.name == "skill_manage" {
+            let action = tool_call
+                .arguments
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if matches!(
+                action,
+                "create" | "patch" | "delete" | "edit" | "write_file" | "remove_file"
+            ) {
+                debug!(
+                    action = action,
+                    "🔄 skill_manage modified skills, refreshing index summary"
+                );
+                self.context_builder.refresh_skill_index_summary();
             }
         }
 
@@ -5991,6 +6522,32 @@ impl AgentRuntime {
             None, // trace_id can be added later
             Some(duration_ms),
         );
+
+        // Skill Nudge: 两个独立计数器 (Skill + Memory)
+        // 与 Hermes 一致: 只有 skill_manage 写操作重置 Skill 计数器 (view/list_skills 等只读操作不重置)
+        // 与 Hermes 一致: 只有 memory 写操作重置 Memory 计数器 (memory_query 等只读操作不重置)
+        let tool_name_str = tool_call.name.as_str();
+        let is_skill_write_tool = tool_name_str == "skill_manage"
+            && matches!(
+                tool_call
+                    .arguments
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                "create" | "patch" | "edit" | "delete" | "write_file" | "remove_file"
+            );
+        let is_memory_write_tool = matches!(
+            tool_name_str,
+            "memory_upsert" | "memory_forget" | "auto_memory"
+        );
+
+        // Skill/Memory 写操作工具使用时重置对应计数器
+        if is_skill_write_tool {
+            self.skill_nudge_engine.reset_skill();
+        }
+        if is_memory_write_tool {
+            self.skill_nudge_engine.reset_memory();
+        }
 
         // Layer 4: Track file reads for Post-Compact recovery
         // 追踪多种文件访问工具的结果，用于 Compact 后恢复
@@ -6341,6 +6898,7 @@ impl AgentRuntime {
                     event_emitter: Some(event_emitter.clone()),
                     channel_contacts_file: Some(paths.channel_contacts_file()),
                     response_cache: None,
+                    skill_mutex: None,
                 };
 
                 // Execute tool synchronously via a new tokio runtime handle
@@ -8336,6 +8894,8 @@ mod tests {
             event_emitter: Some(Arc::new(NoopEmitter)),
             channel_contacts_file: None,
             response_cache: None,
+            skill_mutex: Some(Arc::new(crate::skill_mutex::SkillMutex::new())
+                as blockcell_tools::SkillMutexHandle),
         };
 
         assert!(ctx.event_emitter.is_some());
@@ -8376,7 +8936,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let stub = cache
-            .maybe_cache_and_stub(session_key, &cached_list)
+            .maybe_cache_and_stub(session_key, &cached_list, true)
             .expect("content should be cached");
         let history = vec![ChatMessage::assistant(&stub)];
 

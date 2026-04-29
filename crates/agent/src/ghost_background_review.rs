@@ -372,6 +372,7 @@ fn review_tool_context(paths: &Paths, snapshot: &GhostEpisodeSnapshot) -> Result
         event_emitter: None,
         channel_contacts_file: Some(paths.channel_contacts_file()),
         response_cache: None,
+        skill_mutex: None,
     })
 }
 

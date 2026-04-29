@@ -37,8 +37,11 @@ pub use cache_safe::{
     save_cache_safe_params, CacheSafeParams, ToolDefinition,
 };
 pub use can_use_tool::{
-    create_auto_mem_can_use_tool, create_compact_can_use_tool, create_dream_can_use_tool,
-    create_memory_file_can_use_tool, CanUseToolFn, ToolPermission,
+    build_combined_review_tool_schemas, build_memory_review_tool_schemas,
+    build_skill_review_tool_schemas, create_auto_mem_can_use_tool,
+    create_combined_review_can_use_tool, create_compact_can_use_tool, create_dream_can_use_tool,
+    create_flush_can_use_tool, create_memory_file_can_use_tool, create_memory_review_can_use_tool,
+    create_skill_review_can_use_tool, CanUseToolFn, ToolPermission,
 };
 pub use context::{
     create_subagent_context, AbortController, ContentReplacementState, FileStateCache,

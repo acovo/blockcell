@@ -6,8 +6,7 @@ use blockcell_skills::{EvolutionService, EvolutionServiceConfig, LLMProvider, Sk
 use blockcell_tools::MemoryStoreHandle;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionMode {
@@ -27,6 +26,60 @@ pub struct ActiveSkillContext {
     pub source: SkillSource,
 }
 
+/// Skill 系统引导 (参考 Hermes MEMORY_GUIDANCE)
+///
+/// 注入到系统提示词中, 引导 Agent 正确使用 Skill 系统。
+const SKILL_GUIDANCE: &str = r#"
+## Skill System Guidance
+
+You have a skill system for reusable procedural knowledge.
+
+### Creating skills
+After completing complex tasks (5+ tool calls, errors overcome, user-corrected approach),
+offer to save the workflow as a skill. Use `skill_manage` with action="create".
+
+### Patching skills
+When using a skill and discovering issues not covered by it, patch it immediately
+with `skill_manage` action="patch" — don't wait to be asked.
+
+### Skill maintenance
+Skills that aren't maintained become liabilities. Periodically review skills you use
+and patch them when you find stale instructions or missing steps.
+
+### Memory vs Skill boundary
+- Memory: declarative facts (preferences, environment, conventions)
+- Skill: procedural knowledge (steps, workflows, pitfalls)
+- "User prefers concise responses" → memory
+- "Deploy to K8s requires pushing image first" → skill
+"#;
+
+/// Memory 使用指导 — 参考 Hermes MEMORY_GUIDANCE
+///
+/// 注入到系统提示词中, 引导 Agent 正确使用 Memory 系统。
+const MEMORY_GUIDANCE: &str = r#"
+## Memory Guidance
+
+You have a memory system for storing durable facts about the user and environment.
+
+### What to save
+- User preferences and habits (communication style, language, formatting)
+- Environment facts (OS, shell, project structure, conventions)
+- Important decisions and their rationale
+- Recurring patterns the user has confirmed
+
+### What NOT to save
+- Task progress or temporary state (it changes and becomes stale)
+- Full conversation history (already available in context)
+- Information the user can easily re-derive
+- Speculative or unverified assumptions
+
+### Memory vs Skill boundary
+- Memory: declarative facts (preferences, environment, conventions)
+- Skill: procedural knowledge (steps, workflows, pitfalls)
+- "User prefers concise responses" → memory
+- "Deploy to K8s requires pushing image first" → skill
+"#;
+
 pub struct ContextBuilder {
     paths: Paths,
     skill_manager: Option<SkillManager>,
@@ -37,6 +90,9 @@ pub struct ContextBuilder {
     memory_injector: Option<MemoryInjector>,
     /// Cached capability brief for prompt injection (updated from tick).
     capability_brief: Option<String>,
+    /// Skill 索引摘要 (可用 Skill 列表, 注入到系统提示词)
+    /// 使用 Arc<RwLock> 允许后台 Review Agent 在创建/修改 Skill 后刷新
+    skill_index_summary: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,6 +144,7 @@ impl ContextBuilder {
             memory_store: None,
             memory_injector: None,
             capability_brief: None,
+            skill_index_summary: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -120,6 +177,44 @@ impl ContextBuilder {
             self.capability_brief = None;
         } else {
             self.capability_brief = Some(brief);
+        }
+    }
+
+    /// 设置 Skill 索引摘要 (可用 Skill 列表, 注入到系统提示词)
+    pub fn set_skill_index_summary(&self, summary: String) {
+        let mut s = self
+            .skill_index_summary
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if summary.is_empty() {
+            *s = None;
+        } else {
+            *s = Some(summary);
+        }
+    }
+
+    /// 返回 skill_index_summary Arc 的克隆 (供后台任务共享)
+    pub fn skill_index_summary_arc(&self) -> Arc<RwLock<Option<String>>> {
+        self.skill_index_summary.clone()
+    }
+
+    /// 刷新 Skill 索引摘要 (Skill 变更后调用, 使下次 LLM 调用获取最新 Skill 列表)
+    /// 使用 `&self` (内部 Arc<RwLock>) 以便后台 Review Agent 在完成后刷新
+    pub fn refresh_skill_index_summary(&self) {
+        let skills_dir = self.paths.skills_dir();
+        let mut summary = self
+            .skill_index_summary
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if skills_dir.exists() {
+            let index = crate::skill_index::SkillIndex::build_from_dir(&skills_dir);
+            *summary = if index.entries().is_empty() {
+                None
+            } else {
+                Some(index.to_prompt_summary())
+            };
+        } else {
+            *summary = None;
         }
     }
 
@@ -467,6 +562,31 @@ impl ContextBuilder {
         if is_general {
             prompt.push_str("## Core Tool Scope\n");
             prompt.push_str("You currently have access to the minimal built-in tool kernel only. Specialized domain tools are activated by matching installed skills. Prefer the available core tools unless a skill is explicitly active. If the user's request would be better served by specialized domain capabilities that are not currently active, briefly remind the user that they can install the corresponding skills to extend blockcell.\n\n");
+        }
+
+        // 注入 Skill 系统引导 (参考 Hermes MEMORY_GUIDANCE)
+        if !is_chat {
+            prompt.push_str(SKILL_GUIDANCE);
+            prompt.push('\n');
+        }
+
+        // 注入 Memory 使用指导 (与 Hermes MEMORY_GUIDANCE 对齐)
+        if self.memory_store.is_some() {
+            prompt.push_str(MEMORY_GUIDANCE);
+            prompt.push('\n');
+        }
+
+        // 注入 Skill 索引摘要 (可用 Skill 列表)
+        if let Some(ref summary) = *self
+            .skill_index_summary
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            if !summary.is_empty() {
+                prompt.push_str("\n## Available Skills\n");
+                prompt.push_str(summary);
+                prompt.push('\n');
+            }
         }
 
         prompt

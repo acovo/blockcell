@@ -15,6 +15,7 @@ pub mod exec_local;
 pub mod exec_skill_script;
 pub mod file_ops;
 pub mod fs;
+pub mod fuzzy_match;
 pub mod html_to_md;
 pub mod http_request;
 pub mod image_understand;
@@ -31,8 +32,10 @@ pub mod office;
 pub mod office_write;
 pub mod registry;
 pub mod registry_builder;
+pub mod security_scan;
 pub mod session_recall;
 pub mod session_search;
+pub mod skill_manage;
 pub mod skills;
 pub mod spawn;
 pub mod stream_subscribe;
@@ -116,6 +119,25 @@ pub type CoreEvolutionHandle = Arc<Mutex<dyn CoreEvolutionOps + Send + Sync>>;
 
 /// Opaque handle to the system event emitter, passed through ToolContext.
 pub type EventEmitterHandle = Arc<dyn SystemEventEmitter + Send + Sync>;
+
+/// Opaque guard returned by `try_acquire`. Releases the lock on drop.
+pub type SkillMutexGuard = Arc<dyn Send + Sync>;
+
+/// Opaque handle to the skill mutex, passed through ToolContext.
+/// This avoids a circular dependency between tools and agent crates.
+pub type SkillMutexHandle = Arc<dyn SkillMutexOps + Send + Sync>;
+
+/// Trait abstracting skill mutex operations needed by tools.
+#[async_trait]
+pub trait SkillMutexOps: Send + Sync {
+    /// Check if a skill can be modified (not currently active).
+    async fn can_modify(&self, skill_name: &str) -> bool;
+
+    /// Try to acquire exclusive access to a skill for modification.
+    /// Returns a guard that releases the lock on drop, or None if the skill is active.
+    /// This is preferred over `can_modify` for write operations to prevent TOCTOU races.
+    fn try_acquire(&self, skill_name: &str) -> Option<SkillMutexGuard>;
+}
 
 /// Trait abstracting system event emission needed by tools and runtime services.
 pub trait SystemEventEmitter: Send + Sync {
@@ -277,6 +299,8 @@ pub struct ToolContext {
     pub channel_contacts_file: Option<PathBuf>,
     /// Session response cache handle for session_recall tool.
     pub response_cache: Option<ResponseCacheHandle>,
+    /// Skill mutex handle for checking if a skill is currently active.
+    pub skill_mutex: Option<SkillMutexHandle>,
 }
 
 pub struct ToolSchema {

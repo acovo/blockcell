@@ -562,6 +562,7 @@ fn default_intent_router_profiles() -> HashMap<String, IntentToolProfileConfig> 
                 "toggle_manage".to_string(),
                 "message".to_string(),
                 "agent_status".to_string(),
+                "session_recall".to_string(),
             ],
             intent_tools: HashMap::from([
                 (
@@ -1811,6 +1812,99 @@ pub struct MemoryConfig {
     pub vector: MemoryVectorConfig,
 }
 
+/// Self-Improve 配置 — Nudge + Review 子系统
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfImproveConfig {
+    /// Nudge 配置
+    #[serde(default)]
+    pub nudge: SelfImproveNudgeConfig,
+    /// Review 配置
+    #[serde(default)]
+    pub review: SelfImproveReviewConfig,
+}
+
+/// Self-Improve Nudge 配置 — Skill 和 Memory 使用独立阈值
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfImproveNudgeConfig {
+    /// Skill nudge 软阈值 (默认: 5 次工具迭代)
+    #[serde(default = "default_skill_soft_threshold")]
+    pub skill_soft_threshold: u32,
+    /// Skill nudge 硬阈值 (默认: 10 次工具迭代)
+    #[serde(default = "default_skill_hard_threshold")]
+    pub skill_hard_threshold: u32,
+    /// Memory nudge 软阈值 (默认: 3 次用户轮次)
+    #[serde(default = "default_memory_soft_threshold")]
+    pub memory_soft_threshold: u32,
+    /// Memory nudge 硬阈值 (默认: 6 次用户轮次)
+    #[serde(default = "default_memory_hard_threshold")]
+    pub memory_hard_threshold: u32,
+    /// 是否启用 nudge (默认: true)
+    #[serde(default = "default_true_val")]
+    pub enabled: bool,
+    /// 最小 nudge 间隔秒数 (默认: 300)
+    #[serde(default = "default_min_nudge_interval_secs")]
+    pub min_nudge_interval_secs: u64,
+}
+
+fn default_skill_soft_threshold() -> u32 {
+    5
+}
+fn default_skill_hard_threshold() -> u32 {
+    10
+}
+fn default_memory_soft_threshold() -> u32 {
+    3
+}
+fn default_memory_hard_threshold() -> u32 {
+    6
+}
+fn default_true_val() -> bool {
+    true
+}
+fn default_min_nudge_interval_secs() -> u64 {
+    300
+}
+
+impl Default for SelfImproveNudgeConfig {
+    fn default() -> Self {
+        Self {
+            skill_soft_threshold: 5,
+            skill_hard_threshold: 10,
+            memory_soft_threshold: 3,
+            memory_hard_threshold: 6,
+            enabled: true,
+            min_nudge_interval_secs: 300,
+        }
+    }
+}
+
+/// Self-Improve Review 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfImproveReviewConfig {
+    /// 是否启用 Review (默认: true)
+    #[serde(default = "default_true_val")]
+    pub enabled: bool,
+    /// Review 最大轮次 (默认: 8)
+    #[serde(default = "default_max_review_rounds")]
+    pub max_rounds: u32,
+}
+
+fn default_max_review_rounds() -> u32 {
+    8
+}
+
+impl Default for SelfImproveReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_rounds: 8,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoUpgradeConfig {
@@ -1887,6 +1981,9 @@ pub struct Config {
     /// 是否启用 OpenClaw skill 兼容加载（默认 false）
     #[serde(default)]
     pub openclaw_skill_enabled: bool,
+    /// Self-Improve 配置 (Nudge + Review)
+    #[serde(default)]
+    pub self_improve: SelfImproveConfig,
 }
 
 fn default_cron_tick_interval() -> u64 {
@@ -2034,6 +2131,7 @@ impl Default for Config {
             default_timezone: None,
             cron_tick_interval_secs: default_cron_tick_interval(),
             openclaw_skill_enabled: false,
+            self_improve: SelfImproveConfig::default(),
         }
     }
 }
@@ -2660,6 +2758,9 @@ mod tests {
     #[test]
     fn test_config_load_expands_env_vars_in_json5() {
         let path = temp_config_path("config.json5");
+        // SAFETY: This test runs in a single-threaded context. The environment
+        // variable modification is isolated to this test's scope and will be
+        // cleaned up at the end of the test. No other threads access these vars.
         unsafe {
             std::env::set_var("BLOCKCELL_TEST_OPENAI_KEY", "sk-from-env");
             std::env::remove_var("BLOCKCELL_TEST_MODEL");
