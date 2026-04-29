@@ -26,9 +26,7 @@ use crate::error::{
     classify_tool_failure, dangerous_exec_denied, dangerous_file_ops_denied, disabled_skill_result,
     disabled_tool_result, llm_exhausted_error, scoped_tool_denied_result, ToolFailureKind,
 };
-use crate::ghost_background_review::{
-    spawn_background_review_for_episode, spawn_pending_background_reviews,
-};
+use crate::ghost_background_review::spawn_pending_background_reviews;
 use crate::ghost_learning::{
     estimate_turn_complexity_score, GhostEpisodeSnapshot, GhostLearningBoundary,
     GhostLearningBoundaryKind, GhostLearningPolicy, LearningDecision,
@@ -3396,7 +3394,7 @@ impl AgentRuntime {
     async fn execute_layer4_compact(
         &self,
         messages: &[ChatMessage],
-        session_key: &str,
+        _session_key: &str,
         compact_ctx: Option<CompactContext<'_>>,
         is_auto: bool,
     ) -> crate::compact::CompactResult {
@@ -3408,12 +3406,6 @@ impl AgentRuntime {
 
         // ========== 0. Memory Flush — 压缩前保存重要信息 ==========
         self.flush_memory_store_before_compact(messages).await;
-        if let Err(err) = self
-            .flush_memories(session_key, messages, "layer4_compact")
-            .await
-        {
-            warn!(error = %err, session_key = %session_key, "[layer4] Ghost memory file flush failed before compact");
-        }
 
         // ========== 1. 熔断器检查 ==========
         let circuit_breaker = get_compact_circuit_breaker();
@@ -5632,7 +5624,7 @@ impl AgentRuntime {
             }
         }
 
-        let ghost_learning_episode_id = match self.capture_turn_end_learning_boundary(
+        let _ghost_learning_episode_id = match self.capture_turn_end_learning_boundary(
             &msg,
             &history,
             &final_response,
@@ -5896,15 +5888,7 @@ impl AgentRuntime {
             manager.queue_prefetch_all(&msg.content, &session_key);
         }
 
-        if let Some(episode_id) = ghost_learning_episode_id {
-            spawn_background_review_for_episode(
-                self.paths.clone(),
-                Arc::clone(&self.provider_pool),
-                episode_id,
-            );
-        } else {
-            self.spawn_pending_ghost_background_reviews();
-        }
+        self.spawn_pending_ghost_background_reviews();
 
         Ok(delivered_response)
     }
