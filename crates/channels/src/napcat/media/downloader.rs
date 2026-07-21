@@ -133,7 +133,6 @@ impl DownloaderManager {
         // Import downloaders at runtime to avoid circular dependencies
         let downloaders: Vec<Box<dyn MediaDownloader>> = vec![
             Box::new(super::base64_data::Base64DataDownloader::new()),
-            Box::new(super::local_file::LocalFileDownloader::new()),
             Box::new(super::napcat_stream::NapCatStreamDownloader::new(
                 config.clone(),
             )),
@@ -154,6 +153,12 @@ impl DownloaderManager {
     /// 3. Executes the download with fallback strategies
     pub async fn download(&self, request: UnifiedDownloadRequest) -> Result<UnifiedDownloadResult> {
         let _start_time = Instant::now();
+
+        if request.source.trim_start().starts_with("file:") {
+            return Err(Error::PermissionDenied(
+                "Local file media sources are not accepted from inbound messages".to_string(),
+            ));
+        }
 
         // Detect URL type
         let detection = detect_url_type(&request.source, &request.config);
@@ -202,6 +207,9 @@ impl DownloaderManager {
 
     /// Check if a URL can be downloaded.
     pub fn can_download(&self, url: &str, config: &NapCatConfig) -> bool {
+        if url.trim_start().starts_with("file:") {
+            return false;
+        }
         let detection = detect_url_type(url, config);
 
         // Check if any downloader can handle this URL
@@ -227,7 +235,8 @@ pub async fn download_raw_data(url: &str, config: &NapCatConfig) -> Result<Vec<u
     // NapCat's download_file_stream API only works with NapCat-proxied URLs.
     if matches!(detection.url_type, UrlType::QqImageCdn | UrlType::QqFileCdn) {
         debug!(url = %url, url_type = ?detection.url_type, "Using DirectHttp for QQ CDN URL");
-        return super::direct_http::download_via_http(url).await;
+        return super::direct_http::download_via_http_limited(url, config.max_auto_download_size)
+            .await;
     }
 
     // Try NapCat stream first for NapCat proxy URLs
@@ -241,7 +250,8 @@ pub async fn download_raw_data(url: &str, config: &NapCatConfig) -> Result<Vec<u
     if detection.url_type == UrlType::ExternalHttp
         || detection.strategy == DownloadStrategy::DirectHttp
     {
-        return super::direct_http::download_via_http(url).await;
+        return super::direct_http::download_via_http_limited(url, config.max_auto_download_size)
+            .await;
     }
 
     // Last resort: try NapCat stream for unknown types (might be file IDs)
@@ -282,6 +292,14 @@ mod tests {
         assert_eq!(request.workspace, "/workspace");
         assert_eq!(request.chat_id, "user:123");
         assert!(request.filename.is_none());
+    }
+
+    #[test]
+    fn default_manager_rejects_local_file_sources() {
+        let config = test_config();
+        let manager = DownloaderManager::new(&config);
+        assert!(!manager.can_download("file:///etc/passwd", &config));
+        assert!(!manager.can_download("file:../../secret", &config));
     }
 
     #[test]

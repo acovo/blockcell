@@ -35,7 +35,7 @@ impl MediaDownloader for NapCatStreamDownloader {
             detection.strategy,
             DownloadStrategy::NapCatStream | DownloadStrategy::NapCatRegular
         ) && !url.starts_with("base64://")
-            && !url.starts_with("file://")
+            && !url.starts_with("file:")
     }
 
     async fn download(&self, request: UnifiedDownloadRequest) -> Result<UnifiedDownloadResult> {
@@ -52,6 +52,12 @@ impl MediaDownloader for NapCatStreamDownloader {
 
         // Download via NapCat stream API
         let data = download_via_napcat_stream(url, &self.config).await?;
+        if data.len() as u64 > request.config.max_auto_download_size {
+            return Err(Error::Channel(format!(
+                "Media download exceeds size limit of {} bytes",
+                request.config.max_auto_download_size
+            )));
+        }
 
         // Determine filename - handle empty string case
         let filename = request
@@ -96,16 +102,24 @@ impl MediaDownloader for NapCatStreamDownloader {
 /// Download file data via NapCat streaming API.
 ///
 /// This function uses WebSocket streaming API for all modes.
-pub async fn download_via_napcat_stream(url: &str, _config: &NapCatConfig) -> Result<Vec<u8>> {
+pub async fn download_via_napcat_stream(url: &str, config: &NapCatConfig) -> Result<Vec<u8>> {
     debug!(url = %url, "Starting NapCat stream download");
 
-    download_via_ws_stream(url).await
+    let max_bytes = usize::try_from(config.max_auto_download_size).unwrap_or(usize::MAX);
+    let data = download_via_ws_stream(url, max_bytes).await?;
+    if data.len() as u64 > config.max_auto_download_size {
+        return Err(Error::Channel(format!(
+            "Media download exceeds size limit of {} bytes",
+            config.max_auto_download_size
+        )));
+    }
+    Ok(data)
 }
 
 /// Download via WebSocket streaming API.
-async fn download_via_ws_stream(url: &str) -> Result<Vec<u8>> {
+async fn download_via_ws_stream(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
     use crate::napcat::types::ApiRequest;
-    use crate::napcat::websocket::{call_stream_api_via_ws, is_ws_stream_available};
+    use crate::napcat::websocket::{call_stream_api_via_ws_limited, is_ws_stream_available};
 
     if !is_ws_stream_available() {
         return Err(Error::Channel("WebSocket stream not available".to_string()));
@@ -113,7 +127,7 @@ async fn download_via_ws_stream(url: &str) -> Result<Vec<u8>> {
 
     let request = ApiRequest::download_file_stream(url, Some(3), None, None);
 
-    call_stream_api_via_ws(request)
+    call_stream_api_via_ws_limited(request, max_bytes)
         .await
         .map_err(|e| Error::Channel(format!("WebSocket stream download failed: {}", e)))
 }
@@ -143,18 +157,31 @@ pub async fn save_to_local(
     let subdir_name = if chat_id.starts_with("group:") {
         // Group chat: 2026-03-23_GROUP_1083997779
         let id = chat_id.strip_prefix("group:").unwrap_or(chat_id);
-        format!("{}_GROUP_{}", date_str, id)
+        format!(
+            "{}_GROUP_{}",
+            date_str,
+            crate::security::safe_path_component(id)
+        )
     } else if chat_id.starts_with("user:") {
         // Private chat: 2026-03-23_USER_123456
         let id = chat_id.strip_prefix("user:").unwrap_or(chat_id);
-        format!("{}_USER_{}", date_str, id)
+        format!(
+            "{}_USER_{}",
+            date_str,
+            crate::security::safe_path_component(id)
+        )
     } else {
         // Fallback: use chat_id as-is
-        format!("{}_{}", date_str, chat_id)
+        format!(
+            "{}_{}",
+            date_str,
+            crate::security::safe_path_component(chat_id)
+        )
     };
 
+    let relative_download_dir = crate::security::safe_relative_dir(media_download_dir)?;
     let downloads_dir = Path::new(&workspace_dir)
-        .join(media_download_dir)
+        .join(relative_download_dir)
         .join(&subdir_name);
 
     // Create directory if needed
@@ -163,8 +190,19 @@ pub async fn save_to_local(
             .map_err(|e| Error::Tool(format!("Failed to create downloads directory: {}", e)))?;
     }
 
+    let canonical_workspace = std::fs::canonicalize(&workspace_dir)
+        .map_err(|e| Error::Tool(format!("Failed to resolve workspace directory: {}", e)))?;
+    let canonical_downloads = std::fs::canonicalize(&downloads_dir)
+        .map_err(|e| Error::Tool(format!("Failed to resolve downloads directory: {}", e)))?;
+    if !canonical_downloads.starts_with(&canonical_workspace) {
+        return Err(Error::PermissionDenied(
+            "Media download directory resolves outside the workspace".to_string(),
+        ));
+    }
+
     // Build file path
-    let file_path = downloads_dir.join(filename);
+    let safe_name = crate::security::unique_media_filename(filename)?;
+    let file_path = canonical_downloads.join(safe_name);
 
     // Write file
     let mut file = tokio::fs::File::create(&file_path)

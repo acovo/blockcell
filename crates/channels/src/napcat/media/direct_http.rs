@@ -29,6 +29,7 @@ impl DirectHttpDownloader {
     pub fn new() -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(format!(
                 "blockcell/{}",
                 option_env!("CARGO_PKG_VERSION").unwrap_or("unknown")
@@ -43,6 +44,7 @@ impl DirectHttpDownloader {
     pub fn with_timeout(timeout_secs: u64) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(format!(
                 "blockcell/{}",
                 option_env!("CARGO_PKG_VERSION").unwrap_or("unknown")
@@ -62,12 +64,14 @@ impl Default for DirectHttpDownloader {
 
 impl DirectHttpDownloader {
     /// Download data using the stored client.
-    async fn download_with_client(&self, url: &str) -> Result<Vec<u8>> {
+    async fn download_with_client(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>> {
         debug!(url = %url, "Starting HTTP download with client");
+
+        let url = crate::security::validate_public_http_url(url).await?;
 
         let response = self
             .client
-            .get(url)
+            .get(url.clone())
             .send()
             .await
             .map_err(|e| Error::Channel(format!("HTTP request failed: {}", e)))?;
@@ -80,10 +84,7 @@ impl DirectHttpDownloader {
             )));
         }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Error::Channel(format!("Failed to read response body: {}", e)))?;
+        let bytes = crate::security::read_response_limited(response, max_bytes).await?;
 
         info!(url = %url, size = bytes.len(), "HTTP download completed");
         Ok(bytes.to_vec())
@@ -111,7 +112,9 @@ impl MediaDownloader for DirectHttpDownloader {
         );
 
         // Download via HTTP using the stored client
-        let data = self.download_with_client(url).await?;
+        let data = self
+            .download_with_client(url, request.config.max_auto_download_size)
+            .await?;
 
         // Determine filename - handle empty string case
         let filename = request
@@ -157,10 +160,17 @@ impl MediaDownloader for DirectHttpDownloader {
 ///
 /// A lower-level function that performs HTTP GET and returns raw bytes.
 pub async fn download_via_http(url: &str) -> Result<Vec<u8>> {
+    download_via_http_limited(url, crate::security::MAX_MEDIA_DOWNLOAD_BYTES).await
+}
+
+pub async fn download_via_http_limited(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     debug!(url = %url, "Starting HTTP download");
+
+    let url = crate::security::validate_public_http_url(url).await?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!(
             "blockcell/{}",
             option_env!("CARGO_PKG_VERSION").unwrap_or("unknown")
@@ -169,7 +179,7 @@ pub async fn download_via_http(url: &str) -> Result<Vec<u8>> {
         .unwrap_or_else(|_| Client::new());
 
     let response = client
-        .get(url)
+        .get(url.clone())
         .send()
         .await
         .map_err(|e| Error::Channel(format!("HTTP request failed: {}", e)))?;
@@ -182,10 +192,7 @@ pub async fn download_via_http(url: &str) -> Result<Vec<u8>> {
         )));
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| Error::Channel(format!("Failed to read response: {}", e)))?;
+    let bytes = crate::security::read_response_limited(response, max_bytes).await?;
 
     info!(url = %url, size = bytes.len(), "HTTP download completed");
     Ok(bytes.to_vec())

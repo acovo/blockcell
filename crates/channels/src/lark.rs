@@ -80,6 +80,10 @@ pub struct WebhookBody {
 pub struct EventHeader {
     pub event_id: String,
     pub event_type: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub app_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,32 +244,40 @@ async fn is_duplicate(event_id: &str) -> bool {
 
 /// Process a raw webhook body string. Returns the HTTP response body JSON string.
 /// `inbound_tx` is None when called in verification-only mode.
-fn resolve_lark_plain_webhook_config(config: &Config, body: &WebhookBody) -> Config {
+fn resolve_lark_plain_webhook_config(config: &Config, body: &WebhookBody) -> Result<Config> {
     let listeners = lark_scoped_configs(config);
     if listeners.is_empty() {
-        return config.clone();
-    }
-    if listeners.len() == 1 {
-        return listeners[0].config.clone();
-    }
-
-    if let Some(token) = body.token.as_deref().filter(|value| !value.is_empty()) {
-        for listener in &listeners {
-            if listener.config.channels.lark.verification_token == token {
-                return listener.config.clone();
-            }
-        }
+        return Err(Error::PermissionDenied(
+            "Lark webhook has no enabled listener".to_string(),
+        ));
     }
 
-    if let Some(app_id) = body.app_id.as_deref().filter(|value| !value.is_empty()) {
-        for listener in &listeners {
-            if listener.config.channels.lark.app_id == app_id {
-                return listener.config.clone();
-            }
-        }
-    }
-
-    config.clone()
+    let token = body
+        .token
+        .as_deref()
+        .or_else(|| {
+            body.header
+                .as_ref()
+                .and_then(|header| header.token.as_deref())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::PermissionDenied("Missing Lark verification token".to_string()))?;
+    let claimed_app_id = body.app_id.as_deref().or_else(|| {
+        body.header
+            .as_ref()
+            .and_then(|header| header.app_id.as_deref())
+    });
+    listeners
+        .into_iter()
+        .find(|listener| {
+            let expected = listener.config.channels.lark.verification_token.trim();
+            let app_matches = claimed_app_id
+                .map(|app_id| listener.config.channels.lark.app_id == app_id)
+                .unwrap_or(true);
+            !expected.is_empty() && expected == token && app_matches
+        })
+        .map(|listener| listener.config)
+        .ok_or_else(|| Error::PermissionDenied("Invalid Lark verification token".to_string()))
 }
 
 /// 根据 webhook body 解析匹配的 account_id，供 gateway 计算 agent 级别的 media_dir。
@@ -275,10 +287,6 @@ pub fn resolve_lark_webhook_account_id(config: &Config, raw_body: &str) -> Optio
     if listeners.is_empty() {
         return None;
     }
-    if listeners.len() == 1 {
-        return listeners[0].account_id.clone();
-    }
-
     // 加密 webhook：外层 body 只有 encrypt 字段，无法通过 token/app_id 匹配。
     // 遍历每个 listener 的 encrypt_key 尝试解密，成功则返回该 listener 的 account_id。
     if let Some(encrypted) = body.encrypt.as_deref().filter(|v| !v.is_empty()) {
@@ -287,27 +295,17 @@ pub fn resolve_lark_webhook_account_id(config: &Config, raw_body: &str) -> Optio
             if encrypt_key.is_empty() {
                 continue;
             }
-            if decrypt_lark(encrypt_key, encrypted).is_ok() {
-                return listener.account_id.clone();
+            if let Ok(plaintext) = decrypt_lark(encrypt_key, encrypted) {
+                let inner: WebhookBody = serde_json::from_str(&plaintext).ok()?;
+                if resolve_lark_plain_webhook_config(&listener.config, &inner).is_ok() {
+                    return listener.account_id.clone();
+                }
             }
         }
     }
 
-    if let Some(token) = body.token.as_deref().filter(|v| !v.is_empty()) {
-        for listener in &listeners {
-            if listener.config.channels.lark.verification_token == token {
-                return listener.account_id.clone();
-            }
-        }
-    }
-    if let Some(app_id) = body.app_id.as_deref().filter(|v| !v.is_empty()) {
-        for listener in &listeners {
-            if listener.config.channels.lark.app_id == app_id {
-                return listener.account_id.clone();
-            }
-        }
-    }
-    None
+    let resolved = resolve_lark_plain_webhook_config(config, &body).ok()?;
+    lark_account_id(&resolved)
 }
 
 pub async fn process_webhook(
@@ -343,7 +341,7 @@ pub async fn process_webhook(
         ));
     }
 
-    let resolved_config = resolve_lark_plain_webhook_config(config, &body);
+    let resolved_config = resolve_lark_plain_webhook_config(config, &body)?;
 
     // ── URL verification ────────────────────────────────────────────────────
     if body.event_type.as_deref() == Some("url_verification") {
@@ -667,10 +665,9 @@ async fn download_lark_resource(
     );
     let file_path = media_dir.join(&filename);
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| Error::Channel(format!("Lark resource read body failed: {}", e)))?;
+    let bytes =
+        crate::security::read_response_limited(resp, crate::security::MAX_MEDIA_DOWNLOAD_BYTES)
+            .await?;
 
     tokio::fs::write(&file_path, &bytes)
         .await
@@ -1128,12 +1125,41 @@ mod tests {
             event: None,
         };
 
-        let resolved = resolve_lark_plain_webhook_config(&config, &body);
+        let resolved = resolve_lark_plain_webhook_config(&config, &body).unwrap();
         assert_eq!(
             resolved.channels.lark.default_account_id.as_deref(),
             Some("intl")
         );
         assert_eq!(resolved.channels.lark.verification_token, "verify-intl");
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_missing_or_wrong_verification_token() {
+        let mut config = Config::default();
+        config.channels.lark.enabled = true;
+        config.channels.lark.app_id = "cli_test".to_string();
+        config.channels.lark.verification_token = "expected-secret".to_string();
+
+        for raw in [
+            r#"{"type":"url_verification","challenge":"ok"}"#,
+            r#"{"type":"url_verification","challenge":"ok","token":"wrong"}"#,
+        ] {
+            let result = process_webhook(&config, raw, None, PathBuf::new()).await;
+            assert!(matches!(result, Err(Error::PermissionDenied(_))));
+        }
+    }
+
+    #[test]
+    fn webhook_accepts_v2_header_verification_token() {
+        let mut config = Config::default();
+        config.channels.lark.enabled = true;
+        config.channels.lark.app_id = "cli_test".to_string();
+        config.channels.lark.verification_token = "expected-secret".to_string();
+        let body: WebhookBody = serde_json::from_str(
+            r#"{"header":{"event_id":"evt","event_type":"other","token":"expected-secret","app_id":"cli_test"}}"#,
+        )
+        .unwrap();
+        assert!(resolve_lark_plain_webhook_config(&config, &body).is_ok());
     }
 
     #[test]

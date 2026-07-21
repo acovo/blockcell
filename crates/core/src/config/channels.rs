@@ -381,7 +381,7 @@ pub struct NapCatConfig {
     // WebSocket Server Mode Configuration
     // =========================================================================
     /// WebSocket server host (ws-server mode).
-    /// Default: "0.0.0.0"
+    /// Default: "127.0.0.1"
     #[serde(default = "default_napcat_server_host")]
     pub server_host: String,
     /// WebSocket server port (ws-server mode).
@@ -483,7 +483,7 @@ fn default_napcat_mode() -> String {
 }
 
 fn default_napcat_server_host() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 
 fn default_napcat_server_port() -> u16 {

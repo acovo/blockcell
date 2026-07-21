@@ -272,18 +272,21 @@ impl TelegramChannel {
             TELEGRAM_API_BASE, self.config.channels.telegram.token, file_path
         );
 
-        let file_data = self
+        let response = self
             .client
             .get(&download_url)
             .send()
             .await
-            .map_err(|e| Error::Channel(format!("Failed to download file: {}", e)))?
-            .bytes()
-            .await
-            .map_err(|e| Error::Channel(format!("Failed to read file data: {}", e)))?;
+            .map_err(|e| Error::Channel(format!("Failed to download file: {}", e)))?;
+        let file_data = crate::security::read_response_limited(
+            response,
+            crate::security::MAX_MEDIA_DOWNLOAD_BYTES,
+        )
+        .await?;
 
         // Save to media directory
-        let local_path = self.media_dir.join(filename);
+        let safe_name = crate::security::unique_media_filename(filename)?;
+        let local_path = self.media_dir.join(safe_name);
         let mut file = tokio::fs::File::create(&local_path)
             .await
             .map_err(|e| Error::Channel(format!("Failed to create file: {}", e)))?;

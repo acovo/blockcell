@@ -193,6 +193,14 @@ pub async fn process_media_segments(
                 size,
                 ..
             } => {
+                if u64::try_from(size.unwrap_or(0)).unwrap_or(0) > config.max_auto_download_size {
+                    warn!(
+                        size = size.unwrap_or(0),
+                        max_size = config.max_auto_download_size,
+                        "Skipping auto-download: file too large"
+                    );
+                    continue;
+                }
                 // Determine if this is a private chat
                 let is_private = chat_id.starts_with("user:");
                 let user_id = if is_private {

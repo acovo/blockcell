@@ -156,6 +156,12 @@ impl MediaDownloader for Base64DataDownloader {
 
         // Decode the base64 data
         let (data, mime_type) = Self::decode_data_url(url)?;
+        if data.len() as u64 > request.config.max_auto_download_size {
+            return Err(Error::Channel(format!(
+                "Media download exceeds size limit of {} bytes",
+                request.config.max_auto_download_size
+            )));
+        }
 
         info!(
             size = data.len(),

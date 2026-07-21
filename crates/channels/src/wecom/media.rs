@@ -169,12 +169,10 @@ pub(crate) fn decrypt_wecom_msg(
         return Err("encodingAesKey not configured".to_string());
     }
 
-    tracing::info!(
-        encoding_aes_key_raw = %encoding_aes_key,
-        msg_encrypt_raw = %msg_encrypt,
+    tracing::debug!(
         encoding_aes_key_len = encoding_aes_key.len(),
         msg_encrypt_len = msg_encrypt.len(),
-        "WeCom decrypt: raw inputs"
+        "WeCom decrypt: received encrypted payload"
     );
 
     // AES key: WeCom's EncodingAESKey is always exactly 43 chars of standard base64
@@ -186,8 +184,7 @@ pub(crate) fn decrypt_wecom_msg(
         .collect();
     let key_trimmed = key_compact.trim_end_matches('=');
 
-    tracing::info!(
-        key_trimmed = %key_trimmed,
+    tracing::debug!(
         key_trimmed_len = key_trimmed.len(),
         "WeCom decrypt: key after normalisation"
     );
@@ -205,8 +202,7 @@ pub(crate) fn decrypt_wecom_msg(
         }
     };
 
-    tracing::info!(
-        padded_key = %padded_key,
+    tracing::debug!(
         padded_key_len = padded_key.len(),
         "WeCom decrypt: padded key"
     );
@@ -220,12 +216,9 @@ pub(crate) fn decrypt_wecom_msg(
             .with_decode_padding_mode(DecodePaddingMode::Indifferent)
             .with_decode_allow_trailing_bits(true),
     );
-    let key_bytes = LENIENT.decode(&padded_key).map_err(|e| {
-        format!(
-            "Failed to decode EncodingAESKey: {}. Key was: '{}'",
-            e, padded_key
-        )
-    })?;
+    let key_bytes = LENIENT
+        .decode(&padded_key)
+        .map_err(|e| format!("Failed to decode EncodingAESKey: {}", e))?;
     if key_bytes.len() != 32 {
         return Err(format!(
             "AES key length invalid after base64 decode: {} (expected 32). Please verify WeCom EncodingAESKey is correct (usually 43 chars, no '=').",
@@ -237,17 +230,15 @@ pub(crate) fn decrypt_wecom_msg(
     let iv = &key_bytes[..16];
 
     // Decode ciphertext
-    tracing::info!(
-        msg_encrypt = %msg_encrypt,
+    tracing::debug!(
         msg_encrypt_len = msg_encrypt.len(),
         "WeCom decrypt: decoding msg_encrypt ciphertext"
     );
     let ciphertext = general_purpose::STANDARD.decode(msg_encrypt).map_err(|e| {
         format!(
-            "Failed to decode msg_encrypt (len={}): {}. Value was: '{}'",
+            "Failed to decode msg_encrypt (len={}): {}",
             msg_encrypt.len(),
-            e,
-            msg_encrypt
+            e
         )
     })?;
 
@@ -974,5 +965,19 @@ pub(crate) fn build_media_body_group(
             "file": { "media_id": media_id },
             "safe": 0
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decrypt_errors_do_not_echo_secrets() {
+        let key = "TOP_SECRET_INVALID_KEY";
+        let ciphertext = "TOP_SECRET_INVALID_CIPHERTEXT";
+        let error = decrypt_wecom_msg(ciphertext, key).unwrap_err();
+        assert!(!error.contains(key));
+        assert!(!error.contains(ciphertext));
     }
 }

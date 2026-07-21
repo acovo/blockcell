@@ -43,8 +43,14 @@ pub(super) async fn handle_lark_webhook(
             (StatusCode::OK, axum::Json(val)).into_response()
         }
         Err(e) => {
-            tracing::error!(error = %e, "Lark webhook processing error");
-            (StatusCode::OK, axum::Json(serde_json::json!({"code": 0}))).into_response()
+            let status = if matches!(e, blockcell_core::Error::PermissionDenied(_)) {
+                tracing::warn!(error = %e, "Lark webhook authentication rejected");
+                StatusCode::UNAUTHORIZED
+            } else {
+                tracing::error!(error = %e, "Lark webhook processing error");
+                StatusCode::BAD_REQUEST
+            };
+            (status, axum::Json(serde_json::json!({"code": 1}))).into_response()
         }
     }
 }

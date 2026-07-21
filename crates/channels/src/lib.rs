@@ -1,6 +1,7 @@
 pub mod account;
 pub mod manager;
 pub mod rate_limit;
+pub(crate) mod security;
 
 #[cfg(feature = "telegram")]
 pub mod telegram;

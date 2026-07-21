@@ -534,10 +534,9 @@ impl FeishuChannel {
         );
         let path = self.media_dir.join(&filename);
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Channel(format!("Failed to read media bytes: {}", e)))?;
+        let bytes =
+            crate::security::read_response_limited(resp, crate::security::MAX_MEDIA_DOWNLOAD_BYTES)
+                .await?;
 
         tokio::fs::write(&path, &bytes)
             .await

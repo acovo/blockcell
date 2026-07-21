@@ -109,14 +109,14 @@ impl WeComChannel {
                             info!(chat_id = %chat_id, req_id = %req_id, content_len = content.len(), "WeCom longconn: sending text reply");
                             let msg = serde_json::json!({
                                 "cmd": "aibot_respond_msg",
-                                "headers": { "req_id": req_id },
+                                "headers": { "req_id": req_id.clone() },
                                 "body": {
                                     "msgtype": "stream",
                                     "stream": { "id": stream_id, "finish": true, "content": content }
                                 }
                             });
                             let msg_str = msg.to_string();
-                            info!(payload = %msg_str, "WeCom longconn: outbound WS payload");
+                            debug!(req_id = %req_id, payload_len = msg_str.len(), "WeCom longconn: outbound WS payload ready");
                             if let Err(e) = write.send(WsMessage::Text(msg_str)).await {
                                 warn!(error = %e, "WeCom longconn: failed to send outbound reply");
                             }
@@ -298,7 +298,10 @@ impl WeComChannel {
                 }
             }
             "aibot_event_callback" => {
-                debug!(payload = %text, "WeCom long connection event callback received");
+                debug!(
+                    payload_len = text.len(),
+                    "WeCom long connection event callback received"
+                );
                 let headers: LongConnHeaders = serde_json::from_value(envelope.headers.clone())
                     .unwrap_or(LongConnHeaders { req_id: None });
                 if let Some(req_id) = headers.req_id {
@@ -327,7 +330,7 @@ impl WeComChannel {
                 // Only warn if the payload actually contains an error code.
                 let errcode = envelope.errcode.unwrap_or(0);
                 if errcode != 0 {
-                    warn!(cmd = %other, errcode, payload = %text, "WeCom long connection: received error response");
+                    warn!(cmd = %other, errcode, payload_len = text.len(), "WeCom long connection: received error response");
                 } else {
                     debug!(cmd = %other, "WeCom long connection: received ack");
                 }

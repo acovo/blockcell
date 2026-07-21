@@ -398,7 +398,7 @@ impl DingTalkChannel {
                             }
                         }
                         Err(e) => {
-                            debug!(error = %e, raw = %text, "Failed to parse DingTalk stream event");
+                            debug!(error = %e, payload_len = text.len(), "Failed to parse DingTalk stream event");
                         }
                     }
                 }

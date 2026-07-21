@@ -393,10 +393,9 @@ impl DiscordChannel {
         let filename = format!("discord_{}_{}", &attachment.id, &attachment.filename);
         let path = self.media_dir.join(&filename);
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Channel(format!("Failed to read attachment bytes: {}", e)))?;
+        let bytes =
+            crate::security::read_response_limited(resp, crate::security::MAX_MEDIA_DOWNLOAD_BYTES)
+                .await?;
 
         tokio::fs::write(&path, &bytes)
             .await

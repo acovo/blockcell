@@ -25,6 +25,7 @@
 
 use futures::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +50,21 @@ static DEDUP_CACHE: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::Onc
 
 /// Maximum number of concurrent WebSocket connections.
 const MAX_CONNECTIONS: usize = 100;
+
+fn validate_server_auth(host: &str, access_token: &str) -> Result<()> {
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if !loopback && access_token.trim().is_empty() {
+        return Err(Error::Config(
+            "NapCat WebSocket server requires an access token when bound outside loopback"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
 
 fn dedup_cache() -> &'static Mutex<HashSet<String>> {
     DEDUP_CACHE.get_or_init(|| Mutex::new(HashSet::new()))
@@ -126,6 +142,11 @@ impl NapCatWsServer {
         let port = napcat.server_port;
         let server_path = &napcat.server_path;
         let access_token = &napcat.access_token;
+
+        if let Err(e) = validate_server_auth(host, access_token) {
+            error!(error = %e, host = %host, "Refusing unsafe NapCat WebSocket server configuration");
+            return;
+        }
 
         let bind_addr = format!("{}:{}", host, port);
 
@@ -1314,6 +1335,14 @@ impl NapCatWsServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_bind_requires_access_token() {
+        assert!(validate_server_auth("0.0.0.0", "").is_err());
+        assert!(validate_server_auth("192.168.1.10", "").is_err());
+        assert!(validate_server_auth("0.0.0.0", "secret").is_ok());
+        assert!(validate_server_auth("127.0.0.1", "").is_ok());
+    }
 
     #[test]
     fn test_is_user_allowed_empty_allowlist() {
