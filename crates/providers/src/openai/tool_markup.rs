@@ -10,7 +10,7 @@ use tracing::warn;
 
 use blockcell_core::types::ToolCallRequest;
 
-use super::{truncate_at_char_boundary, OpenAIProvider};
+use super::OpenAIProvider;
 
 impl OpenAIProvider {
     /// Build a text description of tools to inject into the system prompt.
@@ -273,10 +273,7 @@ impl OpenAIProvider {
             }
         }
 
-        Err(format!(
-            "unrecognized native tool-call arguments: {}",
-            &trimmed[..truncate_at_char_boundary(trimmed, 200)]
-        ))
+        Err("unrecognized native tool-call arguments".to_string())
     }
 
     pub(super) fn normalize_text_tool_markup(content: &str) -> String {
@@ -394,7 +391,7 @@ impl OpenAIProvider {
                         tool_calls.push(tc);
                         call_index += 1;
                     } else {
-                        warn!(json = %block, "Failed to parse tool_call JSON");
+                        warn!(block_len = block.len(), "Failed to parse tool_call JSON");
                         remaining.push_str(
                             &rest[start..start + "<tool_call>".len() + end + "</tool_call>".len()],
                         );
@@ -427,7 +424,7 @@ impl OpenAIProvider {
                             tool_calls.push(tc);
                             call_index += 1;
                         } else {
-                            warn!(block = %block, "Failed to parse [TOOL_CALL] block");
+                            warn!(block_len = block.len(), "Failed to parse [TOOL_CALL] block");
                         }
                         rest2 = &after_tag[end + "[/tool_call]".len()..];
                     } else {

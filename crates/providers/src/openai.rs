@@ -15,21 +15,13 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::client::build_http_client;
+use crate::security::{
+    consume_error_body, http_status_error, read_response_limited, redact_url, request_error,
+    StreamGuard, MAX_PROVIDER_RESPONSE_BYTES,
+};
 use crate::Provider;
 
 mod tool_markup;
-
-/// Find the largest byte index <= `max_bytes` that is a valid char boundary.
-fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
-    if max_bytes >= s.len() {
-        return s.len();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
-}
 
 pub struct OpenAIProvider {
     client: Client,
@@ -377,7 +369,7 @@ impl OpenAIProvider {
         } else {
             "no-tools"
         };
-        info!(url = %url, model = %self.model, tools_count = tools.len(), messages_count = messages.len(), mode = %mode, "Calling LLM");
+        info!(url = %redact_url(&url), model = %self.model, tools_count = tools.len(), messages_count = messages.len(), mode = %mode, "Calling LLM");
 
         // 序列化为 Value 以便注入 reasoning_effort/thinking/chat_template_kwargs
         let mut body: Value = serde_json::to_value(&request)
@@ -390,7 +382,7 @@ impl OpenAIProvider {
         let request_body = serde_json::to_string(&body)
             .map_err(|e| Error::Provider(format!("Failed to serialize request: {}", e)))?;
         debug!(body_len = request_body.len(), "Request body prepared");
-        debug!(target: "chat::request", request_body, "Request detail");
+        debug!(body_len = request_body.len(), "LLM request detail redacted");
 
         let response = self
             .client
@@ -400,25 +392,18 @@ impl OpenAIProvider {
             .body(request_body)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("Request failed: {}", e)))?;
+            .map_err(|e| request_error("LLM request failed", e))?;
 
         let status = response.status();
-        let raw_body = response.text().await.unwrap_or_default();
-
         if !status.is_success() {
-            error!(status = %status, body = %raw_body, "LLM API error");
-            return Err(Error::Provider(format!(
-                "API error {}: {}",
-                status, raw_body
-            )));
+            let body_len = consume_error_body(response).await;
+            error!(status = %status, body_len, "LLM API error");
+            return Err(http_status_error("LLM", status, body_len));
         }
+        let raw_bytes = read_response_limited(response, MAX_PROVIDER_RESPONSE_BYTES).await?;
+        let raw_body = String::from_utf8_lossy(&raw_bytes).into_owned();
 
-        {
-            let trimmed = raw_body.trim_start();
-            let end = truncate_at_char_boundary(trimmed, 500);
-            info!(body_len = raw_body.len(), preview = %&trimmed[..end], "LLM raw response");
-        }
-        debug!(target: "chat::response", response = raw_body, "LLM response");
+        debug!(body_len = raw_body.len(), "LLM response received");
 
         let trimmed_body = raw_body.trim();
         if trimmed_body.is_empty() {
@@ -430,11 +415,10 @@ impl OpenAIProvider {
         }
 
         let chat_response: ChatResponse = serde_json::from_str(trimmed_body).map_err(|e| {
-            let end = truncate_at_char_boundary(trimmed_body, 500);
             Error::Provider(format!(
-                "Failed to parse response: {}. Body: {}",
+                "Failed to parse response: {} (body_len={})",
                 e,
-                &trimmed_body[..end]
+                raw_body.len()
             ))
         })?;
 
@@ -625,8 +609,8 @@ impl Provider for OpenAIProvider {
                     .unwrap_or_else(|err| {
                         warn!(
                             tool = %tc.function.name,
-                            error = %err,
-                            raw_arguments = %tc.function.arguments,
+                            error_kind = %err,
+                            arguments_len = tc.function.arguments.len(),
                             "Failed to parse native tool-call arguments; falling back to empty object"
                         );
                         Value::Object(Map::new())
@@ -783,8 +767,13 @@ impl Provider for OpenAIProvider {
             &self.provider_name,
         );
 
-        info!(url = %url, model = %self.model, "Starting streaming LLM call");
-        debug!(target: "chat::request", request = serde_json::to_string(&body).unwrap_or_default(), "Request detail");
+        info!(url = %redact_url(&url), model = %self.model, "Starting streaming LLM call");
+        debug!(
+            body_len = serde_json::to_string(&body)
+                .map(|value| value.len())
+                .unwrap_or(0),
+            "Streaming request detail redacted"
+        );
 
         let response = self
             .client
@@ -794,15 +783,12 @@ impl Provider for OpenAIProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("Stream request failed: {}", e)))?;
+            .map_err(|e| request_error("LLM stream request failed", e))?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!(
-                "Stream API error {}: {}",
-                status, body
-            )));
+            let body_len = consume_error_body(response).await;
+            return Err(http_status_error("LLM stream", status, body_len));
         }
 
         let (tx, rx) = mpsc::channel(64);
@@ -818,13 +804,23 @@ impl Provider for OpenAIProvider {
             let mut accumulated_reasoning = String::new();
             let mut finish_reason = "stop".to_string();
             let mut usage = Value::Null;
+            let mut completed = false;
             let mut text_tool_markup_filter = TextToolMarkupStreamFilter::new(
                 tools_available && !matches!(mode, ToolCallMode::None),
             );
+            let mut stream_guard = StreamGuard::new(MAX_PROVIDER_RESPONSE_BYTES);
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
+                        if let Err(error) = stream_guard.observe(bytes.len()) {
+                            let _ = tx
+                                .send(StreamChunk::Error {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
                         // 处理 SSE 行
@@ -922,6 +918,7 @@ impl Provider for OpenAIProvider {
 
                                         // 更新 finish_reason
                                         if let Some(fr) = &choice.finish_reason {
+                                            completed = true;
                                             finish_reason = fr.clone();
                                         }
                                     }
@@ -929,14 +926,29 @@ impl Provider for OpenAIProvider {
                                     if let Some(u) = &chunk.usage {
                                         usage = u.clone();
                                     }
+                                } else {
+                                    let _ = tx
+                                        .send(StreamChunk::Error {
+                                            message: "Malformed OpenAI stream event".to_string(),
+                                        })
+                                        .await;
+                                    return;
                                 }
                             }
+                        }
+                        if let Err(error) = stream_guard.check_buffer(buffer.len()) {
+                            let _ = tx
+                                .send(StreamChunk::Error {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                            return;
                         }
                     }
                     Err(e) => {
                         let _ = tx
                             .send(StreamChunk::Error {
-                                message: e.to_string(),
+                                message: request_error("OpenAI stream read failed", e).to_string(),
                             })
                             .await;
                         return;
@@ -944,7 +956,15 @@ impl Provider for OpenAIProvider {
                 }
             }
 
-            // 如果流结束但没有收到 [DONE]，也发送完成事件
+            if let Err(error) = stream_guard.finish(completed, "OpenAI stream") {
+                let _ = tx
+                    .send(StreamChunk::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return;
+            }
+
             if let Some(delta) = text_tool_markup_filter.flush() {
                 let _ = tx.send(StreamChunk::TextDelta { delta }).await;
             }
@@ -952,7 +972,6 @@ impl Provider for OpenAIProvider {
                 .into_values()
                 .map(|acc| acc.to_tool_call_request())
                 .collect();
-
             let response = finalize_stream_response(
                 mode,
                 tools_available,

@@ -8,6 +8,7 @@ pub mod openai;
 pub mod openai_responses;
 pub mod pool;
 pub mod prompt_utils;
+mod security;
 
 use async_trait::async_trait;
 use blockcell_core::types::{ChatMessage, LLMResponse, StreamChunk};

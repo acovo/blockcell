@@ -11,6 +11,10 @@ use serde_json::json;
 
 use crate::client::build_blocking_http_client;
 use crate::factory::default_api_base;
+use crate::security::{
+    consume_blocking_error_body, http_status_error, read_blocking_response_limited, request_error,
+    MAX_PROVIDER_RESPONSE_BYTES,
+};
 
 pub struct OpenAICompatibleEmbedder {
     client: Client,
@@ -61,19 +65,16 @@ impl OpenAICompatibleEmbedder {
                 "input": text,
             }))
             .send()
-            .map_err(|error| Error::Provider(format!("Embedding request failed: {}", error)))?;
+            .map_err(|error| request_error("Embedding request failed", error))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().unwrap_or_default();
-            return Err(Error::Provider(format!(
-                "Embedding request failed with status {}: {}",
-                status, body
-            )));
+        let status = response.status();
+        if !status.is_success() {
+            let body_len = consume_blocking_error_body(response);
+            return Err(http_status_error("Embedding", status, body_len));
         }
+        let body = read_blocking_response_limited(response, MAX_PROVIDER_RESPONSE_BYTES)?;
 
-        let payload: EmbeddingResponse = response
-            .json()
+        let payload: EmbeddingResponse = serde_json::from_slice(&body)
             .map_err(|error| Error::Provider(format!("Embedding decode failed: {}", error)))?;
         let vector = payload
             .data

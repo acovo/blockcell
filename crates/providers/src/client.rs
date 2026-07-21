@@ -4,6 +4,8 @@ use reqwest::{Client, Proxy};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+use crate::security::redact_url;
+
 /// 代理解析结果
 enum ProxyResolution {
     /// 使用指定代理 URL
@@ -123,16 +125,16 @@ pub fn build_http_client(
     match resolve_proxy(provider_proxy, global_proxy, no_proxy, api_base) {
         ProxyResolution::UseProxy(proxy_url) => match Proxy::all(&proxy_url) {
             Ok(p) => {
-                info!(proxy = %proxy_url, api_base = %api_base, "LLM provider using proxy");
+                info!(proxy = %redact_url(&proxy_url), api_base = %redact_url(api_base), "LLM provider using proxy");
                 builder = builder.proxy(p);
             }
-            Err(e) => {
-                warn!(error = %e, proxy = %proxy_url, "Invalid proxy URL, falling back to direct connect");
+            Err(_) => {
+                warn!(proxy = %redact_url(&proxy_url), "Invalid proxy URL, falling back to direct connect");
             }
         },
         ProxyResolution::ForceDirectConnect => {
             // no_proxy() 禁用所有代理（包括环境变量），实现强制直连
-            info!(api_base = %api_base, "LLM provider forced to direct connect (proxy disabled)");
+            info!(api_base = %redact_url(api_base), "LLM provider forced to direct connect (proxy disabled)");
             builder = builder.no_proxy();
         }
         ProxyResolution::None => {
@@ -158,15 +160,15 @@ pub fn build_blocking_http_client(
     match resolve_proxy(provider_proxy, global_proxy, no_proxy, api_base) {
         ProxyResolution::UseProxy(proxy_url) => match Proxy::all(&proxy_url) {
             Ok(proxy) => {
-                info!(proxy = %proxy_url, api_base = %api_base, "Blocking HTTP client using proxy");
+                info!(proxy = %redact_url(&proxy_url), api_base = %redact_url(api_base), "Blocking HTTP client using proxy");
                 builder = builder.proxy(proxy);
             }
-            Err(error) => {
-                warn!(error = %error, proxy = %proxy_url, "Invalid proxy URL, falling back to direct connect");
+            Err(_) => {
+                warn!(proxy = %redact_url(&proxy_url), "Invalid proxy URL, falling back to direct connect");
             }
         },
         ProxyResolution::ForceDirectConnect => {
-            info!(api_base = %api_base, "Blocking HTTP client forced to direct connect");
+            info!(api_base = %redact_url(api_base), "Blocking HTTP client forced to direct connect");
             builder = builder.no_proxy();
         }
         ProxyResolution::None => {}

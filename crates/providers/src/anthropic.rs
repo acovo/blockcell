@@ -13,6 +13,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::client::build_http_client;
+use crate::security::{
+    consume_error_body, http_status_error, read_response_limited, redact_url, request_error,
+    StreamGuard, MAX_PROVIDER_RESPONSE_BYTES,
+};
 use crate::Provider;
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
@@ -361,7 +365,7 @@ impl Provider for AnthropicProvider {
         }
 
         info!(
-            url = %url,
+            url = %redact_url(&url),
             model = %model,
             tools_count = tools.len(),
             messages_count = messages.len(),
@@ -377,31 +381,24 @@ impl Provider for AnthropicProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("Anthropic request failed: {}", e)))?;
+            .map_err(|e| request_error("Anthropic request failed", e))?;
 
         let status = response.status();
-        let raw_body = response.text().await.unwrap_or_default();
-
         if !status.is_success() {
-            error!(status = %status, body = %raw_body, "Anthropic API error");
-            return Err(Error::Provider(format!(
-                "Anthropic API error {}: {}",
-                status, raw_body
-            )));
+            let body_len = consume_error_body(response).await;
+            error!(status = %status, body_len, "Anthropic API error");
+            return Err(http_status_error("Anthropic", status, body_len));
         }
+        let raw_bytes = read_response_limited(response, MAX_PROVIDER_RESPONSE_BYTES).await?;
+        let raw_body = String::from_utf8_lossy(&raw_bytes).into_owned();
 
         debug!(body_len = raw_body.len(), "Anthropic raw response");
 
         let resp: AnthropicResponse = serde_json::from_str(&raw_body).map_err(|e| {
-            let preview_end = raw_body
-                .char_indices()
-                .nth(500)
-                .map(|(i, _)| i)
-                .unwrap_or(raw_body.len());
             Error::Provider(format!(
-                "Failed to parse Anthropic response: {}. Body: {}",
+                "Failed to parse Anthropic response: {} (body_len={})",
                 e,
-                &raw_body[..preview_end]
+                raw_body.len()
             ))
         })?;
 
@@ -498,7 +495,7 @@ impl Provider for AnthropicProvider {
             request["tools"] = Value::Array(anthropic_tools);
         }
 
-        info!(url = %url, model = %model, "Starting Anthropic streaming call");
+        info!(url = %redact_url(&url), model = %model, "Starting Anthropic streaming call");
 
         let response = self
             .client
@@ -510,15 +507,12 @@ impl Provider for AnthropicProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("Anthropic stream request failed: {}", e)))?;
+            .map_err(|e| request_error("Anthropic stream request failed", e))?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!(
-                "Anthropic stream API error {}: {}",
-                status, body
-            )));
+            let body_len = consume_error_body(response).await;
+            return Err(http_status_error("Anthropic stream", status, body_len));
         }
 
         let (tx, rx) = mpsc::channel(64);
@@ -534,10 +528,19 @@ impl Provider for AnthropicProvider {
             let mut usage = Value::Null;
             // 记录上一个 SSE event 类型，用于跨行/跨 chunk 的 fallback 解析
             let mut last_event_type: Option<String> = None;
+            let mut stream_guard = StreamGuard::new(MAX_PROVIDER_RESPONSE_BYTES);
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
+                        if let Err(error) = stream_guard.observe(bytes.len()) {
+                            let _ = tx
+                                .send(StreamChunk::Error {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
                         // 处理 SSE 行
@@ -680,10 +683,12 @@ impl Provider for AnthropicProvider {
                                             return;
                                         }
                                         "error" => {
-                                            if let Some(err) = &event.error {
+                                            if event.error.is_some() {
                                                 let _ = tx
                                                     .send(StreamChunk::Error {
-                                                        message: err.message.clone(),
+                                                        message:
+                                                            "Anthropic stream returned an error"
+                                                                .to_string(),
                                                     })
                                                     .await;
                                             }
@@ -697,14 +702,30 @@ impl Provider for AnthropicProvider {
                                             );
                                         }
                                     }
+                                } else {
+                                    let _ = tx
+                                        .send(StreamChunk::Error {
+                                            message: "Malformed Anthropic stream event".to_string(),
+                                        })
+                                        .await;
+                                    return;
                                 }
                             }
+                        }
+                        if let Err(error) = stream_guard.check_buffer(buffer.len()) {
+                            let _ = tx
+                                .send(StreamChunk::Error {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                            return;
                         }
                     }
                     Err(e) => {
                         let _ = tx
                             .send(StreamChunk::Error {
-                                message: e.to_string(),
+                                message: request_error("Anthropic stream read failed", e)
+                                    .to_string(),
                             })
                             .await;
                         return;
@@ -712,24 +733,13 @@ impl Provider for AnthropicProvider {
                 }
             }
 
-            // 如果流结束但没有收到 message_stop，也发送完成事件
-            let final_tool_calls: Vec<ToolCallRequest> = tool_calls
-                .into_values()
-                .map(|acc| acc.to_tool_call_request())
-                .collect();
-
-            let response = LLMResponse {
-                content: if accumulated_content.is_empty() {
-                    None
-                } else {
-                    Some(accumulated_content)
-                },
-                reasoning_content: None,
-                tool_calls: final_tool_calls,
-                finish_reason,
-                usage,
-            };
-            let _ = tx.send(StreamChunk::Done { response }).await;
+            if let Err(error) = stream_guard.finish(false, "Anthropic stream") {
+                let _ = tx
+                    .send(StreamChunk::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+            }
         });
 
         Ok(rx)

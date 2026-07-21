@@ -10,6 +10,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::client::build_http_client;
+use crate::security::{
+    consume_error_body, http_status_error, read_response_limited, request_error, StreamGuard,
+    MAX_PROVIDER_RESPONSE_BYTES,
+};
 use crate::Provider;
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -24,6 +28,17 @@ pub struct GeminiProvider {
 }
 
 impl GeminiProvider {
+    fn generate_content_url(api_base: &str, model: &str) -> String {
+        format!("{}/models/{}:generateContent", api_base, model)
+    }
+
+    fn stream_content_url(api_base: &str, model: &str) -> String {
+        format!(
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            api_base, model
+        )
+    }
+
     pub fn new(
         api_key: &str,
         api_base: Option<&str>,
@@ -314,10 +329,7 @@ impl GeminiProvider {
 impl Provider for GeminiProvider {
     async fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<LLMResponse> {
         let model = Self::normalize_model(&self.model);
-        let url = format!(
-            "{}/models/{}:generateContent?key={}",
-            self.api_base, model, self.api_key
-        );
+        let url = Self::generate_content_url(&self.api_base, model);
 
         let (system_instruction, contents) = Self::convert_messages(messages);
         let gemini_tools = Self::convert_tools(tools);
@@ -350,35 +362,29 @@ impl Provider for GeminiProvider {
         let response = self
             .client
             .post(&url)
+            .header("x-goog-api-key", &self.api_key)
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("Gemini request failed: {}", e)))?;
+            .map_err(|e| request_error("Gemini request failed", e))?;
 
         let status = response.status();
-        let raw_body = response.text().await.unwrap_or_default();
-
         if !status.is_success() {
-            error!(status = %status, body = %raw_body, "Gemini API error");
-            return Err(Error::Provider(format!(
-                "Gemini API error {}: {}",
-                status, raw_body
-            )));
+            let body_len = consume_error_body(response).await;
+            error!(status = %status, body_len, "Gemini API error");
+            return Err(http_status_error("Gemini", status, body_len));
         }
+        let raw_bytes = read_response_limited(response, MAX_PROVIDER_RESPONSE_BYTES).await?;
+        let raw_body = String::from_utf8_lossy(&raw_bytes).into_owned();
 
         debug!(body_len = raw_body.len(), "Gemini raw response");
 
         let resp: GeminiResponse = serde_json::from_str(&raw_body).map_err(|e| {
-            let preview_end = raw_body
-                .char_indices()
-                .nth(500)
-                .map(|(i, _)| i)
-                .unwrap_or(raw_body.len());
             Error::Provider(format!(
-                "Failed to parse Gemini response: {}. Body: {}",
+                "Failed to parse Gemini response: {} (body_len={})",
                 e,
-                &raw_body[..preview_end]
+                raw_body.len()
             ))
         })?;
 
@@ -464,10 +470,7 @@ impl Provider for GeminiProvider {
     ) -> Result<mpsc::Receiver<StreamChunk>> {
         let model = Self::normalize_model(&self.model);
         // Gemini 使用 streamGenerateContent 端点
-        let url = format!(
-            "{}/models/{}:streamGenerateContent?key={}&alt=sse",
-            self.api_base, model, self.api_key
-        );
+        let url = Self::stream_content_url(&self.api_base, model);
 
         let (system_instruction, contents) = Self::convert_messages(messages);
         let gemini_tools = Self::convert_tools(tools);
@@ -495,19 +498,17 @@ impl Provider for GeminiProvider {
         let response = self
             .client
             .post(&url)
+            .header("x-goog-api-key", &self.api_key)
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("Gemini stream request failed: {}", e)))?;
+            .map_err(|e| request_error("Gemini stream request failed", e))?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!(
-                "Gemini stream API error {}: {}",
-                status, body
-            )));
+            let body_len = consume_error_body(response).await;
+            return Err(http_status_error("Gemini stream", status, body_len));
         }
 
         let (tx, rx) = mpsc::channel(64);
@@ -520,10 +521,20 @@ impl Provider for GeminiProvider {
             let mut finish_reason = "stop".to_string();
             let mut usage = Value::Null;
             let mut tool_call_index = 0usize;
+            let mut completed = false;
+            let mut stream_guard = StreamGuard::new(MAX_PROVIDER_RESPONSE_BYTES);
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
+                        if let Err(error) = stream_guard.observe(bytes.len()) {
+                            let _ = tx
+                                .send(StreamChunk::Error {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
                         // 处理 SSE 行
@@ -552,6 +563,7 @@ impl Provider for GeminiProvider {
                                         if let Some(candidate) = candidates.first() {
                                             // 处理 finish_reason
                                             if let Some(fr) = &candidate.finish_reason {
+                                                completed = true;
                                                 finish_reason = match fr.as_str() {
                                                     "STOP" => "stop".to_string(),
                                                     "MAX_TOKENS" => "length".to_string(),
@@ -615,19 +627,43 @@ impl Provider for GeminiProvider {
                                             }
                                         }
                                     }
+                                } else {
+                                    let _ = tx
+                                        .send(StreamChunk::Error {
+                                            message: "Malformed Gemini stream event".to_string(),
+                                        })
+                                        .await;
+                                    return;
                                 }
                             }
+                        }
+                        if let Err(error) = stream_guard.check_buffer(buffer.len()) {
+                            let _ = tx
+                                .send(StreamChunk::Error {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                            return;
                         }
                     }
                     Err(e) => {
                         let _ = tx
                             .send(StreamChunk::Error {
-                                message: e.to_string(),
+                                message: request_error("Gemini stream read failed", e).to_string(),
                             })
                             .await;
                         return;
                     }
                 }
+            }
+
+            if let Err(error) = stream_guard.finish(completed, "Gemini stream") {
+                let _ = tx
+                    .send(StreamChunk::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return;
             }
 
             // 流结束，发送最终响应
@@ -707,6 +743,15 @@ struct GeminiStreamResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_endpoints_do_not_put_api_keys_in_query_strings() {
+        let normal = GeminiProvider::generate_content_url("https://example.com/v1", "gemini-test");
+        let stream = GeminiProvider::stream_content_url("https://example.com/v1", "gemini-test");
+        assert!(!normal.contains("key="));
+        assert!(!stream.contains("key="));
+        assert!(stream.contains("alt=sse"));
+    }
 
     #[test]
     fn test_normalize_model() {

@@ -10,6 +10,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::client::build_http_client;
+use crate::security::{
+    consume_error_body, http_status_error, read_response_limited, redact_url, request_error,
+    StreamGuard, MAX_PROVIDER_RESPONSE_BYTES,
+};
 use crate::Provider;
 
 const DEFAULT_OLLAMA_BASE: &str = "http://localhost:11434";
@@ -173,7 +177,10 @@ impl OllamaProvider {
                         });
                         call_index += 1;
                     } else {
-                        warn!(json = %json_str, "Failed to parse tool_call JSON from Ollama");
+                        warn!(
+                            block_len = json_str.len(),
+                            "Failed to parse tool_call JSON from Ollama"
+                        );
                         remaining.push_str(
                             &rest[start..start + "<tool_call>".len() + end + "</tool_call>".len()],
                         );
@@ -214,7 +221,7 @@ impl OllamaProvider {
         }
 
         info!(
-            url = %url,
+            url = %redact_url(&url),
             model = %model,
             tools_count = tools.len(),
             messages_count = messages.len(),
@@ -227,31 +234,24 @@ impl OllamaProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("Ollama request failed: {}", e)))?;
+            .map_err(|e| request_error("Ollama request failed", e))?;
 
         let status = response.status();
-        let raw_body = response.text().await.unwrap_or_default();
-
         if !status.is_success() {
-            error!(status = %status, body = %raw_body, "Ollama API error");
-            return Err(Error::Provider(format!(
-                "Ollama API error {}: {}",
-                status, raw_body
-            )));
+            let body_len = consume_error_body(response).await;
+            error!(status = %status, body_len, "Ollama API error");
+            return Err(http_status_error("Ollama", status, body_len));
         }
+        let raw_bytes = read_response_limited(response, MAX_PROVIDER_RESPONSE_BYTES).await?;
+        let raw_body = String::from_utf8_lossy(&raw_bytes).into_owned();
 
         debug!(body_len = raw_body.len(), "Ollama raw response");
 
         let resp: OllamaChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
-            let preview_end = raw_body
-                .char_indices()
-                .nth(500)
-                .map(|(i, _)| i)
-                .unwrap_or(raw_body.len());
             Error::Provider(format!(
-                "Failed to parse Ollama response: {}. Body: {}",
+                "Failed to parse Ollama response: {} (body_len={})",
                 e,
-                &raw_body[..preview_end]
+                raw_body.len()
             ))
         })?;
 
@@ -358,17 +358,15 @@ impl OllamaProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("Ollama request failed: {}", e)))?;
+            .map_err(|e| request_error("Ollama request failed", e))?;
 
         let status = response.status();
-        let raw_body = response.text().await.unwrap_or_default();
-
         if !status.is_success() {
-            return Err(Error::Provider(format!(
-                "Ollama API error {}: {}",
-                status, raw_body
-            )));
+            let body_len = consume_error_body(response).await;
+            return Err(http_status_error("Ollama", status, body_len));
         }
+        let raw_bytes = read_response_limited(response, MAX_PROVIDER_RESPONSE_BYTES).await?;
+        let raw_body = String::from_utf8_lossy(&raw_bytes).into_owned();
 
         let resp: OllamaChatResponse = serde_json::from_str(&raw_body)
             .map_err(|e| Error::Provider(format!("Failed to parse Ollama response: {}", e)))?;
@@ -436,7 +434,7 @@ impl Provider for OllamaProvider {
             request["tools"] = Value::Array(ollama_tools);
         }
 
-        info!(url = %url, model = %model, "Starting Ollama streaming call");
+        info!(url = %redact_url(&url), model = %model, "Starting Ollama streaming call");
 
         let response = self
             .client
@@ -444,15 +442,12 @@ impl Provider for OllamaProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("Ollama stream request failed: {}", e)))?;
+            .map_err(|e| request_error("Ollama stream request failed", e))?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!(
-                "Ollama stream API error {}: {}",
-                status, body
-            )));
+            let body_len = consume_error_body(response).await;
+            return Err(http_status_error("Ollama stream", status, body_len));
         }
 
         let (tx, rx) = mpsc::channel(64);
@@ -463,11 +458,19 @@ impl Provider for OllamaProvider {
             let mut accumulated_content = String::new();
             let mut tool_calls: Vec<ToolCallRequest> = Vec::new();
             let mut finish_reason = "stop".to_string();
-            let mut usage = Value::Null;
+            let mut stream_guard = StreamGuard::new(MAX_PROVIDER_RESPONSE_BYTES);
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
+                        if let Err(error) = stream_guard.observe(bytes.len()) {
+                            let _ = tx
+                                .send(StreamChunk::Error {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
                         // Ollama 使用 NDJSON 格式，每行一个 JSON 对象
@@ -524,7 +527,7 @@ impl Provider for OllamaProvider {
 
                                 // 检查是否完成
                                 if chunk.done.unwrap_or(false) {
-                                    usage = serde_json::json!({
+                                    let usage = serde_json::json!({
                                         "prompt_tokens": chunk.prompt_eval_count,
                                         "completion_tokens": chunk.eval_count,
                                     });
@@ -547,13 +550,28 @@ impl Provider for OllamaProvider {
                                     let _ = tx.send(StreamChunk::Done { response }).await;
                                     return;
                                 }
+                            } else {
+                                let _ = tx
+                                    .send(StreamChunk::Error {
+                                        message: "Malformed Ollama stream event".to_string(),
+                                    })
+                                    .await;
+                                return;
                             }
+                        }
+                        if let Err(error) = stream_guard.check_buffer(buffer.len()) {
+                            let _ = tx
+                                .send(StreamChunk::Error {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                            return;
                         }
                     }
                     Err(e) => {
                         let _ = tx
                             .send(StreamChunk::Error {
-                                message: e.to_string(),
+                                message: request_error("Ollama stream read failed", e).to_string(),
                             })
                             .await;
                         return;
@@ -561,19 +579,13 @@ impl Provider for OllamaProvider {
                 }
             }
 
-            // 如果流结束但没有收到 done 标记
-            let response = LLMResponse {
-                content: if accumulated_content.is_empty() {
-                    None
-                } else {
-                    Some(accumulated_content)
-                },
-                reasoning_content: None,
-                tool_calls,
-                finish_reason,
-                usage,
-            };
-            let _ = tx.send(StreamChunk::Done { response }).await;
+            if let Err(error) = stream_guard.finish(false, "Ollama stream") {
+                let _ = tx
+                    .send(StreamChunk::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+            }
         });
 
         Ok(rx)

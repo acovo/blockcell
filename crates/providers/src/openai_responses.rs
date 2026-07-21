@@ -10,6 +10,10 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::client::build_http_client;
+use crate::security::{
+    consume_error_body, http_status_error, read_response_limited, redact_url, request_error,
+    MAX_PROVIDER_RESPONSE_BYTES,
+};
 use crate::Provider;
 
 pub struct OpenAIResponsesProvider {
@@ -292,7 +296,7 @@ impl OpenAIResponsesProvider {
         })?;
 
         info!(
-            url = %url,
+            url = %redact_url(&url),
             model = %self.model,
             messages_count = messages.len(),
             tools_count = tools.len(),
@@ -311,24 +315,23 @@ impl OpenAIResponsesProvider {
             .body(request_body)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("Responses request failed: {}", e)))?;
+            .map_err(|e| request_error("Responses request failed", e))?;
 
         let status = response.status();
-        let raw_body = response.text().await.unwrap_or_default();
-
         if !status.is_success() {
-            error!(status = %status, body = %raw_body, "OpenAI Responses API error");
-            return Err(Error::Provider(format!(
-                "Responses API error {}: {}",
-                status, raw_body
-            )));
+            let body_len = consume_error_body(response).await;
+            error!(status = %status, body_len, "OpenAI Responses API error");
+            return Err(http_status_error("OpenAI Responses", status, body_len));
         }
+        let raw_bytes = read_response_limited(response, MAX_PROVIDER_RESPONSE_BYTES).await?;
+        let raw_body = String::from_utf8_lossy(&raw_bytes).into_owned();
 
         debug!(body_len = raw_body.len(), "Responses raw response received");
         serde_json::from_str::<Value>(&raw_body).map_err(|e| {
             Error::Provider(format!(
-                "Failed to parse Responses API response: {}. Body: {}",
-                e, raw_body
+                "Failed to parse Responses API response: {} (body_len={})",
+                e,
+                raw_body.len()
             ))
         })
     }

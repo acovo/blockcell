@@ -23,7 +23,7 @@ pub enum EntryHealth {
 }
 
 /// 调用反馈类型，由调用方在 chat() 之后上报
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallResult {
     Success,
     /// 限速（429）— 立即进入冷却
@@ -264,30 +264,12 @@ impl ProviderPool {
             .filter(|idx| state.health.get(idx) == Some(&EntryHealth::Healthy))
             .collect();
 
-        let candidates = if !healthy.is_empty() {
-            healthy
-        } else {
-            // 降级保底：临时解除所有 Cooling，Dead 不解除
-            let fallback: Vec<usize> = (0..self.entries.len())
-                .filter(|idx| {
-                    matches!(
-                        state.health.get(idx),
-                        Some(EntryHealth::Healthy) | Some(EntryHealth::Cooling(_))
-                    )
-                })
-                .collect();
-            if fallback.is_empty() {
-                warn!("ProviderPool: all entries are dead or unavailable");
-                return None;
-            }
-            warn!("ProviderPool: all entries cooling, using fallback selection");
-            for idx in &fallback {
-                state.health.insert(*idx, EntryHealth::Healthy);
-            }
-            fallback
-        };
+        if healthy.is_empty() {
+            warn!("ProviderPool: all entries are cooling, dead, or unavailable");
+            return None;
+        }
 
-        let selected = self.select_entry_from_candidates(candidates)?;
+        let selected = self.select_entry_from_candidates(healthy)?;
         Some((selected, Arc::clone(&self.entries[selected].provider)))
     }
 
@@ -428,24 +410,8 @@ impl ProviderPool {
             return Some(healthy);
         }
 
-        let fallback: Vec<usize> = (0..self.entries.len())
-            .filter(|idx| !excluded.contains(idx))
-            .filter(|idx| {
-                matches!(
-                    state.health.get(idx),
-                    Some(EntryHealth::Healthy) | Some(EntryHealth::Cooling(_))
-                )
-            })
-            .collect();
-        if fallback.is_empty() {
-            warn!("ProviderPool: all entries are dead or unavailable");
-            return None;
-        }
-        warn!("ProviderPool: all entries cooling, using fallback selection");
-        for idx in &fallback {
-            state.health.insert(*idx, EntryHealth::Healthy);
-        }
-        Some(fallback)
+        warn!("ProviderPool: all eligible entries are cooling, dead, or unavailable");
+        None
     }
 
     fn select_entry_from_candidates(&self, candidates: Vec<usize>) -> Option<usize> {
@@ -556,23 +522,29 @@ impl ProviderPool {
     /// 将错误字符串分类为 CallResult
     pub fn classify_error(err: &str) -> CallResult {
         let lower = err.to_lowercase();
-        if lower.contains("429")
+        if lower.contains("http_status=429")
+            || lower.contains("http 429")
             || lower.contains("rate limit")
             || lower.contains("too many requests")
         {
             CallResult::RateLimit
-        } else if lower.contains("401")
-            || lower.contains("403")
+        } else if lower.contains("http_status=401")
+            || lower.contains("http_status=403")
+            || lower.contains("http 401")
+            || lower.contains("http 403")
             || lower.contains("unauthorized")
             || lower.contains("invalid api key")
-            || lower.contains("authentication")
-            || lower.contains("api key")
+            || lower.contains("authentication failed")
         {
             CallResult::AuthError
-        } else if lower.contains("500")
-            || lower.contains("502")
-            || lower.contains("503")
-            || lower.contains("504")
+        } else if lower.contains("http_status=500")
+            || lower.contains("http_status=502")
+            || lower.contains("http_status=503")
+            || lower.contains("http_status=504")
+            || lower.contains("http 500")
+            || lower.contains("http 502")
+            || lower.contains("http 503")
+            || lower.contains("http 504")
             || lower.contains("server error")
         {
             CallResult::ServerError
@@ -798,6 +770,41 @@ mod tests {
         pool.report(0, CallResult::AuthError);
         let status = pool.status_summary();
         assert_eq!(status[0].health, "dead");
+    }
+
+    #[test]
+    fn cooling_provider_is_not_reactivated_early() {
+        let pool = ProviderPool {
+            entries: vec![BuiltEntry {
+                model: "model-a".to_string(),
+                provider_name: "test".to_string(),
+                weight: 1,
+                priority: 1,
+                provider: Arc::new(DummyProvider),
+            }],
+            state: Mutex::new(PoolState {
+                health: HashMap::from([(0, EntryHealth::Cooling(Instant::now()))]),
+                stats: HashMap::new(),
+            }),
+            fail_threshold: 3,
+            cooldown: Duration::from_secs(60),
+        };
+
+        assert!(pool.acquire().is_none());
+    }
+
+    #[test]
+    fn incidental_api_key_text_is_not_auth_error() {
+        assert_eq!(
+            ProviderPool::classify_error(
+                "HTTP_STATUS=500 upstream API key service temporarily unavailable"
+            ),
+            CallResult::ServerError
+        );
+        assert_eq!(
+            ProviderPool::classify_error("response documentation mentions api key usage"),
+            CallResult::Transient
+        );
     }
 
     #[test]
