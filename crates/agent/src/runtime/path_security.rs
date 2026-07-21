@@ -2,70 +2,133 @@
 //!
 //! 包含路径提取、安全校验、用户授权和危险操作确认。
 
-use super::{canonical_or_normalized, is_path_within_base, ConfirmRequest};
-use blockcell_core::path_policy::{PathOp, PolicyAction};
+use super::{is_path_within_base, ConfirmRequest};
+use blockcell_core::path_policy::{resolve_for_policy, PathOp, PolicyAction};
 use blockcell_core::InboundMessage;
 use std::path::{Component, Path, PathBuf};
 use tracing::{info, warn};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PathAccess {
+    pub(super) path: String,
+    pub(super) op: PathOp,
+}
+
+fn push_path(accesses: &mut Vec<PathAccess>, args: &serde_json::Value, field: &str, op: PathOp) {
+    if let Some(path) = args.get(field).and_then(|value| value.as_str()) {
+        accesses.push(PathAccess {
+            path: path.to_string(),
+            op,
+        });
+    }
+}
+
+fn push_paths(accesses: &mut Vec<PathAccess>, args: &serde_json::Value, field: &str, op: PathOp) {
+    if let Some(paths) = args.get(field).and_then(|value| value.as_array()) {
+        for path in paths.iter().filter_map(|value| value.as_str()) {
+            accesses.push(PathAccess {
+                path: path.to_string(),
+                op,
+            });
+        }
+    }
+}
+
 impl super::AgentRuntime {
     /// Extract filesystem paths from tool call parameters.
-    pub(super) fn extract_paths(&self, tool_name: &str, args: &serde_json::Value) -> Vec<String> {
-        let mut paths = Vec::new();
+    pub(super) fn extract_path_accesses(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Vec<PathAccess> {
+        let mut accesses = Vec::new();
+        let action = args
+            .get("action")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+
         match tool_name {
-            "read_file" | "write_file" | "edit_file" | "list_dir" => {
-                if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-                    paths.push(p.to_string());
-                }
+            "read_file" => push_path(&mut accesses, args, "path", PathOp::Read),
+            "write_file" | "edit_file" => push_path(&mut accesses, args, "path", PathOp::Write),
+            "list_dir" => push_path(&mut accesses, args, "path", PathOp::List),
+            "file_ops" => {
+                let source_op = match action {
+                    "delete" | "rename" | "move" => PathOp::Write,
+                    _ => PathOp::Read,
+                };
+                push_path(&mut accesses, args, "path", source_op);
+                push_paths(&mut accesses, args, "paths", PathOp::Read);
+                push_path(&mut accesses, args, "destination", PathOp::Write);
             }
-            "file_ops" | "data_process" | "audio_transcribe" | "chart_generate"
-            | "office_write" | "video_process" | "health_api" | "encrypt" => {
-                if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-                    paths.push(p.to_string());
-                }
-                if let Some(d) = args.get("destination").and_then(|v| v.as_str()) {
-                    paths.push(d.to_string());
-                }
-                if let Some(o) = args.get("output_path").and_then(|v| v.as_str()) {
-                    paths.push(o.to_string());
-                }
-                if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
-                    for p in arr {
-                        if let Some(s) = p.as_str() {
-                            paths.push(s.to_string());
-                        }
-                    }
-                }
+            "data_process" => {
+                let path_op = if action == "write_csv" {
+                    PathOp::Write
+                } else {
+                    PathOp::Read
+                };
+                push_path(&mut accesses, args, "path", path_op);
+                push_path(&mut accesses, args, "output_path", PathOp::Write);
+            }
+            "audio_transcribe" | "ocr" | "encrypt" => {
+                push_path(&mut accesses, args, "path", PathOp::Read);
+                push_path(&mut accesses, args, "output_path", PathOp::Write);
+            }
+            "chart_generate" | "office_write" | "camera" | "tts" | "knowledge_graph" => {
+                push_path(&mut accesses, args, "output_path", PathOp::Write);
+            }
+            "video_process" => {
+                push_path(&mut accesses, args, "input", PathOp::Read);
+                push_paths(&mut accesses, args, "inputs", PathOp::Read);
+                push_path(&mut accesses, args, "subtitle_file", PathOp::Read);
+                push_path(&mut accesses, args, "watermark_image", PathOp::Read);
+                push_path(&mut accesses, args, "output_path", PathOp::Write);
+            }
+            "image_understand" => {
+                push_path(&mut accesses, args, "path", PathOp::Read);
+                push_paths(&mut accesses, args, "paths", PathOp::Read);
+            }
+            "termux_api" => {
+                let file_op = match action {
+                    "share" | "media_scan" | "wallpaper" => PathOp::Read,
+                    _ => PathOp::Write,
+                };
+                push_path(&mut accesses, args, "file_path", file_op);
+                push_path(&mut accesses, args, "output_path", PathOp::Write);
+            }
+            "email" => {
+                push_paths(&mut accesses, args, "attachments", PathOp::Read);
+                push_path(&mut accesses, args, "save_attachments_to", PathOp::Write);
+            }
+            "health_api" => {
+                push_path(&mut accesses, args, "path", PathOp::Read);
+                push_path(&mut accesses, args, "output_path", PathOp::Write);
             }
             "message" => {
-                if let Some(arr) = args.get("media").and_then(|v| v.as_array()) {
-                    for p in arr {
-                        if let Some(s) = p.as_str() {
-                            paths.push(s.to_string());
-                        }
-                    }
-                }
+                push_paths(&mut accesses, args, "media", PathOp::Read);
             }
             "browse" => {
-                if let Some(o) = args.get("output_path").and_then(|v| v.as_str()) {
-                    paths.push(o.to_string());
-                }
+                push_path(&mut accesses, args, "output_path", PathOp::Write);
+                push_path(&mut accesses, args, "file_path", PathOp::Read);
+                push_paths(&mut accesses, args, "files", PathOp::Read);
             }
             "exec" => {
-                if let Some(wd) = args.get("working_dir").and_then(|v| v.as_str()) {
-                    paths.push(wd.to_string());
-                }
+                push_path(&mut accesses, args, "working_dir", PathOp::Exec);
                 // Also subject filesystem paths referenced inside the command
                 // itself to the path policy, so built-in sensitive paths
                 // (~/.ssh, /etc, ...) are enforced for `exec`, not just for
                 // its working directory.
                 if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                    paths.extend(extract_command_paths(cmd));
+                    accesses.extend(extract_command_paths(cmd).into_iter().map(|path| {
+                        PathAccess {
+                            path,
+                            op: PathOp::Exec,
+                        }
+                    }));
                 }
             }
             _ => {}
         }
-        paths
+        accesses
     }
 
     /// Resolve a path string the same way tools do (expand ~ and relative paths).
@@ -89,14 +152,14 @@ impl super::AgentRuntime {
     /// Check whether a resolved path falls within an already-authorized directory.
     /// Optimized (#12): walk ancestors with O(1) HashSet lookups instead of O(n) iteration.
     /// `authorized_dirs` stores already-canonicalized paths, so no re-canonicalization needed.
-    pub(super) fn is_path_authorized(&self, resolved: &std::path::Path) -> bool {
+    pub(super) fn is_path_authorized(&self, resolved: &std::path::Path, op: PathOp) -> bool {
         if self.authorized_dirs.is_empty() {
             return false;
         }
-        let rp = canonical_or_normalized(resolved);
+        let rp = resolve_for_policy(resolved);
         let mut current = rp.as_path();
         loop {
-            if self.authorized_dirs.contains(current) {
+            if self.authorized_dirs.contains(&(current.to_path_buf(), op)) {
                 return true;
             }
             match current.parent() {
@@ -107,7 +170,7 @@ impl super::AgentRuntime {
     }
 
     /// Record a directory as authorized so future accesses within it are auto-approved.
-    pub(super) fn authorize_directory(&mut self, resolved: &std::path::Path) {
+    pub(super) fn authorize_directory(&mut self, resolved: &std::path::Path, op: PathOp) {
         // If the path is a directory, authorize it directly.
         // If it's a file, authorize its parent directory.
         let dir = if resolved.is_dir() {
@@ -118,9 +181,9 @@ impl super::AgentRuntime {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| resolved.to_path_buf())
         };
-        let dir = canonical_or_normalized(&dir);
-        if self.authorized_dirs.insert(dir.clone()) {
-            info!(dir = %dir.display(), "Directory authorized for future access");
+        let dir = resolve_for_policy(&dir);
+        if self.authorized_dirs.insert((dir.clone(), op)) {
+            info!(dir = %dir.display(), ?op, "Directory authorized for future access");
         }
     }
 
@@ -155,19 +218,17 @@ impl super::AgentRuntime {
             }
             return true;
         }
-        let raw_paths = self.extract_paths(tool_name, args);
-        if raw_paths.is_empty() {
+        let path_accesses = self.extract_path_accesses(tool_name, args);
+        if path_accesses.is_empty() {
             return true;
         }
 
-        let op = PathOp::from_tool_name(tool_name);
-
         // Classify each path by policy outcome
         let mut deny_paths: Vec<String> = Vec::new();
-        let mut confirm_paths: Vec<String> = Vec::new();
+        let mut confirm_paths: Vec<PathAccess> = Vec::new();
 
-        for p in &raw_paths {
-            let resolved = self.resolve_path(p);
+        for access in &path_accesses {
+            let resolved = self.resolve_path(&access.path);
 
             // 1. Workspace-safe → always OK
             if self.is_path_safe(&resolved) {
@@ -175,12 +236,12 @@ impl super::AgentRuntime {
             }
 
             // 2. Already authorized by user this session → OK
-            if self.is_path_authorized(&resolved) {
+            if self.is_path_authorized(&resolved, access.op) {
                 continue;
             }
 
             // 3. Evaluate policy
-            let action = self.path_policy.evaluate(&resolved, op);
+            let action = self.path_policy.evaluate(&resolved, access.op);
             match action {
                 PolicyAction::Deny => {
                     warn!(
@@ -188,7 +249,7 @@ impl super::AgentRuntime {
                         path = %resolved.display(),
                         "Path access denied by policy"
                     );
-                    deny_paths.push(p.clone());
+                    deny_paths.push(access.path.clone());
                 }
                 PolicyAction::Allow => {
                     // Policy explicitly allows — cache for this session
@@ -198,11 +259,11 @@ impl super::AgentRuntime {
                         "Path access allowed by policy"
                     );
                     if self.path_policy.cache_confirmed_dirs() {
-                        self.authorize_directory(&resolved);
+                        self.authorize_directory(&resolved, access.op);
                     }
                 }
                 PolicyAction::Confirm => {
-                    confirm_paths.push(p.clone());
+                    confirm_paths.push(access.clone());
                 }
             }
         }
@@ -222,7 +283,10 @@ impl super::AgentRuntime {
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             let request = ConfirmRequest {
                 tool_name: tool_name.to_string(),
-                paths: confirm_paths.clone(),
+                paths: confirm_paths
+                    .iter()
+                    .map(|access| access.path.clone())
+                    .collect(),
                 response_tx,
                 agent_id: self.agent_id.clone(),
                 channel: msg.channel.clone(),
@@ -242,9 +306,9 @@ impl super::AgentRuntime {
             match response_rx.await {
                 Ok(allowed) => {
                     if allowed && self.path_policy.cache_confirmed_dirs() {
-                        for p in &confirm_paths {
-                            let resolved = self.resolve_path(p);
-                            self.authorize_directory(&resolved);
+                        for access in &confirm_paths {
+                            let resolved = self.resolve_path(&access.path);
+                            self.authorize_directory(&resolved, access.op);
                         }
                     }
                     allowed

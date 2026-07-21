@@ -217,9 +217,9 @@ impl AgentRuntime {
         {
             PolicyOutcome::Proceed => false,
             PolicyOutcome::ProceedConfirmed => {
-                for path in self.extract_paths(&tool_call.name, &tool_call.arguments) {
-                    let resolved = self.resolve_path(&path);
-                    self.authorize_directory(&resolved);
+                for access in self.extract_path_accesses(&tool_call.name, &tool_call.arguments) {
+                    let resolved = self.resolve_path(&access.path);
+                    self.authorize_directory(&resolved, access.op);
                 }
                 true
             }

@@ -11,7 +11,7 @@ fn format_policy_parse_error(policy_file: &Path, error: &json5::Error) -> String
 }
 
 /// Which operation is being performed on a path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PathOp {
     Read,
@@ -314,7 +314,7 @@ pub fn path_starts_with_normalized(path: &Path, base: &Path) -> bool {
 /// Resolving both the candidate and the rule prefix through the same routine
 /// keeps their representations consistent (e.g. avoids mixing Windows `\\?\C:\`
 /// with `C:\`) while closing the symlink-escape gap of lexical-only handling.
-fn resolve_for_policy(path: &Path) -> PathBuf {
+pub fn resolve_for_policy(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;
     }

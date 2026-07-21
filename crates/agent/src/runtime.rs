@@ -1,4 +1,4 @@
-use blockcell_core::path_policy::PathPolicy;
+use blockcell_core::path_policy::{resolve_for_policy, PathPolicy};
 use blockcell_core::system_event::{EventPriority, EventScope, SessionSummary, SystemEvent};
 use blockcell_core::tool_policy::{
     PolicyEvalResult, ToolCallContext, ToolPolicy, ToolPolicyDecision,
@@ -21,7 +21,7 @@ use blockcell_tools::{
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
@@ -1498,32 +1498,9 @@ fn resolve_profile_tool_names(
 
 // scoped_tool_denied_result moved to crate::error
 
-fn normalize_path_for_check(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push("..");
-                }
-            }
-            Component::Normal(seg) => normalized.push(seg),
-        }
-    }
-    normalized
-}
-
-pub(super) fn canonical_or_normalized(path: &Path) -> PathBuf {
-    path.canonicalize()
-        .unwrap_or_else(|_| normalize_path_for_check(path))
-}
-
 pub(super) fn is_path_within_base(base: &Path, candidate: &Path) -> bool {
-    let base_norm = canonical_or_normalized(base);
-    let candidate_norm = canonical_or_normalized(candidate);
+    let base_norm = resolve_for_policy(base);
+    let candidate_norm = resolve_for_policy(candidate);
     candidate_norm.starts_with(&base_norm)
 }
 
@@ -2123,7 +2100,7 @@ pub struct AgentRuntime {
     confirm_tx: Option<mpsc::Sender<ConfirmRequest>>,
     /// Directories that the user has already authorized access to.
     /// Files within these directories will not require separate confirmation.
-    authorized_dirs: HashSet<PathBuf>,
+    authorized_dirs: HashSet<(PathBuf, blockcell_core::path_policy::PathOp)>,
     /// Shared task manager for tracking background subagent tasks.
     task_manager: TaskManager,
     /// Agent id bound to this runtime.

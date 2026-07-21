@@ -897,6 +897,222 @@ fn test_path_within_base_blocks_nonexistent_traversal() {
     assert!(!is_path_within_base(&base, &candidate));
 }
 
+#[cfg(unix)]
+#[test]
+fn test_path_within_base_blocks_symlink_escape_for_nonexistent_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+    symlink(&outside, workspace.join("link")).expect("create symlink");
+
+    let candidate = workspace.join("link/missing/new.txt");
+    assert!(!is_path_within_base(&workspace, &candidate));
+}
+
+fn test_runtime_with_path_policy(policy: &str) -> AgentRuntime {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-path-policy-runtime-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp path policy runtime dir");
+    let paths = Paths::with_base(base);
+    let policy_file = paths.path_access_file();
+    std::fs::write(&policy_file, policy).expect("write path policy");
+    config.security.path_access.policy_file = policy_file.to_string_lossy().to_string();
+
+    test_runtime_with_provider_and_paths(paths, Arc::new(TestProvider), config)
+}
+
+fn read_deny_write_allow_policy(path: &Path) -> String {
+    format!(
+        r#"{{
+            version: 1,
+            default_policy: "deny",
+            cache_confirmed_dirs: false,
+            builtin_protected_paths: false,
+            rules: [
+                {{
+                    name: "deny-read",
+                    action: "deny",
+                    ops: ["read"],
+                    paths: [{}],
+                }},
+                {{
+                    name: "allow-write",
+                    action: "allow",
+                    ops: ["write"],
+                    paths: [{}],
+                }},
+            ],
+        }}"#,
+        serde_json::to_string(&path.to_string_lossy()).expect("serialize policy path"),
+        serde_json::to_string(&path.to_string_lossy()).expect("serialize policy path"),
+    )
+}
+
+fn read_allow_write_deny_policy(path: &Path) -> String {
+    format!(
+        r#"{{
+            version: 1,
+            default_policy: "deny",
+            cache_confirmed_dirs: true,
+            builtin_protected_paths: false,
+            rules: [
+                {{
+                    name: "allow-read",
+                    action: "allow",
+                    ops: ["read"],
+                    paths: [{}],
+                }},
+                {{
+                    name: "deny-write",
+                    action: "deny",
+                    ops: ["write"],
+                    paths: [{}],
+                }},
+            ],
+        }}"#,
+        serde_json::to_string(&path.to_string_lossy()).expect("serialize policy path"),
+        serde_json::to_string(&path.to_string_lossy()).expect("serialize policy path"),
+    )
+}
+
+#[tokio::test]
+async fn test_authorized_read_directory_does_not_authorize_writes() {
+    let outside = std::env::temp_dir().join(format!(
+        "blockcell-op-cache-policy-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&outside).expect("create outside operation cache dir");
+    let path = outside.join("data.txt");
+    std::fs::write(&path, "data").expect("write operation cache input");
+
+    let mut runtime = test_runtime_with_path_policy(&read_allow_write_deny_policy(&outside));
+    let msg = test_main_session_inbound("cli", "operation-cache-policy");
+
+    assert!(
+        runtime
+            .check_path_permission("read_file", &serde_json::json!({"path": path}), &msg)
+            .await
+    );
+    assert!(
+        !runtime
+            .check_path_permission("write_file", &serde_json::json!({"path": path}), &msg)
+            .await
+    );
+}
+
+#[tokio::test]
+async fn test_email_attachment_is_checked_as_read() {
+    let outside =
+        std::env::temp_dir().join(format!("blockcell-email-policy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&outside).expect("create outside email policy dir");
+    let attachment = outside.join("secret.txt");
+    std::fs::write(&attachment, "secret").expect("write attachment");
+
+    let mut runtime = test_runtime_with_path_policy(&read_deny_write_allow_policy(&outside));
+    let msg = test_main_session_inbound("cli", "email-path-policy");
+
+    assert!(
+        !runtime
+            .check_path_permission(
+                "email",
+                &serde_json::json!({
+                    "action": "send",
+                    "attachments": [attachment],
+                }),
+                &msg,
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn test_email_attachment_destination_is_checked_as_write() {
+    let outside = std::env::temp_dir().join(format!(
+        "blockcell-email-output-policy-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&outside).expect("create outside email output dir");
+
+    let mut runtime = test_runtime_with_path_policy(&read_deny_write_allow_policy(&outside));
+    let msg = test_main_session_inbound("cli", "email-output-path-policy");
+
+    assert!(
+        runtime
+            .check_path_permission(
+                "email",
+                &serde_json::json!({
+                    "action": "read",
+                    "save_attachments_to": outside,
+                }),
+                &msg,
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn test_ocr_input_and_output_use_separate_operations() {
+    let outside =
+        std::env::temp_dir().join(format!("blockcell-ocr-policy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&outside).expect("create outside ocr policy dir");
+    let input = outside.join("secret.png");
+    std::fs::write(&input, "image").expect("write ocr input");
+
+    let mut runtime = test_runtime_with_path_policy(&read_deny_write_allow_policy(&outside));
+    let msg = test_main_session_inbound("cli", "ocr-path-policy");
+
+    assert!(
+        !runtime
+            .check_path_permission(
+                "ocr",
+                &serde_json::json!({
+                    "action": "recognize",
+                    "path": input,
+                    "output_path": outside.join("result.txt"),
+                }),
+                &msg,
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn test_browser_upload_files_are_checked_as_read() {
+    let outside = std::env::temp_dir().join(format!(
+        "blockcell-browser-upload-policy-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&outside).expect("create outside browser upload dir");
+    let upload = outside.join("secret.txt");
+    std::fs::write(&upload, "secret").expect("write browser upload input");
+
+    let mut runtime = test_runtime_with_path_policy(&read_deny_write_allow_policy(&outside));
+    let msg = test_main_session_inbound("cli", "browser-upload-path-policy");
+
+    assert!(
+        !runtime
+            .check_path_permission(
+                "browse",
+                &serde_json::json!({
+                    "action": "upload_file",
+                    "files": [upload],
+                }),
+                &msg,
+            )
+            .await
+    );
+}
+
 #[test]
 fn test_tool_result_indicates_error_for_json_error_field() {
     let result = r#"{"error":"Permission denied: blocked"}"#;
