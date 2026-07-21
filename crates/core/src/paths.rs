@@ -207,6 +207,10 @@ impl Paths {
         self.cron_dir().join("jobs.json")
     }
 
+    pub fn cron_jobs_lock_file(&self) -> PathBuf {
+        self.cron_dir().join("jobs.json.lock")
+    }
+
     pub fn media_dir(&self) -> PathBuf {
         self.workspace().join("media")
     }

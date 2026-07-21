@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use blockcell_core::file_store::{atomic_write, ExclusiveFileLock};
 use blockcell_core::{Error, Paths, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,11 @@ fn execute_cron_action_with_paths(
     origin_chat_id: &str,
     default_timezone: Option<&str>,
 ) -> Result<Value> {
+    let _store_lock = if matches!(action, "add" | "remove") {
+        Some(ExclusiveFileLock::acquire(&paths.cron_jobs_lock_file())?)
+    } else {
+        None
+    };
     match action {
         "add" => {
             let mut store = load_store(paths)?;
@@ -58,7 +64,17 @@ fn execute_cron_action_with_paths(
             let (kind, schedule) = if let Some(delay) =
                 params.get("delay_seconds").and_then(|v| v.as_i64())
             {
-                let at_ms = now_ms + delay * 1000;
+                if delay <= 0 {
+                    return Err(Error::Validation(
+                        "delay_seconds must be a positive integer".to_string(),
+                    ));
+                }
+                let delay_ms = delay
+                    .checked_mul(1000)
+                    .ok_or_else(|| Error::Validation("delay_seconds is too large".to_string()))?;
+                let at_ms = now_ms.checked_add(delay_ms).ok_or_else(|| {
+                    Error::Validation("delay_seconds produces an invalid timestamp".to_string())
+                })?;
                 (
                     "at",
                     json!({
@@ -291,24 +307,7 @@ fn load_store(paths: &Paths) -> Result<JobStore> {
         return Ok(JobStore::default());
     }
     let content = std::fs::read_to_string(&path)?;
-    let store: JobStore = serde_json::from_str(&content).unwrap_or_else(|e| {
-        tracing::warn!(
-            path = %path.display(),
-            error = %e,
-            "Failed to parse cron_jobs.json, starting with empty store. Existing file may be corrupted."
-        );
-        // Optionally backup the corrupted file
-        let corrupted_path = path.with_extension("json.corrupted");
-        if let Err(backup_err) = std::fs::rename(&path, &corrupted_path) {
-            tracing::warn!(
-                original = %path.display(),
-                backup = %corrupted_path.display(),
-                error = %backup_err,
-                "Failed to backup corrupted cron_jobs.json"
-            );
-        }
-        JobStore::default()
-    });
+    let store: JobStore = serde_json::from_str(&content)?;
     Ok(store)
 }
 
@@ -318,7 +317,7 @@ fn save_store(paths: &Paths, store: &JobStore) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let content = serde_json::to_string_pretty(store)?;
-    std::fs::write(&path, content)?;
+    atomic_write(&path, content.as_bytes())?;
     Ok(())
 }
 
@@ -819,6 +818,56 @@ mod tests {
             .and_then(|s| s.get("runImmediately"))
             .and_then(|v| v.as_bool());
         assert_eq!(run_immediately, Some(true));
+        let _ = std::fs::remove_dir_all(paths.base);
+    }
+
+    #[test]
+    fn test_invalid_cron_store_is_reported_without_moving_source() {
+        let paths = temp_paths("invalid_store");
+        std::fs::create_dir_all(paths.cron_dir()).expect("create cron dir");
+        let path = paths.cron_jobs_file();
+        std::fs::write(&path, "{partial json").expect("write invalid store");
+
+        let result = load_store(&paths);
+
+        assert!(result.is_err(), "invalid JSON must be reported");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("source must remain"),
+            "{partial json"
+        );
+        assert!(!path.with_extension("json.corrupted").exists());
+        let _ = std::fs::remove_dir_all(paths.base);
+    }
+
+    #[test]
+    fn test_cron_rejects_non_positive_delay_seconds() {
+        let paths = temp_paths("delay_non_positive");
+        for delay in [0, -1] {
+            let result = execute_cron_action_with_paths(
+                &paths,
+                "add",
+                &json!({"name":"test","message":"hi","delay_seconds":delay}),
+                "test",
+                "chat",
+                None,
+            );
+            assert!(result.is_err(), "delay {delay} must be rejected");
+        }
+        let _ = std::fs::remove_dir_all(paths.base);
+    }
+
+    #[test]
+    fn test_cron_rejects_overflowing_delay_seconds() {
+        let paths = temp_paths("delay_overflow");
+        let result = execute_cron_action_with_paths(
+            &paths,
+            "add",
+            &json!({"name":"test","message":"hi","delay_seconds":i64::MAX}),
+            "test",
+            "chat",
+            None,
+        );
+        assert!(result.is_err());
         let _ = std::fs::remove_dir_all(paths.base);
     }
 }

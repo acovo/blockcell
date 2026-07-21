@@ -20,6 +20,7 @@ use blockcell_agent::forked::{
 use blockcell_agent::memory_event;
 use blockcell_agent::session_metrics::get_dream_circuit_breaker;
 use blockcell_agent::CrossProcessLock;
+use blockcell_core::file_store::ExclusiveFileLock;
 use blockcell_core::types::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -502,6 +503,8 @@ pub struct DreamConsolidator {
     gate_config: ConsolidatorConfig,
     /// Provider 池（用于 Forked Agent LLM 调用）
     provider_pool: Option<Arc<blockcell_providers::ProviderPool>>,
+    /// Ownership-bearing guard for `.dream_lock`.
+    dream_lock: std::sync::Mutex<Option<ExclusiveFileLock>>,
 }
 
 /// 检查锁的有效性（独立函数，供 check_gates 和 acquire_lock 复用）
@@ -511,9 +514,9 @@ pub struct DreamConsolidator {
 async fn check_lock_validity(lock_path: &Path) -> Result<bool, DreamError> {
     let content = fs::read_to_string(lock_path).await?;
 
-    // 解析 PID:TIMESTAMP
+    // 解析 PID:TIMESTAMP[:TOKEN]
     let parts: Vec<&str> = content.split(':').collect();
-    if parts.len() != 2 {
+    if parts.len() < 2 {
         // 格式错误，锁无效
         return Ok(false);
     }

@@ -70,7 +70,8 @@ pub struct DreamService {
 
 impl DreamService {
     /// 创建梦境服务
-    pub fn new(config: DreamServiceConfig, paths: Paths) -> Self {
+    pub fn new(mut config: DreamServiceConfig, paths: Paths) -> Self {
+        config.check_interval_secs = config.check_interval_secs.max(1);
         Self { config, paths }
     }
 
@@ -258,5 +259,20 @@ mod tests {
         let service = DreamService::new(config, paths);
 
         assert_eq!(service.config.check_interval_secs, 300);
+    }
+
+    #[test]
+    fn test_dream_service_normalizes_zero_interval() {
+        let config = DreamServiceConfig {
+            check_interval_secs: 0,
+            ..DreamServiceConfig::default()
+        };
+        let paths = Paths::with_base(
+            std::env::temp_dir().join(format!("blockcell-dream-zero-{}", uuid::Uuid::new_v4())),
+        );
+
+        let service = DreamService::new(config, paths);
+
+        assert_eq!(service.config.check_interval_secs, 1);
     }
 }

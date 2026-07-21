@@ -1,4 +1,5 @@
-use crate::job::{CronJob, ScheduleKind};
+use crate::job::{CronJob, JobStatus, ScheduleKind};
+use blockcell_core::file_store::{atomic_write, ExclusiveFileLock};
 use blockcell_core::system_event::{DeliveryPolicy, EventPriority, SystemEvent};
 use blockcell_core::{InboundMessage, Paths, Result};
 use blockcell_tools::EventEmitterHandle;
@@ -6,7 +7,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,6 +36,11 @@ pub struct CronService {
     last_file_mtime: Arc<RwLock<Option<SystemTime>>>,
     /// Flag to track if in-memory state has changes that need to be saved.
     has_unsaved_changes: Arc<RwLock<bool>>,
+    /// Membership changes that must be applied while holding the disk-store lock.
+    pending_added_ids: Arc<RwLock<std::collections::HashSet<String>>>,
+    pending_deleted_ids: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Serializes each in-process read/modify/write transaction.
+    operation_lock: Arc<Mutex<()>>,
     /// Tick interval in seconds for checking due jobs.
     tick_interval_secs: u64,
     /// Default timezone for jobs without a specified timezone or with invalid timezone.
@@ -113,6 +119,9 @@ impl CronService {
             event_emitter: Arc::new(StdMutex::new(None)),
             last_file_mtime: Arc::new(RwLock::new(None)),
             has_unsaved_changes: Arc::new(RwLock::new(false)),
+            pending_added_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            pending_deleted_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            operation_lock: Arc::new(Mutex::new(())),
             tick_interval_secs: tick_interval_secs.unwrap_or(1),
             default_timezone: default_tz,
         }
@@ -127,6 +136,11 @@ impl CronService {
     }
 
     pub async fn load(&self) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock().await;
+        self.load_unlocked().await
+    }
+
+    async fn load_unlocked(&self) -> Result<()> {
         let path = self.paths.cron_jobs_file();
         if !path.exists() {
             return Ok(());
@@ -146,6 +160,11 @@ impl CronService {
     }
 
     pub async fn save(&self) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock().await;
+        self.save_unlocked().await
+    }
+
+    async fn save_unlocked(&self) -> Result<()> {
         // Check if there are unsaved changes
         if !*self.has_unsaved_changes.read().await {
             debug!("No unsaved changes, skipping cron save");
@@ -153,19 +172,62 @@ impl CronService {
         }
 
         let path = self.paths.cron_jobs_file();
+        let lock_path = self.paths.cron_jobs_lock_file();
+        let mut snapshot = self.jobs.read().await.clone();
+        let added_ids = self.pending_added_ids.read().await.clone();
+        let deleted_ids = self.pending_deleted_ids.read().await.clone();
 
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        let _store_lock =
+            tokio::task::spawn_blocking(move || ExclusiveFileLock::acquire(&lock_path))
+                .await
+                .map_err(|error| {
+                    blockcell_core::Error::Other(format!("cron lock task failed: {error}"))
+                })??;
+
+        let disk_existed = path.exists();
+        let disk_store = if disk_existed {
+            let content = tokio::fs::read_to_string(&path).await?;
+            serde_json::from_str::<JobStore>(&content)?
+        } else {
+            JobStore::default()
+        };
+        let memory_by_id: std::collections::HashMap<String, CronJob> = snapshot
+            .drain(..)
+            .map(|job| (job.id.clone(), job))
+            .collect();
+        let mut merged = Vec::new();
+        let mut persisted_ids = std::collections::HashSet::new();
+        for disk_job in disk_store.jobs {
+            if deleted_ids.contains(&disk_job.id) {
+                continue;
+            }
+            let job = memory_by_id.get(&disk_job.id).cloned().unwrap_or(disk_job);
+            persisted_ids.insert(job.id.clone());
+            merged.push(job);
+        }
+        for (id, job) in memory_by_id {
+            if !persisted_ids.contains(&id)
+                && !deleted_ids.contains(&id)
+                && (!disk_existed || added_ids.contains(&id))
+            {
+                persisted_ids.insert(id);
+                merged.push(job);
+            }
         }
 
-        let jobs = self.jobs.read().await;
         let store = JobStore {
             version: 1,
-            jobs: jobs.clone(),
+            jobs: merged.clone(),
         };
-
         let content = serde_json::to_string_pretty(&store)?;
-        tokio::fs::write(&path, content).await?;
+        let write_path = path.clone();
+        tokio::task::spawn_blocking(move || atomic_write(&write_path, content.as_bytes()))
+            .await
+            .map_err(|error| {
+                blockcell_core::Error::Other(format!("cron write task failed: {error}"))
+            })??;
+
+        *self.jobs.write().await = merged;
 
         // Update the recorded modification time (our own write)
         let mtime = tokio::fs::metadata(&path)
@@ -176,12 +238,16 @@ impl CronService {
 
         // Clear the unsaved changes flag
         *self.has_unsaved_changes.write().await = false;
+        self.pending_added_ids.write().await.clear();
+        self.pending_deleted_ids.write().await.clear();
 
         debug!("Cron jobs saved to disk");
         Ok(())
     }
 
     pub async fn add_job(&self, job: CronJob) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock().await;
+        let added_id = job.id.clone();
         let mut jobs = self.jobs.write().await;
         // Check for duplicate ID
         if jobs.iter().any(|j| j.id == job.id) {
@@ -190,11 +256,17 @@ impl CronService {
         }
         jobs.push(job);
         drop(jobs);
+        self.pending_added_ids
+            .write()
+            .await
+            .insert(added_id.clone());
+        self.pending_deleted_ids.write().await.remove(&added_id);
         *self.has_unsaved_changes.write().await = true;
-        self.save().await
+        self.save_unlocked().await
     }
 
     pub async fn remove_job(&self, id: &str) -> Result<bool> {
+        let _operation_guard = self.operation_lock.lock().await;
         let mut jobs = self.jobs.write().await;
         let len_before = jobs.len();
         jobs.retain(|j| j.id != id);
@@ -202,8 +274,13 @@ impl CronService {
         drop(jobs);
 
         if removed {
+            self.pending_deleted_ids
+                .write()
+                .await
+                .insert(id.to_string());
+            self.pending_added_ids.write().await.remove(id);
             *self.has_unsaved_changes.write().await = true;
-            self.save().await?;
+            self.save_unlocked().await?;
         }
         Ok(removed)
     }
@@ -218,6 +295,7 @@ impl CronService {
         id_prefix: &str,
         enabled: bool,
     ) -> Result<Option<String>> {
+        let _operation_guard = self.operation_lock.lock().await;
         let mut jobs = self.jobs.write().await;
         let matching: Vec<usize> = jobs
             .iter()
@@ -235,7 +313,7 @@ impl CronService {
                 let name = job.name.clone();
                 drop(jobs);
                 *self.has_unsaved_changes.write().await = true;
-                self.save().await?;
+                self.save_unlocked().await?;
                 Ok(Some(name))
             }
             _ => {
@@ -328,75 +406,8 @@ impl CronService {
         Ok(true)
     }
 
-    /// Pick up any new jobs written to disk (e.g. by CronTool) since the last load.
-    /// Also updates existing jobs if they were modified on disk (detected by updated_at_ms).
-    /// Called just before save() to close the race window.
-    async fn sync_new_from_disk(
-        &self,
-        known_ids: &std::collections::HashSet<String>,
-    ) -> Result<bool> {
-        let path = self.paths.cron_jobs_file();
-        if !path.exists() {
-            return Ok(false);
-        }
-        let content = tokio::fs::read_to_string(&path).await?;
-        let store: JobStore = serde_json::from_str(&content)?;
-
-        let mut mem_jobs = self.jobs.write().await;
-        let mut changed = false;
-
-        for disk_job in store.jobs {
-            // Check if this is a new job
-            if !known_ids.contains(&disk_job.id)
-                && !mem_jobs.iter().any(|job| job.id == disk_job.id)
-            {
-                debug!(job_id = %disk_job.id, "Picked up new cron job from disk");
-                mem_jobs.push(disk_job);
-                changed = true;
-            } else {
-                // Check if existing job was modified on disk (by updated_at_ms)
-                if let Some(mem_job) = mem_jobs.iter_mut().find(|j| j.id == disk_job.id) {
-                    // If disk job is newer, update the in-memory copy
-                    // but preserve execution state (next_run_at_ms, last_run_at_ms)
-                    // unless the schedule itself changed
-                    if disk_job.updated_at_ms > mem_job.updated_at_ms {
-                        let schedule_changed = mem_job.schedule.kind != disk_job.schedule.kind
-                            || mem_job.schedule.at_ms != disk_job.schedule.at_ms
-                            || mem_job.schedule.every_ms != disk_job.schedule.every_ms
-                            || mem_job.schedule.expr != disk_job.schedule.expr
-                            || mem_job.schedule.tz != disk_job.schedule.tz;
-
-                        debug!(
-                            job_id = %disk_job.id,
-                            schedule_changed = schedule_changed,
-                            "Detected modified job on disk, updating in-memory state"
-                        );
-
-                        // Preserve execution state unless schedule changed
-                        let preserved_next_run = if schedule_changed {
-                            // Schedule changed: reset next_run to force recalculation
-                            None
-                        } else {
-                            mem_job.state.next_run_at_ms
-                        };
-                        let preserved_last_run = mem_job.state.last_run_at_ms;
-
-                        // Update from disk
-                        *mem_job = disk_job;
-
-                        // Restore preserved state
-                        mem_job.state.next_run_at_ms = preserved_next_run;
-                        mem_job.state.last_run_at_ms = preserved_last_run;
-
-                        changed = true;
-                    }
-                }
-            }
-        }
-        Ok(changed)
-    }
-
     pub async fn run_tick(&self) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock().await;
         // Reload from disk, merging in-memory execution state for already-initialized jobs.
         // New jobs added by CronTool (disk-only) are picked up; existing job scheduling
         // state (next_run_at_ms / last_run_at_ms) is preserved to avoid double-firing.
@@ -444,150 +455,123 @@ impl CronService {
                 })
                 .or(self.default_timezone);
 
+            let previous_next_run = job.state.next_run_at_ms;
             let should_run = match &job.state.next_run_at_ms {
                 Some(next) => *next <= now_ms,
                 None => self.calculate_next_run(job, now_ms, tz.as_ref()),
             };
+            if job.state.next_run_at_ms != previous_next_run {
+                state_changed = true;
+            }
 
             if should_run {
                 jobs_to_run.push(job.clone());
-
-                // Update state
-                job.state.last_run_at_ms = Some(now_ms);
-                state_changed = true;
-
-                // Calculate next run with timezone support
-                match job.schedule.kind {
-                    ScheduleKind::At => {
-                        // One-time job: disable immediately
-                        job.state.next_run_at_ms = None;
-                        job.enabled = false;
-                    }
-                    ScheduleKind::Every => {
-                        if let Some(every_ms) = job.schedule.every_ms {
-                            job.state.next_run_at_ms = Some(now_ms + every_ms);
-                        }
-                    }
-                    ScheduleKind::Cron => {
-                        // Calculate next cron time with timezone support
-                        if let Some(expr) = &job.schedule.expr {
-                            if let Some(next_ms) =
-                                self.calculate_next_cron_run_ms(expr, tz.as_ref())
-                            {
-                                job.state.next_run_at_ms = Some(next_ms);
-                            }
-                        }
-                    }
-                }
             }
         }
-
-        // Handle delete_after_run
-        let delete_ids: Vec<String> = jobs
-            .iter()
-            .filter(|j| j.delete_after_run && j.state.last_run_at_ms.is_some())
-            .map(|j| j.id.clone())
-            .collect();
-        if !delete_ids.is_empty() {
-            jobs.retain(|j| !delete_ids.contains(&j.id));
-            state_changed = true;
-            info!(count = delete_ids.len(), "Deleted completed one-time jobs");
-        }
-
         drop(jobs);
 
-        // Mark state as changed if any modifications occurred
+        // Persist schedule initialization before delivery. Completion is not
+        // persisted until the inbound channel acknowledges the message.
         if state_changed {
             *self.has_unsaved_changes.write().await = true;
+            self.save_unlocked().await?;
         }
 
-        // 同步磁盘上的新任务，缩小 mtime 竞态窗口。
-        // CronTool 可能在 merge_load 之后写入新任务；缺这一步 save() 会覆盖它们。
-        // merge_load 已按 mtime 短路读取，因此只有当文件在本 tick 内又发生改动
-        // （mtime 不同于 merge_load 记录的 last_file_mtime）时才需要 sync；否则
-        // 磁盘内容已在 merge_load 并入内存，再全量读+解析纯属冗余（每秒一次）。
-        let mut retries = 0;
-        let max_retries = 2;
-        // 延迟构建 known_ids：仅在确实需要 sync 时才克隆 job id 集合。集合需覆盖
-        // 本 tick 起始时存在的全部任务（含已被 delete_after_run 移除、尚未落盘的），
-        // 以免把刚删除的任务当成磁盘上的“新任务”重新加入。
-        let mut known_ids: Option<std::collections::HashSet<String>> = None;
-        loop {
-            // 检查文件 mtime：若自 merge_load 后未变化，则无新写入，跳过读盘+解析。
-            // 若在 sync 之后又被其他进程修改，则需要重新读取，避免 save() 覆盖其写入。
-            let path = self.paths.cron_jobs_file();
-            let current_mtime = if path.exists() {
-                tokio::fs::metadata(&path)
-                    .await
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-            } else {
-                None
-            };
-            let last_mtime = *self.last_file_mtime.read().await;
-
-            let file_changed = match (current_mtime, last_mtime) {
-                (Some(current), Some(last)) => current != last,
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
-
-            if !file_changed {
-                break;
-            }
-
-            if known_ids.is_none() {
-                let mem_jobs = self.jobs.read().await;
-                let mut ids: std::collections::HashSet<String> =
-                    mem_jobs.iter().map(|job| job.id.clone()).collect();
-                drop(mem_jobs);
-                ids.extend(delete_ids.iter().cloned());
-                known_ids = Some(ids);
-            }
-            let ids = known_ids.as_ref().expect("known_ids initialized above");
-
-            match self.sync_new_from_disk(ids).await {
-                Ok(added) => {
-                    if added {
-                        *self.has_unsaved_changes.write().await = true;
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e.to_string(), "Failed to sync new cron jobs from disk");
-                }
-            }
-
-            if retries >= max_retries {
-                break;
-            }
-
-            retries += 1;
-            debug!(
-                retry = retries,
-                "Cron jobs file changed again, re-syncing from disk"
-            );
-        }
-
-        // Save state changes to disk BEFORE executing jobs
-        // This ensures the next tick won't re-fire disabled/deleted jobs
-        if state_changed || *self.has_unsaved_changes.read().await {
-            self.save().await?;
-        }
-
-        // Execute jobs - spawn for parallel execution to avoid blocking
+        // Deliver due jobs, then commit completion only for acknowledged sends.
         let inbound_tx = self.inbound_tx.clone();
         let event_emitter = self.event_emitter.clone();
         let agent_id = self.agent_id.clone();
-
-        for job in jobs_to_run {
-            let inbound_tx = inbound_tx.clone();
-            let event_emitter = event_emitter.clone();
-            let agent_id = agent_id.clone();
-
-            tokio::spawn(async move {
-                Self::execute_job_internal(&job, inbound_tx, event_emitter, agent_id).await;
-            });
+        let mut delivery_results = Vec::with_capacity(jobs_to_run.len());
+        for job in &jobs_to_run {
+            let result = Self::execute_job_internal(
+                job,
+                inbound_tx.clone(),
+                event_emitter.clone(),
+                agent_id.clone(),
+            )
+            .await;
+            delivery_results.push((job.id.clone(), result));
         }
+
+        if delivery_results.is_empty() {
+            return Ok(());
+        }
+
+        let mut jobs = self.jobs.write().await;
+        let mut delete_ids = Vec::new();
+        for (job_id, delivery) in delivery_results {
+            let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) else {
+                continue;
+            };
+            match delivery {
+                Ok(()) => {
+                    job.state.last_run_at_ms = Some(now_ms);
+                    job.state.last_status = Some(JobStatus::Ok);
+                    job.state.last_error = None;
+                    match job.schedule.kind {
+                        ScheduleKind::At => {
+                            job.state.next_run_at_ms = None;
+                            job.enabled = false;
+                        }
+                        ScheduleKind::Every => {
+                            if let Some(every_ms) = job.schedule.every_ms {
+                                job.state.next_run_at_ms = now_ms.checked_add(every_ms);
+                            }
+                        }
+                        ScheduleKind::Cron => {
+                            let tz = job
+                                .schedule
+                                .tz
+                                .as_deref()
+                                .and_then(parse_timezone)
+                                .or(self.default_timezone);
+                            if let Some(expr) = &job.schedule.expr {
+                                job.state.next_run_at_ms =
+                                    self.calculate_next_cron_run_ms(expr, tz.as_ref());
+                            }
+                        }
+                    }
+                    if job.delete_after_run {
+                        delete_ids.push(job.id.clone());
+                    }
+                }
+                Err(error) => {
+                    job.state.last_status = Some(JobStatus::Error);
+                    job.state.last_error = Some(error);
+                    if job.schedule.kind != ScheduleKind::At {
+                        match job.schedule.kind {
+                            ScheduleKind::Every => {
+                                job.state.next_run_at_ms = job
+                                    .schedule
+                                    .every_ms
+                                    .and_then(|every_ms| now_ms.checked_add(every_ms));
+                            }
+                            ScheduleKind::Cron => {
+                                let tz = job
+                                    .schedule
+                                    .tz
+                                    .as_deref()
+                                    .and_then(parse_timezone)
+                                    .or(self.default_timezone);
+                                if let Some(expr) = &job.schedule.expr {
+                                    job.state.next_run_at_ms =
+                                        self.calculate_next_cron_run_ms(expr, tz.as_ref());
+                                }
+                            }
+                            ScheduleKind::At => {}
+                        }
+                    }
+                }
+            }
+        }
+        if !delete_ids.is_empty() {
+            jobs.retain(|job| !delete_ids.contains(&job.id));
+            info!(count = delete_ids.len(), "Deleted completed cron jobs");
+        }
+        drop(jobs);
+        self.pending_deleted_ids.write().await.extend(delete_ids);
+        *self.has_unsaved_changes.write().await = true;
+        self.save_unlocked().await?;
         Ok(())
     }
 
@@ -597,7 +581,7 @@ impl CronService {
         inbound_tx: mpsc::Sender<InboundMessage>,
         event_emitter: Arc<StdMutex<Option<EventEmitterHandle>>>,
         agent_id: Option<String>,
-    ) {
+    ) -> std::result::Result<(), String> {
         debug!(job_id = %job.id, job_name = %job.name, kind = %job.payload.kind, "Executing cron job");
 
         // Emit start event
@@ -664,7 +648,7 @@ impl CronService {
             }
             _ => {
                 error!(job_id = %job.id, kind = %job.payload.kind, "Unknown cron payload kind");
-                return;
+                return Err(format!("unknown cron payload kind: {}", job.payload.kind));
             }
         };
 
@@ -704,6 +688,7 @@ impl CronService {
                 });
                 emitter.emit(event);
             }
+            Err(e.to_string())
         } else {
             // Emit completion event
             if let Some(emitter) = event_emitter.lock().ok().and_then(|e| e.clone()) {
@@ -721,13 +706,14 @@ impl CronService {
                 });
                 emitter.emit(event);
             }
+            Ok(())
         }
     }
 
     /// Execute a cron job (wrapper for testing and internal use)
     #[allow(dead_code)]
     async fn execute_job(&self, job: &CronJob) {
-        Self::execute_job_internal(
+        let _ = Self::execute_job_internal(
             job,
             self.inbound_tx.clone(),
             self.event_emitter.clone(),
@@ -1130,6 +1116,78 @@ mod tests {
         assert!(
             saved.jobs.is_empty(),
             "delete_after_run job should be removed from disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_due_at_delivery_remains_retryable_and_records_error() {
+        let paths = Paths::with_base(
+            std::env::temp_dir().join(format!("blockcell-cron-service-{}", uuid::Uuid::new_v4())),
+        );
+        tokio::fs::create_dir_all(paths.cron_dir())
+            .await
+            .expect("create cron dir");
+        let store = JobStore {
+            version: 1,
+            jobs: vec![test_due_at_job()],
+        };
+        tokio::fs::write(
+            paths.cron_jobs_file(),
+            serde_json::to_string_pretty(&store).unwrap(),
+        )
+        .await
+        .expect("write cron store");
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let service = CronService::new(paths.clone(), tx);
+
+        service.run_tick().await.expect("run failed delivery tick");
+
+        let saved: JobStore = serde_json::from_str(
+            &tokio::fs::read_to_string(paths.cron_jobs_file())
+                .await
+                .expect("read saved store"),
+        )
+        .expect("parse saved store");
+        assert_eq!(saved.jobs.len(), 1, "failed one-shot must not be deleted");
+        assert!(saved.jobs[0].enabled, "failed one-shot must remain enabled");
+        assert_eq!(
+            saved.jobs[0].state.last_status,
+            Some(crate::job::JobStatus::Error)
+        );
+        assert!(saved.jobs[0].state.last_error.is_some());
+        assert!(saved.jobs[0].state.last_run_at_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_adds_preserve_both_jobs() {
+        let paths = Paths::with_base(
+            std::env::temp_dir().join(format!("blockcell-cron-service-{}", uuid::Uuid::new_v4())),
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        let service = Arc::new(CronService::new(paths.clone(), tx));
+        let mut first = test_job();
+        first.id = "first".to_string();
+        let mut second = test_job();
+        second.id = "second".to_string();
+
+        let first_service = service.clone();
+        let second_service = service.clone();
+        let (first_result, second_result) =
+            tokio::join!(first_service.add_job(first), second_service.add_job(second));
+        first_result.expect("add first job");
+        second_result.expect("add second job");
+
+        let saved: JobStore = serde_json::from_str(
+            &tokio::fs::read_to_string(paths.cron_jobs_file())
+                .await
+                .expect("read cron store"),
+        )
+        .expect("parse cron store");
+        let ids: std::collections::HashSet<_> = saved.jobs.into_iter().map(|job| job.id).collect();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from(["first".to_string(), "second".to_string()])
         );
     }
 }

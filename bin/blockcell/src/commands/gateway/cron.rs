@@ -12,7 +12,6 @@ pub(super) async fn handle_cron_list(
         Ok(value) => value,
         Err(err) => return Json(serde_json::json!({ "error": err })),
     };
-    let _ = cron_service.load().await;
     let jobs = cron_service.list_jobs().await;
     let jobs_json: Vec<serde_json::Value> = jobs
         .iter()
@@ -72,6 +71,23 @@ fn resolve_cron_skill_payload_kind(paths: &Paths, skill_name: Option<&str>) -> &
     } else {
         "rhai"
     }
+}
+
+fn build_every_schedule(every_seconds: i64, run_immediately: bool) -> Result<JobSchedule, String> {
+    if every_seconds <= 0 {
+        return Err("every_seconds must be a positive integer".to_string());
+    }
+    let every_ms = every_seconds
+        .checked_mul(1000)
+        .ok_or_else(|| "every_seconds is too large".to_string())?;
+    Ok(JobSchedule {
+        kind: ScheduleKind::Every,
+        at_ms: None,
+        every_ms: Some(every_ms),
+        expr: None,
+        tz: None,
+        run_immediately,
+    })
 }
 
 fn build_manual_cron_inbound(job: &CronJob, agent_id: &str) -> InboundMessage {
@@ -166,13 +182,9 @@ pub(super) async fn handle_cron_create(
             run_immediately: false, // Not applicable for At jobs
         }
     } else if let Some(every) = req.every_seconds {
-        JobSchedule {
-            kind: ScheduleKind::Every,
-            at_ms: None,
-            every_ms: Some(every * 1000),
-            expr: None,
-            tz: None,
-            run_immediately: req.run_immediately,
+        match build_every_schedule(every, req.run_immediately) {
+            Ok(schedule) => schedule,
+            Err(error) => return Json(serde_json::json!({ "error": error })),
         }
     } else if let Some(expr) = req.cron_expr {
         JobSchedule {
@@ -270,8 +282,13 @@ pub(super) async fn handle_cron_run(
     match job {
         Some(job) => {
             let inbound = build_manual_cron_inbound(job, &agent_id);
-            let _ = state.inbound_tx.send(inbound).await;
-            Json(serde_json::json!({ "status": "triggered", "job_id": job.id }))
+            match state.inbound_tx.send(inbound).await {
+                Ok(()) => Json(serde_json::json!({ "status": "triggered", "job_id": job.id })),
+                Err(error) => Json(serde_json::json!({
+                    "error": format!("failed to trigger cron job: {error}"),
+                    "job_id": job.id,
+                })),
+            }
         }
         None => Json(serde_json::json!({ "status": "not_found", "job_id": job_id })),
     }
@@ -362,5 +379,19 @@ mod tests {
             inbound.metadata.get("deliver_to").and_then(|v| v.as_str()),
             Some("manual:test")
         );
+    }
+
+    #[test]
+    fn test_build_every_schedule_rejects_non_positive_and_overflowing_values() {
+        assert!(build_every_schedule(0, false).is_err());
+        assert!(build_every_schedule(-1, false).is_err());
+        assert!(build_every_schedule(i64::MAX, false).is_err());
+    }
+
+    #[test]
+    fn test_build_every_schedule_converts_checked_seconds_to_millis() {
+        let schedule = build_every_schedule(60, true).expect("valid every schedule");
+        assert_eq!(schedule.every_ms, Some(60_000));
+        assert!(schedule.run_immediately);
     }
 }
