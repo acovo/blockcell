@@ -1,10 +1,19 @@
 use crate::atomic::{AtomicSwitcher, MaintenanceWindow};
 use crate::manifest::Manifest;
-use crate::verification::{HealthChecker, Sha256Verifier, SignatureVerifier};
+use crate::verification::{HealthChecker, SignatureVerifier};
 use blockcell_core::{Config, Error, Paths, Result};
 use reqwest::Client;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
+
+const MAX_ARTIFACT_SIZE: u64 = 256 * 1024 * 1024;
+const STAGING_METADATA_FILE: &str = "current.json";
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct UpdateManager {
     config: Config,
@@ -19,6 +28,19 @@ pub struct UpdateStatus {
     pub latest_version: Option<String>,
     pub update_available: bool,
     pub staging_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedUpdate {
+    pub version: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedUpdateMetadata {
+    version: String,
+    file_name: String,
 }
 
 impl UpdateManager {
@@ -97,69 +119,205 @@ impl UpdateManager {
 
         info!(url = %artifact.url, "Downloading update");
 
-        let response = self
+        let mut response = self
             .client
             .get(&artifact.url)
             .send()
             .await
             .map_err(|e| Error::Other(format!("Download failed: {}", e)))?;
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Error::Other(format!("Failed to read download: {}", e)))?;
-
-        // Verify SHA256
-        let hash = Sha256Verifier::compute(&bytes);
-        if hash != artifact.sha256 {
-            return Err(Error::Validation(format!(
-                "SHA256 mismatch: expected {}, got {}",
-                artifact.sha256, hash
+        if !response.status().is_success() {
+            return Err(Error::Other(format!(
+                "Download failed: HTTP {}",
+                response.status()
             )));
         }
-        info!("SHA256 verification passed");
 
-        // Verify signature if required
-        if self.config.auto_upgrade.require_signature {
-            self.verify_signature(manifest, &bytes, artifact.sig.as_deref())?;
-        } else {
-            warn!(
-                "requireSignature is disabled: installing update verified by SHA256 only. \
-                 A tampered manifest could serve a malicious binary. \
-                 Enable signature verification (requireSignature: true) for fail-closed safety."
-            );
+        if let Some(content_length) = response.content_length() {
+            if content_length > MAX_ARTIFACT_SIZE {
+                return Err(Error::Validation(format!(
+                    "Update artifact is too large: {} bytes (maximum {})",
+                    content_length, MAX_ARTIFACT_SIZE
+                )));
+            }
         }
 
-        // Save to staging
-        let staging_dir = self.paths.update_dir().join("staging");
+        let version_file_name = Self::version_file_name(&manifest.version)?;
+        let staging_dir = self.staging_dir();
         std::fs::create_dir_all(&staging_dir)?;
+        let staging_path = staging_dir.join(&version_file_name);
+        let temp_path = unique_temp_path(&staging_dir, "artifact");
 
-        let staging_path = staging_dir.join(format!("blockcell-{}", manifest.version));
-        std::fs::write(&staging_path, &bytes)?;
+        let result: Result<PathBuf> = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)
+                .await?;
+            let mut hasher = Sha256::new();
+            let mut downloaded = 0u64;
 
-        // 设置可执行权限（Unix），否则 HealthChecker 运行 --version 会因权限不足失败
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&staging_path)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&staging_path, perms)?;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| Error::Other(format!("Failed to read download: {}", e)))?
+            {
+                downloaded = downloaded.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    Error::Validation("Update artifact size overflow".to_string())
+                })?;
+                if downloaded > MAX_ARTIFACT_SIZE {
+                    return Err(Error::Validation(format!(
+                        "Update artifact is too large: more than {} bytes",
+                        MAX_ARTIFACT_SIZE
+                    )));
+                }
+                file.write_all(&chunk).await?;
+                hasher.update(&chunk);
+            }
+            file.flush().await?;
+            file.sync_all().await?;
+            drop(file);
+
+            let hash = format!("{:x}", hasher.finalize());
+            if hash != artifact.sha256 {
+                return Err(Error::Validation(format!(
+                    "SHA256 mismatch: expected {}, got {}",
+                    artifact.sha256, hash
+                )));
+            }
+            info!("SHA256 verification passed");
+
+            if self.config.auto_upgrade.require_signature {
+                let bytes = tokio::fs::read(&temp_path).await?;
+                self.verify_signature(manifest, &bytes, artifact.sig.as_deref())?;
+            } else {
+                warn!(
+                    "requireSignature is disabled: installing update verified by SHA256 only. \
+                     A tampered manifest could serve a malicious binary. \
+                     Enable signature verification (requireSignature: true) for fail-closed safety."
+                );
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&temp_path)?.permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&temp_path, perms)?;
+            }
+
+            replace_staging_file(&temp_path, &staging_path)?;
+            self.persist_staged_update(&StagedUpdateMetadata {
+                version: manifest.version.clone(),
+                file_name: version_file_name,
+            })?;
+
+            Ok(staging_path.clone())
         }
+        .await;
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        let staging_path = result?;
 
         info!(path = %staging_path.display(), "Update downloaded and verified");
 
         Ok(staging_path)
     }
 
-    pub fn status(&self) -> UpdateStatus {
-        let current_version = env!("CARGO_PKG_VERSION").to_string();
-
-        UpdateStatus {
-            current_version,
-            latest_version: None,
-            update_available: false,
-            staging_path: None,
+    pub fn staged_update(&self) -> Result<Option<StagedUpdate>> {
+        let metadata_path = self.staging_dir().join(STAGING_METADATA_FILE);
+        let bytes = match std::fs::read(&metadata_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata: StagedUpdateMetadata = serde_json::from_slice(&bytes)?;
+        let file_name = Path::new(&metadata.file_name);
+        if file_name.components().count() != 1
+            || !matches!(file_name.components().next(), Some(Component::Normal(_)))
+        {
+            return Err(Error::Validation(
+                "Invalid staged update file name".to_string(),
+            ));
         }
+        let path = self.staging_dir().join(file_name);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(StagedUpdate {
+            version: metadata.version,
+            path,
+        }))
+    }
+
+    fn staging_dir(&self) -> PathBuf {
+        self.paths.update_dir().join("staging")
+    }
+
+    fn version_file_name(version: &str) -> Result<String> {
+        if version.is_empty()
+            || !version
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || ".-_+".contains(character))
+        {
+            return Err(Error::Validation(format!(
+                "Invalid update version for staging: {}",
+                version
+            )));
+        }
+        Ok(format!("blockcell-{}", version))
+    }
+
+    fn persist_staged_update(&self, metadata: &StagedUpdateMetadata) -> Result<()> {
+        use std::io::Write;
+
+        let staging_dir = self.staging_dir();
+        std::fs::create_dir_all(&staging_dir)?;
+        let metadata_path = staging_dir.join(STAGING_METADATA_FILE);
+        let temp_path = unique_temp_path(&staging_dir, "metadata");
+        let result: Result<()> = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)?;
+            serde_json::to_writer(&mut file, metadata)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            replace_staging_file(&temp_path, &metadata_path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
+    }
+
+    fn clear_staged_update_metadata(&self) -> Result<()> {
+        match std::fs::remove_file(self.staging_dir().join(STAGING_METADATA_FILE)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn status(&self) -> Result<UpdateStatus> {
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+        let staged = self.staged_update()?;
+        let remote = self.check().await?;
+        let latest_version = remote
+            .as_ref()
+            .map(|manifest| manifest.version.clone())
+            .or_else(|| staged.as_ref().map(|update| update.version.clone()));
+        let update_available = remote.is_some() || staged.is_some();
+        let staging_path = staged.map(|update| update.path);
+
+        Ok(UpdateStatus {
+            current_version,
+            latest_version,
+            update_available,
+            staging_path,
+        })
     }
 
     pub async fn apply(&self, staging_path: &std::path::Path, version: &str) -> Result<()> {
@@ -190,6 +348,7 @@ impl UpdateManager {
 
         // 3. 原子切换
         self.switcher.switch_to_new(staging_path, version).await?;
+        self.clear_staged_update_metadata()?;
 
         // 4. 运行 Healthcheck（切换后）
         // 注意：这里需要重启进程，所以实际上这个检查应该在重启后由外部进程执行
@@ -199,10 +358,10 @@ impl UpdateManager {
         Ok(())
     }
 
-    pub async fn rollback(&self) -> Result<()> {
+    pub async fn rollback(&self, version: Option<&str>) -> Result<()> {
         warn!("Rolling back to previous version");
 
-        self.switcher.rollback().await?;
+        self.switcher.rollback(version).await?;
 
         info!("Rollback completed. Restart required.");
         Ok(())
@@ -335,4 +494,214 @@ fn get_current_platform() -> (String, String) {
     };
 
     (os.to_string(), arch.to_string())
+}
+
+fn unique_temp_path(directory: &Path, label: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    directory.join(format!(
+        ".blockcell-{}-{}-{}-{}.tmp",
+        label,
+        std::process::id(),
+        timestamp,
+        counter
+    ))
+}
+
+fn replace_staging_file(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if destination.exists() {
+        std::fs::remove_file(destination)?;
+    }
+    std::fs::rename(source, destination)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::Artifact;
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn serve_once(status: &str, headers: &[(&str, String)], body: &[u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect();
+        let body = body.to_vec();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = socket.read(&mut request).await;
+
+            let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+            for (name, value) in headers {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str("\r\n");
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+        });
+
+        format!("http://{addr}/artifact")
+    }
+
+    fn manager(temp: &TempDir) -> UpdateManager {
+        let mut config = Config::default();
+        config.auto_upgrade.require_signature = false;
+        UpdateManager::new(config, Paths::with_base(temp.path().to_path_buf()))
+    }
+
+    fn manager_with_manifest_url(temp: &TempDir, manifest_url: String) -> UpdateManager {
+        let mut config = Config::default();
+        config.auto_upgrade.require_signature = false;
+        config.auto_upgrade.manifest_url = manifest_url;
+        UpdateManager::new(config, Paths::with_base(temp.path().to_path_buf()))
+    }
+
+    fn manifest(url: String, body: &[u8]) -> Manifest {
+        let (os, arch) = get_current_platform();
+        Manifest {
+            channel: "stable".to_string(),
+            version: "9.9.9".to_string(),
+            published_at: "2026-07-21T00:00:00Z".to_string(),
+            artifacts: vec![Artifact {
+                os,
+                arch,
+                url,
+                sha256: format!("{:x}", Sha256::digest(body)),
+                sig: None,
+            }],
+            min_host_version: None,
+            notes: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_rejects_non_success_http_status() {
+        let temp = TempDir::new().unwrap();
+        let body = b"not found";
+        let url = serve_once(
+            "404 Not Found",
+            &[("Content-Length", body.len().to_string())],
+            body,
+        )
+        .await;
+
+        let error = manager(&temp)
+            .download(&manifest(url, body))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("HTTP 404"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn download_rejects_artifact_larger_than_limit() {
+        let temp = TempDir::new().unwrap();
+        let url = serve_once(
+            "200 OK",
+            &[("Content-Length", (MAX_ARTIFACT_SIZE + 1).to_string())],
+            &[],
+        )
+        .await;
+
+        let error = manager(&temp)
+            .download(&manifest(url, &[]))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("too large"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn successful_download_persists_staging_metadata() {
+        let temp = TempDir::new().unwrap();
+        let body = b"signed update bytes";
+        let url = serve_once(
+            "200 OK",
+            &[("Content-Length", body.len().to_string())],
+            body,
+        )
+        .await;
+        let manager = manager(&temp);
+
+        let staged_path = manager.download(&manifest(url, body)).await.unwrap();
+
+        assert_eq!(std::fs::read(staged_path).unwrap(), body);
+        let metadata_path = temp.path().join("update/staging/current.json");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(metadata_path).unwrap()).unwrap();
+        assert_eq!(metadata["version"], "9.9.9");
+        assert_eq!(metadata["fileName"], "blockcell-9.9.9");
+    }
+
+    #[tokio::test]
+    async fn status_reports_remote_update() {
+        let temp = TempDir::new().unwrap();
+        let remote_manifest = manifest("http://127.0.0.1/unused".to_string(), b"");
+        let body = serde_json::to_vec(&remote_manifest).unwrap();
+        let url = serve_once(
+            "200 OK",
+            &[
+                ("Content-Length", body.len().to_string()),
+                ("Content-Type", "application/json".to_string()),
+            ],
+            &body,
+        )
+        .await;
+
+        let status = manager_with_manifest_url(&temp, url)
+            .status()
+            .await
+            .unwrap();
+
+        assert_eq!(status.latest_version.as_deref(), Some("9.9.9"));
+        assert!(status.update_available);
+        assert_eq!(status.staging_path, None);
+    }
+
+    #[tokio::test]
+    async fn status_reports_locally_staged_update() {
+        let temp = TempDir::new().unwrap();
+        let mut remote_manifest = manifest("http://127.0.0.1/unused".to_string(), b"");
+        remote_manifest.channel = "beta".to_string();
+        let body = serde_json::to_vec(&remote_manifest).unwrap();
+        let url = serve_once(
+            "200 OK",
+            &[
+                ("Content-Length", body.len().to_string()),
+                ("Content-Type", "application/json".to_string()),
+            ],
+            &body,
+        )
+        .await;
+        let manager = manager_with_manifest_url(&temp, url);
+        let staging_dir = temp.path().join("update/staging");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        let staged_path = staging_dir.join("blockcell-9.9.9");
+        std::fs::write(&staged_path, b"update").unwrap();
+        manager
+            .persist_staged_update(&StagedUpdateMetadata {
+                version: "9.9.9".to_string(),
+                file_name: "blockcell-9.9.9".to_string(),
+            })
+            .unwrap();
+
+        let status = manager.status().await.unwrap();
+
+        assert_eq!(status.latest_version.as_deref(), Some("9.9.9"));
+        assert!(status.update_available);
+        assert_eq!(status.staging_path.as_deref(), Some(staged_path.as_path()));
+    }
 }

@@ -64,22 +64,30 @@ pub async fn download() -> anyhow::Result<()> {
 }
 
 pub async fn apply() -> anyhow::Result<()> {
-    println!("Apply not yet implemented.");
-    println!("This would:");
-    println!("  1. Verify the downloaded binary");
-    println!("  2. Stop the running daemon");
-    println!("  3. Replace the binary atomically");
-    println!("  4. Restart the daemon");
-    println!("  5. Run healthcheck");
+    let paths = Paths::new();
+    let config = Config::load_or_default(&paths)?;
+    let manager = UpdateManager::new(config, paths);
+    let staged = manager
+        .staged_update()?
+        .ok_or_else(|| anyhow::anyhow!("No downloaded update is ready to apply"))?;
+
+    println!("Applying version {}...", staged.version);
+    manager.apply(&staged.path, &staged.version).await?;
+    println!("Update applied successfully. Restart blockcell to use the new version.");
     Ok(())
 }
 
 pub async fn rollback(to: Option<String>) -> anyhow::Result<()> {
-    if let Some(version) = to {
-        println!("Rollback to version {} not yet implemented.", version);
-    } else {
-        println!("Rollback to previous version not yet implemented.");
+    let paths = Paths::new();
+    let config = Config::load_or_default(&paths)?;
+    let manager = UpdateManager::new(config, paths);
+
+    match to.as_deref() {
+        Some(version) => println!("Rolling back to version {}...", version),
+        None => println!("Rolling back to the previous version..."),
     }
+    manager.rollback(to.as_deref()).await?;
+    println!("Rollback completed. Restart blockcell to use the restored version.");
     Ok(())
 }
 
@@ -88,7 +96,7 @@ pub async fn status() -> anyhow::Result<()> {
     let config = Config::load_or_default(&paths)?;
     let manager = UpdateManager::new(config, paths);
 
-    let status = manager.status();
+    let status = manager.status().await?;
 
     println!("Upgrade Status");
     println!("==============");

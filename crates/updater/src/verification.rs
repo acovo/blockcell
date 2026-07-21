@@ -233,15 +233,25 @@ impl HealthChecker {
                 passed: true,
                 message: "Self-check passed".to_string(),
             },
-            Ok(Ok(_)) => Check {
+            Ok(Ok(output)) if self_check_is_unsupported(&output) => Check {
+                name: "self_check".to_string(),
+                passed: true,
+                message: "Self-check not supported (skipped)".to_string(),
+            },
+            Ok(Ok(output)) => Check {
                 name: "self_check".to_string(),
                 passed: false,
-                message: "Self-check failed".to_string(),
+                message: format!("Self-check failed with {}", output.status),
             },
-            Ok(Err(_)) | Err(_) => Check {
+            Ok(Err(error)) => Check {
                 name: "self_check".to_string(),
-                passed: true, // 不强制要求支持 --self-check
-                message: "Self-check not supported (skipped)".to_string(),
+                passed: false,
+                message: format!("Failed to execute self-check: {}", error),
+            },
+            Err(_) => Check {
+                name: "self_check".to_string(),
+                passed: false,
+                message: "Self-check Timeout".to_string(),
             },
         }
     }
@@ -289,6 +299,15 @@ impl HealthChecker {
     }
 }
 
+fn self_check_is_unsupported(output: &std::process::Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    stderr.contains("--self-check")
+        && (stderr.contains("unexpected argument")
+            || stderr.contains("unrecognized option")
+            || stderr.contains("unknown option")
+            || stderr.contains("unknown argument"))
+}
+
 #[derive(Debug, Clone)]
 pub struct HealthCheckResult {
     pub passed: bool,
@@ -305,6 +324,18 @@ pub struct Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn executable_temp_dir() -> TempDir {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/updater-healthcheck-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("healthcheck-")
+            .tempdir_in(root)
+            .unwrap()
+    }
 
     #[test]
     fn test_sha256_compute() {
@@ -314,5 +345,63 @@ mod tests {
             hash,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    #[cfg(unix)]
+    fn write_script(temp: &TempDir, contents: &str, executable: bool) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp.path().join("healthcheck-script");
+        std::fs::write(&path, contents).unwrap();
+        if executable {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn self_check_timeout_is_a_failure() {
+        let temp = executable_temp_dir();
+        let path = write_script(&temp, "#!/bin/sh\nsleep 3\n", true);
+
+        let check = HealthChecker::new(path).check_self_test(1).await;
+
+        assert!(!check.passed);
+        assert!(check.message.contains("Timeout"), "{}", check.message);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn self_check_spawn_error_is_a_failure() {
+        let temp = executable_temp_dir();
+        let path = write_script(&temp, "#!/bin/sh\nexit 0\n", false);
+
+        let check = HealthChecker::new(path).check_self_test(1).await;
+
+        assert!(!check.passed);
+        assert!(
+            check.message.contains("Failed to execute"),
+            "{}",
+            check.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicitly_unsupported_self_check_is_skipped() {
+        let temp = executable_temp_dir();
+        let path = write_script(
+            &temp,
+            "#!/bin/sh\necho \"error: unexpected argument '--self-check' found\" >&2\nexit 2\n",
+            true,
+        );
+
+        let check = HealthChecker::new(path).check_self_test(1).await;
+
+        assert!(check.passed);
+        assert!(check.message.contains("not supported"), "{}", check.message);
     }
 }

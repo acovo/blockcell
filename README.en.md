@@ -1,10 +1,6 @@
-# BlueClaw
+# BlockCell
 
 <div align="center">
-
-<img src="screenshot/logo-blueclaw.png" alt="BlueClaw Logo" width="320" />
-
-**BlockCell evolves into BlueClaw — the blue claw**
 
 **A self-evolving AI agent framework built with Rust**
 
