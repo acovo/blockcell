@@ -41,6 +41,7 @@ pub mod session_search;
 pub mod skill_manage;
 pub mod skills;
 pub mod spawn;
+pub(crate) mod ssrf;
 pub mod stream_subscribe;
 pub mod system_info;
 pub mod tasks;

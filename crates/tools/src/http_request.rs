@@ -2,105 +2,11 @@ use async_trait::async_trait;
 use blockcell_core::{Error, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::net::{IpAddr, ToSocketAddrs};
 
+use crate::ssrf::{ensure_url_allowed, redirect_policy};
+#[cfg(test)]
+use crate::ssrf::{host_is_blocked, is_blocked_ip};
 use crate::{Tool, ToolContext, ToolSchema};
-
-/// Set this env var to `1`/`true` to allow requests to private/internal
-/// addresses (disables the SSRF guard). Off by default.
-const SSRF_ALLOW_ENV: &str = "BLOCKCELL_HTTP_ALLOW_PRIVATE";
-
-fn private_network_allowed() -> bool {
-    std::env::var(SSRF_ALLOW_ENV)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-/// Whether an IP must be refused to mitigate SSRF (loopback, private,
-/// link-local incl. cloud metadata 169.254.169.254, CGNAT, ULA, ...).
-fn is_blocked_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || o[0] == 0
-                || (o[0] == 100 && (64..128).contains(&o[1])) // CGNAT 100.64.0.0/10
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
-                || v6
-                    .to_ipv4()
-                    .map(|v4| is_blocked_ip(&IpAddr::V4(v4)))
-                    .unwrap_or(false)
-        }
-    }
-}
-
-/// Synchronous host check used by the redirect policy: resolves the host and
-/// reports whether it points at a blocked address. DNS failures return
-/// `false` so reqwest surfaces the underlying connection error.
-fn host_is_blocked(host: &str) -> bool {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return is_blocked_ip(&ip);
-    }
-    match (host, 0u16).to_socket_addrs() {
-        Ok(addrs) => addrs.into_iter().any(|a| is_blocked_ip(&a.ip())),
-        Err(_) => false,
-    }
-}
-
-fn ssrf_denied(host: &str) -> Error {
-    Error::PermissionDenied(format!(
-        "Refusing to request private/internal address ({host}). \
-         Set {SSRF_ALLOW_ENV}=1 to override."
-    ))
-}
-
-/// Pre-flight SSRF check for the initial URL (async DNS resolution).
-async fn ensure_url_allowed(url: &str) -> Result<()> {
-    if private_network_allowed() {
-        return Ok(());
-    }
-    let parsed =
-        reqwest::Url::parse(url).map_err(|e| Error::Validation(format!("Invalid URL: {}", e)))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| Error::Validation("URL has no host".to_string()))?;
-
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return if is_blocked_ip(&ip) {
-            Err(ssrf_denied(host))
-        } else {
-            Ok(())
-        };
-    }
-
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| Error::Tool(format!("DNS resolution failed for {}: {}", host, e)))?;
-    let mut any = false;
-    for addr in addrs {
-        any = true;
-        if is_blocked_ip(&addr.ip()) {
-            return Err(ssrf_denied(host));
-        }
-    }
-    if !any {
-        return Err(Error::Tool(format!(
-            "DNS resolution returned no addresses for {}",
-            host
-        )));
-    }
-    Ok(())
-}
 
 fn parse_string_map(input: &str) -> Option<serde_json::Map<String, Value>> {
     let trimmed = input.trim();
@@ -332,27 +238,8 @@ impl Tool for HttpRequestTool {
         ensure_url_allowed(url).await?;
 
         // Build client
-        let redirect_policy = if follow_redirects {
-            let allow_private = private_network_allowed();
-            reqwest::redirect::Policy::custom(move |attempt| {
-                if attempt.previous().len() >= 10 {
-                    return attempt.error("too many redirects");
-                }
-                if !allow_private {
-                    if let Some(host) = attempt.url().host_str() {
-                        if host_is_blocked(host) {
-                            return attempt.error("redirect to private/internal address blocked");
-                        }
-                    }
-                }
-                attempt.follow()
-            })
-        } else {
-            reqwest::redirect::Policy::none()
-        };
-
         let client = Client::builder()
-            .redirect(redirect_policy)
+            .redirect(redirect_policy(follow_redirects))
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .map_err(|e| Error::Tool(format!("Failed to create HTTP client: {}", e)))?;

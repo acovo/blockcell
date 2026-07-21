@@ -28,6 +28,19 @@ fn base64_upload_within_decoded_limit(content: &str, limit: usize) -> bool {
     decoded_upper_bound.saturating_sub(padding) <= limit
 }
 
+fn resolve_workspace_upload_target(
+    workspace: &std::path::Path,
+    relative: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let resolved_workspace = blockcell_core::path_policy::resolve_for_policy(workspace);
+    let resolved_target =
+        blockcell_core::path_policy::resolve_for_policy(&workspace.join(relative));
+    if !resolved_target.starts_with(&resolved_workspace) {
+        return Err("Access denied: upload path escapes workspace".to_string());
+    }
+    Ok(resolved_target)
+}
+
 async fn reject_if_file_too_large(path: &std::path::Path, limit: u64) -> Option<Response> {
     match tokio::fs::metadata(path).await {
         Ok(meta) if !file_size_within_limit(meta.len(), limit) => Some(
@@ -551,7 +564,16 @@ pub(super) async fn handle_files_upload(
     }
 
     let workspace = state.paths.for_agent(&agent_id).workspace();
-    let target = workspace.join(&rel);
+    let target = match resolve_workspace_upload_target(&workspace, &rel) {
+        Ok(target) => target,
+        Err(error) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
     let path_echo = rel.to_string_lossy().to_string();
     let content = content.to_string();
     let encoding = encoding.to_string();
@@ -596,6 +618,34 @@ pub(super) async fn handle_files_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_upload_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "blockcell-gateway-upload-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let real = workspace.join("real");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        std::fs::create_dir_all(&real).expect("create real dir");
+        symlink(&outside, workspace.join("link")).expect("create symlink");
+
+        let escaped =
+            resolve_workspace_upload_target(&workspace, std::path::Path::new("link/new.txt"));
+        assert!(escaped.is_err(), "symlink escape must be rejected");
+
+        let allowed =
+            resolve_workspace_upload_target(&workspace, std::path::Path::new("real/new.txt"))
+                .expect("real workspace target should be allowed");
+        assert!(allowed.starts_with(std::fs::canonicalize(&workspace).unwrap()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn file_size_limit_rejects_values_above_limit() {

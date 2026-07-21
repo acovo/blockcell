@@ -73,6 +73,23 @@ impl SyncTracker {
     }
 }
 
+#[derive(Debug, Default)]
+struct GhostConfigReloadTracker {
+    last_mtime: Option<std::time::SystemTime>,
+    loaded_once: bool,
+}
+
+impl GhostConfigReloadTracker {
+    fn should_reload(&self, current_mtime: Option<std::time::SystemTime>) -> bool {
+        !self.loaded_once || current_mtime != self.last_mtime
+    }
+
+    fn record_success(&mut self, current_mtime: Option<std::time::SystemTime>) {
+        self.loaded_once = true;
+        self.last_mtime = current_mtime;
+    }
+}
+
 pub struct GhostMaintenanceService {
     config: GhostMaintenanceServiceConfig,
     #[allow(dead_code)]
@@ -246,8 +263,7 @@ impl GhostMaintenanceService {
         let config_mtime = |path: &std::path::Path| -> Option<std::time::SystemTime> {
             std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
         };
-        let mut last_config_mtime: Option<std::time::SystemTime> = None;
-        let mut loaded_once = false;
+        let mut reload_tracker = GhostConfigReloadTracker::default();
 
         let mut consecutive_failures = 0u32;
         const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -257,57 +273,57 @@ impl GhostMaintenanceService {
                 _ = check_interval.tick() => {
                     // Hot-reload config（按 mtime 短路，避免每分钟重复读+解析）
                     let current_mtime = config_mtime(&config_file);
-                    let config_changed = match (current_mtime, last_config_mtime) {
-                        (Some(current), Some(last)) => current != last,
-                        (Some(_), None) => true,
-                        (None, _) => false,
-                    };
-                    if !loaded_once || config_changed {
-                    if let Ok(new_config) = Config::load_or_default(&config_paths) {
-                        let new_ghost = GhostMaintenanceServiceConfig::from_config(&new_config);
+                    if reload_tracker.should_reload(current_mtime) {
+                        match Config::load_or_default(&config_paths) {
+                            Ok(new_config) => {
+                                let new_ghost = GhostMaintenanceServiceConfig::from_config(&new_config);
 
-                        // Check if relevant fields changed
-                        let schedule_changed = new_ghost.schedule != self.config.schedule;
-                        let changed = new_ghost.enabled != self.config.enabled ||
-                                     schedule_changed ||
-                                     new_ghost.model != self.config.model ||
-                                     new_ghost.max_syncs_per_day != self.config.max_syncs_per_day ||
-                                     new_ghost.auto_social != self.config.auto_social;
+                                // Check if relevant fields changed
+                                let schedule_changed = new_ghost.schedule != self.config.schedule;
+                                let changed = new_ghost.enabled != self.config.enabled ||
+                                             schedule_changed ||
+                                             new_ghost.model != self.config.model ||
+                                             new_ghost.max_syncs_per_day != self.config.max_syncs_per_day ||
+                                             new_ghost.auto_social != self.config.auto_social;
 
-                        if changed {
-                            info!("👻 Ghost config updated via hot-reload");
-                            self.config = new_ghost;
+                                if changed {
+                                    info!("👻 Ghost config updated via hot-reload");
+                                    self.config = new_ghost;
 
-                            // Re-parse schedule if changed
-                            if schedule_changed {
-                                schedule = match Self::parse_cron_schedule(&self.config.schedule) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        let normalized = Self::normalize_cron_schedule(&self.config.schedule);
-                                        error!(
-                                            error = %e,
-                                            schedule = %self.config.schedule,
-                                            normalized_schedule = %normalized,
-                                            "Ghost: invalid cron schedule, falling back to every 4 hours"
-                                        );
-                                        "0 0 */4 * * *".parse::<cron::Schedule>().unwrap()
+                                    // Re-parse schedule if changed
+                                    if schedule_changed {
+                                        schedule = match Self::parse_cron_schedule(&self.config.schedule) {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                let normalized = Self::normalize_cron_schedule(&self.config.schedule);
+                                                error!(
+                                                    error = %e,
+                                                    schedule = %self.config.schedule,
+                                                    normalized_schedule = %normalized,
+                                                    "Ghost: invalid cron schedule, falling back to every 4 hours"
+                                                );
+                                                "0 0 */4 * * *".parse::<cron::Schedule>().unwrap()
+                                            }
+                                        };
+                                        // 修复：schedule 变更后重置 next_scheduled，
+                                        // 避免旧的 last_run 去重逻辑阻止新 schedule 的首次执行。
+                                        next_scheduled = schedule.upcoming(Utc).next();
                                     }
-                                };
-                                // 修复：schedule 变更后重置 next_scheduled，
-                                // 避免旧的 last_run 去重逻辑阻止新 schedule 的首次执行。
-                                next_scheduled = schedule.upcoming(Utc).next();
-                            }
 
-                            if !self.config.enabled {
-                                info!("👻 GhostMaintenanceService disabled via config");
-                            } else {
-                                info!("👻 GhostMaintenanceService enabled/updated via config: {}", self.config.schedule);
+                                    if !self.config.enabled {
+                                        info!("👻 GhostMaintenanceService disabled via config");
+                                    } else {
+                                        info!("👻 GhostMaintenanceService enabled/updated via config: {}", self.config.schedule);
+                                    }
+                                }
+
+                                // load_or_default may write defaults and change the mtime.
+                                reload_tracker.record_success(config_mtime(&config_file));
+                            }
+                            Err(error) => {
+                                warn!(error = %error, "Ghost config reload failed; will retry on next tick");
                             }
                         }
-                    }
-                        loaded_once = true;
-                        // 重新读取 mtime：load_or_default 可能写入了默认字段。
-                        last_config_mtime = config_mtime(&config_file);
                     }
 
                     if !self.config.enabled {
@@ -349,6 +365,40 @@ impl GhostMaintenanceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ghost_config_reload_detects_deleted_file() {
+        let previous = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let tracker = GhostConfigReloadTracker {
+            last_mtime: Some(previous),
+            loaded_once: true,
+        };
+
+        assert!(tracker.should_reload(None));
+    }
+
+    #[test]
+    fn ghost_config_reload_failure_remains_retryable() {
+        let current = std::time::UNIX_EPOCH + std::time::Duration::from_secs(20);
+        let tracker = GhostConfigReloadTracker::default();
+
+        assert!(tracker.should_reload(Some(current)));
+        assert!(tracker.should_reload(Some(current)));
+        assert!(!tracker.loaded_once);
+        assert_eq!(tracker.last_mtime, None);
+    }
+
+    #[test]
+    fn ghost_config_reload_success_records_latest_mtime() {
+        let current = std::time::UNIX_EPOCH + std::time::Duration::from_secs(30);
+        let mut tracker = GhostConfigReloadTracker::default();
+
+        tracker.record_success(Some(current));
+
+        assert!(tracker.loaded_once);
+        assert_eq!(tracker.last_mtime, Some(current));
+        assert!(!tracker.should_reload(Some(current)));
+    }
 
     #[test]
     fn test_sync_tracker() {
