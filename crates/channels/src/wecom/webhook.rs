@@ -1,5 +1,35 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WecomVerificationDiagnostics {
+    timestamp_present: bool,
+    nonce_len: usize,
+    signature_present: bool,
+    encrypted_payload_len: usize,
+    token_configured: bool,
+    aes_key_configured: bool,
+}
+
+impl WecomVerificationDiagnostics {
+    fn new(
+        callback_token: &str,
+        encoding_aes_key: &str,
+        timestamp: &str,
+        nonce: &str,
+        signature: &str,
+        encrypted_payload: &str,
+    ) -> Self {
+        Self {
+            timestamp_present: !timestamp.is_empty(),
+            nonce_len: nonce.len(),
+            signature_present: !signature.is_empty(),
+            encrypted_payload_len: encrypted_payload.len(),
+            token_configured: !callback_token.is_empty(),
+            aes_key_configured: !encoding_aes_key.is_empty(),
+        }
+    }
+}
+
 pub(crate) fn build_mixed_summary(mixed: &LongConnMixed) -> String {
     let parts: Vec<String> = mixed
         .items
@@ -338,21 +368,25 @@ pub async fn process_webhook(
         let echostr_enc_owned = percent_decode(echostr_raw);
         let echostr_enc = echostr_enc_owned.as_str();
 
-        // ── 原始数据诊断日志（INFO级别，方便复制调试）──────────────────────
+        let diagnostics = WecomVerificationDiagnostics::new(
+            &wecom_cfg.callback_token,
+            &wecom_cfg.encoding_aes_key,
+            timestamp,
+            nonce,
+            msg_signature,
+            echostr_enc,
+        );
         tracing::info!(
-            token        = %wecom_cfg.callback_token,
-            timestamp    = %timestamp,
-            nonce        = %nonce,
-            msg_signature= %msg_signature,
-            echostr      = %echostr_enc,
-            echostr_len  = echostr_enc.len(),
-            encoding_aes_key = %wecom_cfg.encoding_aes_key,
-            encoding_aes_key_len = wecom_cfg.encoding_aes_key.len(),
-            "WeCom GET 原始参数"
+            timestamp_present = diagnostics.timestamp_present,
+            nonce_len = diagnostics.nonce_len,
+            signature_present = diagnostics.signature_present,
+            encrypted_payload_len = diagnostics.encrypted_payload_len,
+            token_configured = diagnostics.token_configured,
+            aes_key_configured = diagnostics.aes_key_configured,
+            "WeCom GET verification parameters received"
         );
 
         if !wecom_cfg.callback_token.is_empty() {
-            // 计算签名并打印，方便对比
             let mut parts = [
                 wecom_cfg.callback_token.as_str(),
                 timestamp,
@@ -362,20 +396,10 @@ pub async fn process_webhook(
             parts.sort_unstable();
             let combined = parts.join("");
             let computed = sha1_hex(combined.as_bytes());
-            tracing::info!(
-                computed_signature = %computed,
-                expected_signature = %msg_signature,
-                sort_input         = %combined,
-                "WeCom GET 签名计算"
-            );
 
             // 4-param signature: sort(token, timestamp, nonce, msg_encrypt)
             if computed != msg_signature {
-                tracing::warn!(
-                    computed  = %computed,
-                    expected  = %msg_signature,
-                    "WeCom webhook: GET 签名不匹配"
-                );
+                tracing::warn!("WeCom webhook: GET signature verification failed");
                 return (403, "Forbidden: invalid signature".to_string());
             }
         }
@@ -658,4 +682,34 @@ pub async fn process_webhook(
     }
 
     (200, "success".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wecom_verification_diagnostics_redact_secrets() {
+        let diagnostics = WecomVerificationDiagnostics::new(
+            "callback-secret",
+            "aes-secret",
+            "1700000000",
+            "nonce-secret",
+            "signature-secret",
+            "encrypted-secret",
+        );
+        let rendered = format!("{diagnostics:?}");
+
+        for secret in [
+            "callback-secret",
+            "aes-secret",
+            "nonce-secret",
+            "signature-secret",
+            "encrypted-secret",
+        ] {
+            assert!(!rendered.contains(secret), "diagnostics leaked {secret}");
+        }
+        assert!(rendered.contains("token_configured: true"));
+        assert!(rendered.contains("aes_key_configured: true"));
+    }
 }

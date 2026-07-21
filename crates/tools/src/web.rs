@@ -348,6 +348,7 @@ impl Tool for WebFetchTool {
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let url = params["url"].as_str().unwrap();
+        crate::ssrf::ensure_url_allowed(url).await?;
         let extract_mode = params
             .get("extractMode")
             .and_then(|v| v.as_str())
@@ -390,7 +391,7 @@ async fn fetch_markdown(
     let is_challenge =
         html_looks_like_challenge(&content) || (content.trim().len() < 500 && meta.status == 200);
 
-    if is_challenge {
+    if is_challenge && crate::ssrf::private_network_allowed() {
         if let Some(ws) = workspace {
             tracing::debug!(url, "web_fetch: JS challenge detected, trying CDP fallback");
             match fetch_via_cdp(url, max_chars, ws).await {
@@ -398,6 +399,11 @@ async fn fetch_markdown(
                 Err(e) => tracing::warn!(error = %e, url, "CDP fetch fallback failed"),
             }
         }
+    } else if is_challenge {
+        tracing::debug!(
+            url,
+            "web_fetch: skipping CDP fallback while private-network SSRF protection is enabled"
+        );
     }
 
     let truncated = content.len() >= max_chars;
@@ -522,7 +528,7 @@ async fn fetch_via_cdp(url: &str, max_chars: usize, workspace: &std::path::Path)
 /// Fetch and extract plain text (strip all formatting).
 async fn fetch_text(url: &str, max_chars: usize) -> Result<Value> {
     let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(crate::ssrf::redirect_policy(true))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| Error::Tool(format!("Failed to create HTTP client: {}", e)))?;
@@ -581,7 +587,7 @@ async fn fetch_text(url: &str, max_chars: usize) -> Result<Value> {
 /// Fetch raw response body without conversion.
 async fn fetch_raw(url: &str, max_chars: usize) -> Result<Value> {
     let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(crate::ssrf::redirect_policy(true))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| Error::Tool(format!("Failed to create HTTP client: {}", e)))?;
@@ -671,6 +677,23 @@ fn extract_text_from_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn web_fetch_ssrf_guard_rejects_private_targets() {
+        for url in [
+            "http://127.0.0.1:18790/v1/config",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+        ] {
+            let error = crate::ssrf::ensure_url_allowed(url)
+                .await
+                .expect_err("private target must be rejected");
+            assert!(
+                error.to_string().contains("private/internal"),
+                "unexpected error for {url}: {error}"
+            );
+        }
+    }
     use serde_json::json;
 
     #[test]

@@ -209,6 +209,7 @@ impl ProviderPool {
                         idx, model = %model, provider = %provider_name,
                         weight, priority, "ProviderPool: entry loaded"
                     );
+                    let built_idx = entries.len();
                     entries.push(BuiltEntry {
                         model,
                         provider_name,
@@ -216,7 +217,7 @@ impl ProviderPool {
                         priority,
                         provider: Arc::from(p),
                     });
-                    health_map.insert(idx, EntryHealth::Healthy);
+                    health_map.insert(built_idx, EntryHealth::Healthy);
                 }
                 Err(e) => {
                     warn!(idx, model = %model, error = %e, "ProviderPool: failed to build entry, skipping");
@@ -720,6 +721,39 @@ mod tests {
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].model, "ollama/qwen3.6");
         assert_eq!(status[0].weight, 2);
+    }
+
+    #[test]
+    fn pool_skips_invalid_entry_without_health_index_gap() {
+        let mut config = Config::default();
+        config.agents.defaults.model_pool = vec![
+            blockcell_core::config::ModelEntry {
+                model: "missing/model".to_string(),
+                provider: "provider-that-does-not-exist".to_string(),
+                weight: 1,
+                priority: 1,
+                input_price: None,
+                output_price: None,
+                temperature: None,
+                tool_call_mode: blockcell_core::config::ToolCallMode::Native,
+            },
+            blockcell_core::config::ModelEntry {
+                model: "ollama/qwen3.6".to_string(),
+                provider: "ollama".to_string(),
+                weight: 1,
+                priority: 2,
+                input_price: None,
+                output_price: None,
+                temperature: None,
+                tool_call_mode: blockcell_core::config::ToolCallMode::Native,
+            },
+        ];
+
+        let pool = ProviderPool::from_config(&config).expect("valid second entry should build");
+        let status = pool.status_summary();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].health, "healthy");
+        assert_eq!(pool.acquire().map(|(idx, _)| idx), Some(0));
     }
 
     #[test]

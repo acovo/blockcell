@@ -3,8 +3,90 @@ use blockcell_core::{session_file_stem, session_id_from_file_stem, Paths, Result
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
+
+static SESSION_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn session_temp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session.jsonl");
+    let counter = SESSION_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        counter
+    ))
+}
+
+#[cfg(windows)]
+fn replace_session_file(
+    temp_path: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temp_wide: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replaced = unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_session_file(
+    temp_path: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(temp_path, path)
+}
+
+fn write_session_bytes_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp_path = session_temp_path(path);
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        let file = options.open(&temp_path)?;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            std::fs::set_permissions(&temp_path, metadata.permissions())?;
+        }
+
+        let mut writer = BufWriter::new(file);
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+
+        replace_session_file(&temp_path, path)?;
+
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "_type")]
@@ -216,19 +298,19 @@ impl SessionStore {
         messages: &[ChatMessage],
         metadata: &Value,
     ) -> Result<()> {
-        let mut file = File::create(path)?;
-
         let metadata_line = SessionLine::Metadata {
             created_at: created_at.to_string(),
             updated_at: updated_at.to_string(),
             metadata: metadata.clone(),
         };
-        writeln!(file, "{}", serde_json::to_string(&metadata_line)?)?;
+        let mut content = Vec::new();
+        writeln!(content, "{}", serde_json::to_string(&metadata_line)?)?;
 
         for msg in messages {
-            writeln!(file, "{}", serde_json::to_string(msg)?)?;
+            writeln!(content, "{}", serde_json::to_string(msg)?)?;
         }
 
+        write_session_bytes_atomically(path, &content)?;
         Ok(())
     }
 
@@ -405,5 +487,41 @@ mod tests {
             .load_metadata(session_key)
             .expect("load metadata after save");
         assert_eq!(loaded["skill_state"]["last_skill"], "deep_analysis");
+    }
+
+    #[test]
+    fn session_atomic_replacement_writes_complete_file_without_temp_residue() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, "old").expect("write old session");
+
+        write_session_bytes_atomically(&path, b"metadata\nmessage\n")
+            .expect("atomic replacement should succeed");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"metadata\nmessage\n");
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, vec!["session.jsonl"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_atomic_replacement_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, "old").expect("write old session");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("set restrictive permissions");
+
+        write_session_bytes_atomically(&path, b"new").expect("atomic replacement should succeed");
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

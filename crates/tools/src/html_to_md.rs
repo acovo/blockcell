@@ -55,8 +55,9 @@ impl MarkdownMeta {
 /// 3. If response is `text/html` → convert locally via `htmd`
 /// 4. Otherwise → return raw text
 pub async fn fetch_as_markdown(url: &str, max_chars: usize) -> Result<(String, MarkdownMeta)> {
+    crate::ssrf::ensure_url_allowed(url).await?;
     let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(crate::ssrf::redirect_policy(true))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| Error::Tool(format!("Failed to create HTTP client: {}", e)))?;
