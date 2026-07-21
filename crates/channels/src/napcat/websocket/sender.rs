@@ -166,6 +166,13 @@ pub async fn call_api_via_ws(request: ApiRequest) -> Result<ApiResponse, String>
 /// 4. Combines all chunks in order
 /// 5. Returns the complete file data
 pub async fn call_stream_api_via_ws(request: ApiRequest) -> Result<Vec<u8>, String> {
+    call_stream_api_via_ws_limited(request, usize::MAX).await
+}
+
+pub async fn call_stream_api_via_ws_limited(
+    request: ApiRequest,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     let caller = STREAM_CALLER
         .get()
         .cloned()
@@ -238,6 +245,18 @@ pub async fn call_stream_api_via_ws(request: ApiRequest) -> Result<Vec<u8>, Stri
                         // Decode chunk data
                         let decoded = chunk_data.decode_data()
                             .map_err(|e| format!("Failed to decode chunk {}: {}", chunk_data.chunk_index, e))?;
+
+                        let existing_size = chunks
+                            .get(&chunk_data.chunk_index)
+                            .map(Vec::len)
+                            .unwrap_or(0);
+                        let current_size: usize = chunks.values().map(Vec::len).sum();
+                        if current_size - existing_size + decoded.len() > max_bytes {
+                            return Err(format!(
+                                "Stream download exceeds size limit of {} bytes",
+                                max_bytes
+                            ));
+                        }
 
                         tracing::debug!(
                             stream_id = %chunk_data.stream_id,
