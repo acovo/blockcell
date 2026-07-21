@@ -126,6 +126,28 @@ fn test_completed_forked_agent_result_is_consolidation_success() {
 }
 
 #[tokio::test]
+async fn test_dream_release_does_not_delete_replaced_lock() {
+    let root = temp_test_dir("dream-lock-owner");
+    let consolidator = DreamConsolidator::new(&root).await.unwrap();
+    consolidator
+        .acquire_lock()
+        .await
+        .expect("acquire dream lock");
+    let lock_path = root.join(LOCK_FILE_NAME);
+    tokio::fs::write(&lock_path, format!("{}:{}", std::process::id(), u64::MAX))
+        .await
+        .expect("replace lock ownership");
+
+    consolidator.release_lock().await.expect("release old lock");
+
+    assert!(
+        lock_path.exists(),
+        "an old owner must not delete a replacement lock"
+    );
+    let _ = tokio::fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
 async fn test_dream_staging_commit_applies_updates_atomically() {
     let root = temp_test_dir("dream-staging-commit");
     let real = root.join("memory");

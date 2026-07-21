@@ -9,6 +9,7 @@ impl DreamConsolidator {
             state,
             gate_config: ConsolidatorConfig::default(),
             provider_pool: None,
+            dream_lock: std::sync::Mutex::new(None),
         })
     }
 
