@@ -158,6 +158,11 @@ impl AtomicSwitcher {
         Ok(self.current_binary.clone())
     }
 
+    #[doc(hidden)]
+    pub fn current_binary_path(&self) -> &Path {
+        &self.current_binary
+    }
+
     fn get_current_version(&self) -> Result<String> {
         Ok(env!("CARGO_PKG_VERSION").to_string())
     }
@@ -231,23 +236,86 @@ struct UpdateLock {
 
 impl UpdateLock {
     fn acquire(path: PathBuf) -> Result<Self> {
+        match Self::create(&path) {
+            Ok(()) => return Ok(Self { path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        if !lock_owner_is_stale(&path)? {
+            return Err(Error::Other(
+                "Another update or rollback is already running".to_string(),
+            ));
+        }
+
+        std::fs::remove_file(&path)?;
+        Self::create(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::Other("Another update or rollback is already running".to_string())
+            } else {
+                error.into()
+            }
+        })?;
+        Ok(Self { path })
+    }
+
+    fn create(path: &Path) -> std::io::Result<()> {
         use std::io::Write;
 
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&path)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    Error::Other("Another update or rollback is already running".to_string())
-                } else {
-                    error.into()
-                }
-            })?;
+            .open(path)?;
         writeln!(file, "{}", std::process::id())?;
         file.sync_all()?;
-        Ok(Self { path })
+        Ok(())
     }
+}
+
+fn lock_owner_is_stale(path: &Path) -> Result<bool> {
+    let contents = std::fs::read_to_string(path)?;
+    let pid = match contents.trim().parse::<u32>() {
+        Ok(pid) if pid > 0 => pid,
+        _ => return Ok(false),
+    };
+    Ok(!process_is_alive(pid))
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    if pid > libc::pid_t::MAX as u32 {
+        return false;
+    }
+    // SAFETY: signal 0 does not deliver a signal; it only checks whether the PID exists
+    // and whether the caller may signal it.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: the handle is checked for null, queried without mutation, and always closed.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0;
+        let alive =
+            GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE as u32;
+        CloseHandle(handle);
+        alive
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 impl Drop for UpdateLock {
@@ -457,5 +525,22 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.parent(), target.parent());
         assert_eq!(second.parent(), target.parent());
+    }
+
+    #[test]
+    fn stale_update_lock_is_recovered_but_live_lock_is_preserved() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("update.lock");
+        std::fs::write(&path, format!("{}\n", u32::MAX)).unwrap();
+
+        let recovered = UpdateLock::acquire(path.clone()).unwrap();
+        drop(recovered);
+
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        let error = match UpdateLock::acquire(path) {
+            Ok(_) => panic!("live update lock must not be replaced"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already running"), "{error}");
     }
 }

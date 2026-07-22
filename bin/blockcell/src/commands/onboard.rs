@@ -216,7 +216,7 @@ const EXAMPLE_CONFIG: &str = r#"{
     "enabled": true,
     "channel": "stable",
     "manifestUrl": "https://github.com/blockcell-labs/blockcell/releases/latest/download/manifest.json",
-    "requireSignature": true,
+    "requireSignature": false,
     "maintenanceWindow": ""
   }
 }
@@ -405,6 +405,7 @@ pub async fn run(
 }
 
 fn ensure_auto_upgrade_defaults(json: &mut serde_json::Value) {
+    let defaults = blockcell_core::config::AutoUpgradeConfig::default();
     if json.get("autoUpgrade").is_none() || json["autoUpgrade"].is_null() {
         json["autoUpgrade"] = serde_json::json!({});
     }
@@ -426,7 +427,10 @@ fn ensure_auto_upgrade_defaults(json: &mut serde_json::Value) {
         );
     }
     if json["autoUpgrade"].get("requireSignature").is_none() {
-        json["autoUpgrade"]["requireSignature"] = serde_json::json!(true);
+        json["autoUpgrade"]["requireSignature"] = serde_json::json!(defaults.require_signature);
+    }
+    if json["autoUpgrade"].get("publicKey").is_none() {
+        json["autoUpgrade"]["publicKey"] = serde_json::json!(defaults.public_key);
     }
     if json["autoUpgrade"].get("maintenanceWindow").is_none() {
         json["autoUpgrade"]["maintenanceWindow"] = serde_json::json!("");
@@ -438,19 +442,33 @@ mod auto_upgrade_tests {
     use super::*;
 
     #[test]
-    fn example_config_requires_update_signatures() {
+    fn example_config_does_not_require_an_unconfigured_signature_key() {
         let config = parse_json5_value(EXAMPLE_CONFIG).expect("example config should parse");
 
-        assert_eq!(config["autoUpgrade"]["requireSignature"], true);
+        assert_eq!(config["autoUpgrade"]["requireSignature"], false);
     }
 
     #[test]
-    fn migration_enables_update_signatures_when_missing() {
+    fn migration_uses_the_runtime_signature_default_when_missing() {
         let mut config = serde_json::json!({});
 
         ensure_auto_upgrade_defaults(&mut config);
 
-        assert_eq!(config["autoUpgrade"]["requireSignature"], true);
+        assert_eq!(
+            config["autoUpgrade"]["requireSignature"],
+            blockcell_core::config::AutoUpgradeConfig::default().require_signature
+        );
+    }
+
+    #[test]
+    fn migration_does_not_require_a_signature_without_a_trusted_key() {
+        let mut config = serde_json::json!({});
+
+        ensure_auto_upgrade_defaults(&mut config);
+
+        if config["autoUpgrade"]["publicKey"].is_null() {
+            assert_eq!(config["autoUpgrade"]["requireSignature"], false);
+        }
     }
 }
 

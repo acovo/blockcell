@@ -609,6 +609,9 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         let _ = config.save(&paths.config_file());
     }
 
+    let _auto_upgrade_handle =
+        super::upgrade::spawn_auto_upgrade_if_enabled(config.clone(), paths.clone());
+
     // Auto-generate and persist node_alias if not set (short 8-char hex, e.g. "54c6be7b").
     // This becomes the stable display name for this node in the community hub.
     if config.community_hub.node_alias.is_none() {

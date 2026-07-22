@@ -1,5 +1,25 @@
 use blockcell_core::{Config, Paths};
 use blockcell_updater::UpdateManager;
+use std::time::Duration;
+
+const AUTO_UPGRADE_START_DELAY: Duration = Duration::from_secs(30);
+
+pub fn spawn_auto_upgrade_if_enabled(
+    config: Config,
+    paths: Paths,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.auto_upgrade.enabled {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(AUTO_UPGRADE_START_DELAY).await;
+        let manager = UpdateManager::new(config, paths);
+        if let Err(error) = manager.update_flow().await {
+            tracing::warn!(error = %error, "Automatic update failed");
+        }
+    }))
+}
 
 pub async fn check() -> anyhow::Result<()> {
     let paths = Paths::new();
@@ -116,4 +136,26 @@ pub async fn status() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn auto_upgrade_task_respects_enabled_setting() {
+        let paths = Paths::with_base(std::env::temp_dir().join(format!(
+            "blockcell-auto-upgrade-test-{}",
+            std::process::id()
+        )));
+        let mut config = Config::default();
+
+        config.auto_upgrade.enabled = false;
+        assert!(spawn_auto_upgrade_if_enabled(config.clone(), paths.clone()).is_none());
+
+        config.auto_upgrade.enabled = true;
+        let handle = spawn_auto_upgrade_if_enabled(config, paths)
+            .expect("enabled auto-upgrade should start a task");
+        handle.abort();
+    }
 }

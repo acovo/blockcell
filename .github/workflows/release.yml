@@ -31,6 +31,7 @@ jobs:
             arch: arm64
             binary: blockcell
             archive_ext: tar.gz
+            updater_ext: .updater
             deployment_target: "11.0"
 
           # macOS Intel (x86_64) — native Intel runner
@@ -40,6 +41,7 @@ jobs:
             arch: amd64
             binary: blockcell
             archive_ext: tar.gz
+            updater_ext: .updater
             deployment_target: "10.15"
 
           # Linux x86_64 (musl — fully static, no glibc dependency)
@@ -49,6 +51,7 @@ jobs:
             arch: amd64
             binary: blockcell
             archive_ext: tar.gz
+            updater_ext: .updater
 
           # Windows x86_64
           - os: windows-2022
@@ -57,6 +60,7 @@ jobs:
             arch: amd64
             binary: blockcell.exe
             archive_ext: zip
+            updater_ext: .exe
 
     runs-on: ${{ matrix.os }}
 
@@ -114,6 +118,9 @@ jobs:
           # Ensure C build scripts (lz4-sys, blake3, etc.) target the same macOS
           # version as the Rust linker; avoids "built for newer macOS" linker errors
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target || '' }}
+          # Optional repository variable containing the trusted 32-byte Ed25519 public key.
+          # When present it is embedded into AutoUpgradeConfig at compile time.
+          BLOCKCELL_UPDATER_PUBLIC_KEY: ${{ vars.BLOCKCELL_UPDATER_PUBLIC_KEY }}
         run: |
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
             export OPENSSL_VENDORED=1
@@ -176,11 +183,22 @@ jobs:
           Compress-Archive -Path "dist\$PKG\*" -DestinationPath "dist\${PKG}.zip"
           echo "ASSET=${PKG}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # The updater installs a single executable. Keep the archives for people who download
+      # releases manually, and publish a separate raw binary for manifest consumers.
+      - name: Prepare raw updater binary
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          UPDATER="blockcell-${{ steps.ver.outputs.version }}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.updater_ext }}"
+          cp "$BIN" "dist/$UPDATER"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: blockcell-${{ matrix.platform }}-${{ matrix.arch }}
-          path: dist/blockcell-*.${{ matrix.archive_ext }}
+          path: |
+            dist/blockcell-*.${{ matrix.archive_ext }}
+            dist/blockcell-*${{ matrix.updater_ext }}
           if-no-files-found: error
 
   release:
@@ -234,17 +252,30 @@ jobs:
         shell: bash
         run: |
           cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) | sort | while read f; do
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.updater" -o -name "*.exe" \) | sort | while read f; do
             sha256sum "$f"
           done > ../checksums.txt
           cat ../checksums.txt
 
       - name: Generate updater manifest.json
         shell: bash
+        env:
+          UPDATER_PRIVATE_KEY: ${{ secrets.BLOCKCELL_UPDATER_PRIVATE_KEY }}
+          UPDATER_PUBLIC_KEY: ${{ vars.BLOCKCELL_UPDATER_PUBLIC_KEY }}
         run: |
           TAG="${{ steps.reltag.outputs.tag }}"
           PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           REPO="${{ github.repository }}"
+
+          if { [[ -n "$UPDATER_PRIVATE_KEY" ]] && [[ -z "$UPDATER_PUBLIC_KEY" ]]; } \
+            || { [[ -z "$UPDATER_PRIVATE_KEY" ]] && [[ -n "$UPDATER_PUBLIC_KEY" ]]; }; then
+            echo "BLOCKCELL_UPDATER_PRIVATE_KEY secret and BLOCKCELL_UPDATER_PUBLIC_KEY variable must be configured together" >&2
+            exit 1
+          fi
+          if [[ -n "$UPDATER_PRIVATE_KEY" ]]; then
+            printf '%s' "$UPDATER_PRIVATE_KEY" > updater-signing-key.pem
+            trap 'rm -f updater-signing-key.pem' EXIT
+          fi
 
           artifacts_json="[]"
 
@@ -253,25 +284,42 @@ jobs:
             path="$(echo "$line" | awk '{print $2}')"
             file="$(basename "$path")"
 
-            if [[ "$file" =~ ^blockcell-${TAG}-darwin-arm64\\.tar\\.gz$ ]]; then
+            if [[ "$file" =~ ^blockcell-${TAG}-darwin-arm64\\.updater$ ]]; then
               os="macos"; arch="aarch64"
-            elif [[ "$file" =~ ^blockcell-${TAG}-darwin-amd64\\.tar\\.gz$ ]]; then
+            elif [[ "$file" =~ ^blockcell-${TAG}-darwin-amd64\\.updater$ ]]; then
               os="macos"; arch="x86_64"
-            elif [[ "$file" =~ ^blockcell-${TAG}-linux-amd64\\.tar\\.gz$ ]]; then
+            elif [[ "$file" =~ ^blockcell-${TAG}-linux-amd64\\.updater$ ]]; then
               os="linux"; arch="x86_64"
-            elif [[ "$file" =~ ^blockcell-${TAG}-windows-amd64\\.zip$ ]]; then
+            elif [[ "$file" =~ ^blockcell-${TAG}-windows-amd64\\.exe$ ]]; then
               os="windows"; arch="x86_64"
             else
               continue
             fi
 
             url="https://github.com/${REPO}/releases/download/${TAG}/${file}"
+            sig=""
+            if [[ -n "$UPDATER_PRIVATE_KEY" ]]; then
+              payload=$(jq -nc \
+                --arg schema "blockcell-update-v1" \
+                --arg channel "stable" \
+                --arg version "$TAG" \
+                --arg os "$os" \
+                --arg arch "$arch" \
+                --arg url "$url" \
+                --arg sha256 "$sha" \
+                '{schema:$schema,channel:$channel,version:$version,os:$os,arch:$arch,url:$url,sha256:$sha256}')
+              sig=$(printf '%s' "$payload" \
+                | openssl pkeyutl -sign -rawin -inkey updater-signing-key.pem \
+                | base64 -w0)
+            fi
             artifacts_json=$(echo "$artifacts_json" | jq -c \
               --arg os "$os" \
               --arg arch "$arch" \
               --arg url "$url" \
               --arg sha256 "$sha" \
-              '. + [{os:$os, arch:$arch, url:$url, sha256:$sha256}]')
+              --arg sig "$sig" \
+              '. + [({os:$os, arch:$arch, url:$url, sha256:$sha256}
+                + if $sig == "" then {} else {sig:$sig} end)]')
           done < checksums.txt
 
           jq -n -c \
@@ -296,5 +344,7 @@ jobs:
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
+            artifacts/**/*.updater
+            artifacts/**/*.exe
             checksums.txt
             manifest.json

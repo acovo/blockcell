@@ -146,6 +146,23 @@ impl HealthChecker {
 
     /// 执行健康检查
     pub async fn check(&self, timeout_secs: u64) -> Result<HealthCheckResult> {
+        self.check_internal(timeout_secs, None).await
+    }
+
+    pub async fn check_expected_version(
+        &self,
+        timeout_secs: u64,
+        expected_version: &str,
+    ) -> Result<HealthCheckResult> {
+        self.check_internal(timeout_secs, Some(expected_version))
+            .await
+    }
+
+    async fn check_internal(
+        &self,
+        timeout_secs: u64,
+        expected_version: Option<&str>,
+    ) -> Result<HealthCheckResult> {
         info!(binary = %self.binary_path.display(), "Running healthcheck");
 
         // 1. 检查二进制是否可执行
@@ -163,7 +180,7 @@ impl HealthChecker {
         let mut checks = vec![];
 
         // 2. 运行 --version 检查
-        let version_check = self.check_version(timeout_secs).await;
+        let version_check = self.check_version(timeout_secs, expected_version).await;
         checks.push(version_check.clone());
 
         // 3. 运行 --self-check（如果支持）
@@ -182,10 +199,11 @@ impl HealthChecker {
         Ok(HealthCheckResult { passed, checks })
     }
 
-    async fn check_version(&self, timeout_secs: u64) -> Check {
+    async fn check_version(&self, timeout_secs: u64, expected_version: Option<&str>) -> Check {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             tokio::process::Command::new(&self.binary_path)
+                .kill_on_drop(true)
                 .arg("--version")
                 .output(),
         )
@@ -194,10 +212,25 @@ impl HealthChecker {
         match result {
             Ok(Ok(output)) if output.status.success() => {
                 let version = String::from_utf8_lossy(&output.stdout);
-                Check {
-                    name: "version".to_string(),
-                    passed: true,
-                    message: format!("Version: {}", version.trim()),
+                let matches = expected_version
+                    .map(|expected| version_output_matches(&version, expected))
+                    .unwrap_or(true);
+                if matches {
+                    Check {
+                        name: "version".to_string(),
+                        passed: true,
+                        message: format!("Version: {}", version.trim()),
+                    }
+                } else {
+                    Check {
+                        name: "version".to_string(),
+                        passed: false,
+                        message: format!(
+                            "Expected version {}, got {}",
+                            expected_version.unwrap_or_default(),
+                            version.trim()
+                        ),
+                    }
                 }
             }
             Ok(Ok(output)) => Check {
@@ -222,6 +255,7 @@ impl HealthChecker {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             tokio::process::Command::new(&self.binary_path)
+                .kill_on_drop(true)
                 .arg("--self-check")
                 .output(),
         )
@@ -299,6 +333,21 @@ impl HealthChecker {
     }
 }
 
+fn version_output_matches(output: &str, expected: &str) -> bool {
+    let expected = expected.trim_start_matches('v');
+    output.split_whitespace().any(|token| {
+        token
+            .trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric()
+                    && character != '.'
+                    && character != '-'
+                    && character != '+'
+            })
+            .trim_start_matches('v')
+            == expected
+    })
+}
+
 fn self_check_is_unsupported(output: &std::process::Output) -> bool {
     let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
     stderr.contains("--self-check")
@@ -365,9 +414,9 @@ mod tests {
     #[tokio::test]
     async fn self_check_timeout_is_a_failure() {
         let temp = executable_temp_dir();
-        let path = write_script(&temp, "#!/bin/sh\nsleep 3\n", true);
+        let path = write_script(&temp, "#!/bin/sh\nsleep 30\n", true);
 
-        let check = HealthChecker::new(path).check_self_test(1).await;
+        let check = HealthChecker::new(path).check_self_test(3).await;
 
         assert!(!check.passed);
         assert!(check.message.contains("Timeout"), "{}", check.message);
@@ -379,7 +428,7 @@ mod tests {
         let temp = executable_temp_dir();
         let path = write_script(&temp, "#!/bin/sh\nexit 0\n", false);
 
-        let check = HealthChecker::new(path).check_self_test(1).await;
+        let check = HealthChecker::new(path).check_self_test(5).await;
 
         assert!(!check.passed);
         assert!(
@@ -399,9 +448,53 @@ mod tests {
             true,
         );
 
-        let check = HealthChecker::new(path).check_self_test(1).await;
+        let check = HealthChecker::new(path).check_self_test(5).await;
 
         assert!(check.passed);
         assert!(check.message.contains("not supported"), "{}", check.message);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expected_version_must_appear_in_version_output() {
+        let temp = executable_temp_dir();
+        let path = write_script(
+            &temp,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'blockcell 1.0.0'; exit 0; fi\necho \"error: unexpected argument '$1' found\" >&2\nexit 2\n",
+            true,
+        );
+
+        let result = HealthChecker::new(path)
+            .check_expected_version(5, "2.0.0")
+            .await
+            .unwrap();
+
+        assert!(!result.passed);
+        assert!(result
+            .checks
+            .iter()
+            .any(|check| check.name == "version" && !check.passed));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_healthcheck_process_is_terminated() {
+        let temp = executable_temp_dir();
+        let pid_path = temp.path().join("pid");
+        let script = format!("#!/bin/sh\necho $$ > '{}'\nsleep 30\n", pid_path.display());
+        let path = write_script(&temp, &script, true);
+
+        let check = HealthChecker::new(path).check_self_test(3).await;
+        assert!(!check.passed);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let pid = std::fs::read_to_string(pid_path).unwrap();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!alive, "timed-out healthcheck process {pid} is still alive");
     }
 }

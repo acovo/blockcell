@@ -1,17 +1,18 @@
 use crate::atomic::{AtomicSwitcher, MaintenanceWindow};
 use crate::manifest::Manifest;
-use crate::verification::{HealthChecker, SignatureVerifier};
+use crate::verification::{HealthChecker, Sha256Verifier, SignatureVerifier};
 use blockcell_core::{Config, Error, Paths, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 
 const MAX_ARTIFACT_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_MANIFEST_SIZE: usize = 1024 * 1024;
 const STAGING_METADATA_FILE: &str = "current.json";
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -41,6 +42,13 @@ pub struct StagedUpdate {
 struct StagedUpdateMetadata {
     version: String,
     file_name: String,
+    channel: String,
+    os: String,
+    arch: String,
+    url: String,
+    sha256: String,
+    #[serde(default)]
+    sig: Option<String>,
 }
 
 impl UpdateManager {
@@ -55,7 +63,21 @@ impl UpdateManager {
         Self {
             config,
             paths,
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() >= 5 {
+                        return attempt.error("too many update redirects");
+                    }
+                    if redirect_target_is_allowed(attempt.previous(), attempt.url()) {
+                        attempt.follow()
+                    } else {
+                        attempt.stop()
+                    }
+                }))
+                .build()
+                .expect("static updater HTTP client configuration must be valid"),
             switcher,
         }
     }
@@ -67,6 +89,7 @@ impl UpdateManager {
         }
 
         debug!(url = %manifest_url, "Checking for updates");
+        validate_update_url(manifest_url)?;
 
         let response = self
             .client
@@ -82,9 +105,9 @@ impl UpdateManager {
             )));
         }
 
-        let manifest: Manifest = response
-            .json()
-            .await
+        validate_update_url(response.url().as_str())?;
+        let manifest_bytes = read_response_limited(response, MAX_MANIFEST_SIZE, "manifest").await?;
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| Error::Other(format!("Failed to parse manifest: {}", e)))?;
 
         // Check if channel matches
@@ -118,6 +141,7 @@ impl UpdateManager {
             .ok_or_else(|| Error::NotFound(format!("No artifact for {}/{}", os, arch)))?;
 
         info!(url = %artifact.url, "Downloading update");
+        validate_update_url(&artifact.url)?;
 
         let mut response = self
             .client
@@ -132,6 +156,7 @@ impl UpdateManager {
                 response.status()
             )));
         }
+        validate_update_url(response.url().as_str())?;
 
         if let Some(content_length) = response.content_length() {
             if content_length > MAX_ARTIFACT_SIZE {
@@ -188,8 +213,7 @@ impl UpdateManager {
             info!("SHA256 verification passed");
 
             if self.config.auto_upgrade.require_signature {
-                let bytes = tokio::fs::read(&temp_path).await?;
-                self.verify_signature(manifest, &bytes, artifact.sig.as_deref())?;
+                self.verify_signature(manifest, artifact)?;
             } else {
                 warn!(
                     "requireSignature is disabled: installing update verified by SHA256 only. \
@@ -210,6 +234,12 @@ impl UpdateManager {
             self.persist_staged_update(&StagedUpdateMetadata {
                 version: manifest.version.clone(),
                 file_name: version_file_name,
+                channel: manifest.channel.clone(),
+                os: artifact.os.clone(),
+                arch: artifact.arch.clone(),
+                url: artifact.url.clone(),
+                sha256: artifact.sha256.clone(),
+                sig: artifact.sig.clone(),
             })?;
 
             Ok(staging_path.clone())
@@ -301,6 +331,21 @@ impl UpdateManager {
         }
     }
 
+    fn load_staged_update_metadata(&self) -> Result<StagedUpdateMetadata> {
+        let metadata_path = self.staging_dir().join(STAGING_METADATA_FILE);
+        let metadata: StagedUpdateMetadata =
+            serde_json::from_slice(&std::fs::read(metadata_path)?)?;
+        let file_name = Path::new(&metadata.file_name);
+        if file_name.components().count() != 1
+            || !matches!(file_name.components().next(), Some(Component::Normal(_)))
+        {
+            return Err(Error::Validation(
+                "Invalid staged update file name".to_string(),
+            ));
+        }
+        Ok(metadata)
+    }
+
     pub async fn status(&self) -> Result<UpdateStatus> {
         let current_version = env!("CARGO_PKG_VERSION").to_string();
         let staged = self.staged_update()?;
@@ -323,6 +368,21 @@ impl UpdateManager {
     pub async fn apply(&self, staging_path: &std::path::Path, version: &str) -> Result<()> {
         info!(version = %version, "Applying update");
 
+        // 暂存文件可能在 download 与 apply 之间被破坏或替换；安装前必须重新建立
+        // 文件、元数据和发布签名之间的完整信任链。
+        let metadata = self.load_staged_update_metadata()?;
+        let expected_path = self.staging_dir().join(&metadata.file_name);
+        if staging_path != expected_path || version != metadata.version {
+            return Err(Error::Validation(
+                "Staged update does not match persisted verification metadata".to_string(),
+            ));
+        }
+        Sha256Verifier::verify_file(staging_path, &metadata.sha256)?;
+        if self.config.auto_upgrade.require_signature {
+            let manifest = metadata.as_manifest();
+            self.verify_signature(&manifest, &manifest.artifacts[0])?;
+        }
+
         // 1. 检查维护窗口
         let window = MaintenanceWindow::new(self.config.auto_upgrade.maintenance_window.clone());
         if !window.is_in_window() {
@@ -333,7 +393,7 @@ impl UpdateManager {
 
         // 2. 运行 Healthcheck（在切换前）
         let checker = HealthChecker::new(staging_path.to_path_buf());
-        let health_result = checker.check(30).await?;
+        let health_result = checker.check_expected_version(30, version).await?;
 
         if !health_result.passed {
             error!("Healthcheck failed before switch");
@@ -348,11 +408,20 @@ impl UpdateManager {
 
         // 3. 原子切换
         self.switcher.switch_to_new(staging_path, version).await?;
-        self.clear_staged_update_metadata()?;
 
-        // 4. 运行 Healthcheck（切换后）
-        // 注意：这里需要重启进程，所以实际上这个检查应该在重启后由外部进程执行
-        // 这里我们只是验证文件已正确替换
+        // 4. 对实际替换后的路径再次检查；若复制/权限/替换结果不可运行，立即恢复备份。
+        let post_switch = HealthChecker::new(self.switcher.current_binary_path().to_path_buf())
+            .check_expected_version(30, version)
+            .await?;
+        if !post_switch.passed {
+            error!("Healthcheck failed after switch; rolling back");
+            self.switcher.rollback(None).await?;
+            return Err(Error::Validation(
+                "Post-switch healthcheck failed; previous version restored".to_string(),
+            ));
+        }
+
+        self.clear_staged_update_metadata()?;
         info!("Update applied successfully. Restart required.");
 
         Ok(())
@@ -370,20 +439,27 @@ impl UpdateManager {
     /// 验证签名
     fn verify_signature(
         &self,
-        _manifest: &Manifest,
-        data: &[u8],
-        signature: Option<&str>,
+        manifest: &Manifest,
+        artifact: &crate::manifest::Artifact,
     ) -> Result<()> {
-        let sig = signature
+        let sig = artifact
+            .sig
+            .as_deref()
             .ok_or_else(|| Error::Validation("Signature required but not provided".to_string()))?;
 
         // 从环境变量或配置获取公钥
-        let public_key_hex = std::env::var("BLOCKCELL_PUBLIC_KEY")
-            .or_else(|_| std::env::var("BLOCKCELL_VERIFY_KEY"))
-            .map_err(|_| Error::Config("Public key not configured".to_string()))?;
+        let public_key_hex = self
+            .config
+            .auto_upgrade
+            .public_key
+            .clone()
+            .or_else(|| std::env::var("BLOCKCELL_PUBLIC_KEY").ok())
+            .or_else(|| std::env::var("BLOCKCELL_VERIFY_KEY").ok())
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| Error::Config("Public key not configured".to_string()))?;
 
         let verifier = SignatureVerifier::from_hex(&public_key_hex)?;
-        verifier.verify(data, sig)?;
+        verifier.verify(&manifest.signature_payload(artifact), sig)?;
 
         info!("Signature verification passed");
         Ok(())
@@ -474,6 +550,25 @@ impl UpdateManager {
     }
 }
 
+impl StagedUpdateMetadata {
+    fn as_manifest(&self) -> Manifest {
+        Manifest {
+            channel: self.channel.clone(),
+            version: self.version.clone(),
+            published_at: String::new(),
+            artifacts: vec![crate::manifest::Artifact {
+                os: self.os.clone(),
+                arch: self.arch.clone(),
+                url: self.url.clone(),
+                sha256: self.sha256.clone(),
+                sig: self.sig.clone(),
+            }],
+            min_host_version: None,
+            notes: String::new(),
+        }
+    }
+}
+
 fn get_current_platform() -> (String, String) {
     let os = if cfg!(target_os = "macos") {
         "macos"
@@ -494,6 +589,59 @@ fn get_current_platform() -> (String, String) {
     };
 
     (os.to_string(), arch.to_string())
+}
+
+fn validate_update_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|error| Error::Validation(format!("Invalid update URL: {error}")))?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    let is_loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if url.scheme() == "http" && is_loopback {
+        return Ok(());
+    }
+    Err(Error::Validation(
+        "Remote update URLs must use HTTPS".to_string(),
+    ))
+}
+
+fn redirect_target_is_allowed(previous: &[reqwest::Url], target: &reqwest::Url) -> bool {
+    !(previous.iter().any(|url| url.scheme() == "https") && target.scheme() != "https")
+}
+
+async fn read_response_limited(
+    mut response: reqwest::Response,
+    maximum: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(Error::Validation(format!(
+            "Update {label} is too large (maximum {maximum} bytes)"
+        )));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| Error::Other(format!("Failed to read update {label}: {error}")))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > maximum {
+            return Err(Error::Validation(format!(
+                "Update {label} is too large (maximum {maximum} bytes)"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn unique_temp_path(directory: &Path, label: &str) -> PathBuf {
@@ -695,6 +843,12 @@ mod tests {
             .persist_staged_update(&StagedUpdateMetadata {
                 version: "9.9.9".to_string(),
                 file_name: "blockcell-9.9.9".to_string(),
+                channel: "stable".to_string(),
+                os: get_current_platform().0,
+                arch: get_current_platform().1,
+                url: "https://example.com/blockcell".to_string(),
+                sha256: format!("{:x}", Sha256::digest(b"update")),
+                sig: None,
             })
             .unwrap();
 
@@ -703,5 +857,78 @@ mod tests {
         assert_eq!(status.latest_version.as_deref(), Some("9.9.9"));
         assert!(status.update_available);
         assert_eq!(status.staging_path.as_deref(), Some(staged_path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_a_staged_file_modified_after_download() {
+        let temp = TempDir::new().unwrap();
+        let manager = manager(&temp);
+        let staging_dir = temp.path().join("update/staging");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        let staged_path = staging_dir.join("blockcell-9.9.9");
+        std::fs::write(&staged_path, b"modified after verification").unwrap();
+        manager
+            .persist_staged_update(&StagedUpdateMetadata {
+                version: "9.9.9".to_string(),
+                file_name: "blockcell-9.9.9".to_string(),
+                channel: "stable".to_string(),
+                os: get_current_platform().0,
+                arch: get_current_platform().1,
+                url: "https://example.com/blockcell".to_string(),
+                sha256: format!("{:x}", Sha256::digest(b"original verified bytes")),
+                sig: None,
+            })
+            .unwrap();
+
+        let error = manager.apply(&staged_path, "9.9.9").await.unwrap_err();
+
+        assert!(error.to_string().contains("SHA256 mismatch"), "{error}");
+    }
+
+    #[test]
+    fn remote_update_urls_must_use_https() {
+        let error = validate_update_url("http://example.com/manifest.json").unwrap_err();
+        assert!(error.to_string().contains("HTTPS"), "{error}");
+
+        validate_update_url("http://127.0.0.1:8080/manifest.json").unwrap();
+        validate_update_url("https://example.com/manifest.json").unwrap();
+    }
+
+    #[test]
+    fn redirects_cannot_downgrade_https_to_http() {
+        let previous = reqwest::Url::parse("https://example.com/manifest.json").unwrap();
+        let insecure = reqwest::Url::parse("http://example.com/manifest.json").unwrap();
+        let secure = reqwest::Url::parse("https://cdn.example.com/manifest.json").unwrap();
+
+        assert!(!redirect_target_is_allowed(
+            std::slice::from_ref(&previous),
+            &insecure
+        ));
+        assert!(redirect_target_is_allowed(&[previous], &secure));
+    }
+
+    #[tokio::test]
+    async fn check_rejects_manifest_larger_than_limit() {
+        let temp = TempDir::new().unwrap();
+        let body = vec![b' '; MAX_MANIFEST_SIZE + 1];
+        let url = serve_once(
+            "200 OK",
+            &[
+                ("Content-Length", body.len().to_string()),
+                ("Content-Type", "application/json".to_string()),
+            ],
+            &body,
+        )
+        .await;
+
+        let error = manager_with_manifest_url(&temp, url)
+            .check()
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("manifest is too large"),
+            "{error}"
+        );
     }
 }
