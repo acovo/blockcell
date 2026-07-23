@@ -286,6 +286,7 @@ mod tests {
             cron_services: Arc::new(HashMap::new()),
             tool_registry: Arc::new(ToolRegistry::with_defaults()),
             web_password: "test-password".to_string(),
+            login_rate_limiter: Arc::new(Mutex::new(LoginRateLimiter::default())),
             channel_manager,
             evolution_service,
             response_caches: Arc::new(RwLock::new(HashMap::new())),

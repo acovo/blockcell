@@ -1,4 +1,7 @@
 use super::*;
+use std::collections::VecDeque;
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 // HTTP request / response types
 // ---------------------------------------------------------------------------
@@ -63,6 +66,85 @@ struct TasksResponse {
 // Auth handler — login with password, returns Bearer token
 // ---------------------------------------------------------------------------
 
+const LOGIN_MAX_FAILURES: usize = 5;
+const LOGIN_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const LOGIN_LOCKOUT: Duration = Duration::from_secs(300);
+
+struct LoginAttemptState {
+    failures: VecDeque<Instant>,
+    blocked_until: Option<Instant>,
+}
+
+pub(super) struct LoginRateLimiter {
+    entries: HashMap<IpAddr, LoginAttemptState>,
+    max_failures: usize,
+    failure_window: Duration,
+    lockout: Duration,
+}
+
+impl Default for LoginRateLimiter {
+    fn default() -> Self {
+        Self::new(LOGIN_MAX_FAILURES, LOGIN_FAILURE_WINDOW, LOGIN_LOCKOUT)
+    }
+}
+
+impl LoginRateLimiter {
+    fn new(max_failures: usize, failure_window: Duration, lockout: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_failures,
+            failure_window,
+            lockout,
+        }
+    }
+
+    fn is_allowed(&mut self, ip: IpAddr, now: Instant) -> bool {
+        self.entries.retain(|_, entry| {
+            entry.blocked_until.is_some_and(|until| until > now)
+                || entry.failures.back().is_some_and(|failure| {
+                    now.saturating_duration_since(*failure) <= self.failure_window
+                })
+        });
+        let Some(entry) = self.entries.get_mut(&ip) else {
+            return true;
+        };
+        if entry.blocked_until.is_some_and(|until| until > now) {
+            return false;
+        }
+        entry.blocked_until = None;
+        while entry
+            .failures
+            .front()
+            .is_some_and(|failure| now.saturating_duration_since(*failure) > self.failure_window)
+        {
+            entry.failures.pop_front();
+        }
+        true
+    }
+
+    fn record_failure(&mut self, ip: IpAddr, now: Instant) {
+        let entry = self.entries.entry(ip).or_insert_with(|| LoginAttemptState {
+            failures: VecDeque::new(),
+            blocked_until: None,
+        });
+        while entry
+            .failures
+            .front()
+            .is_some_and(|failure| now.saturating_duration_since(*failure) > self.failure_window)
+        {
+            entry.failures.pop_front();
+        }
+        entry.failures.push_back(now);
+        if entry.failures.len() >= self.max_failures {
+            entry.blocked_until = Some(now + self.lockout);
+        }
+    }
+
+    fn record_success(&mut self, ip: IpAddr) {
+        self.entries.remove(&ip);
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct LoginRequest {
     password: String,
@@ -70,15 +152,40 @@ pub(super) struct LoginRequest {
 
 pub(super) async fn handle_login(
     State(state): State<GatewayState>,
+    axum::extract::ConnectInfo(peer_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Response {
+    let peer_ip = peer_addr.ip();
+    let now = Instant::now();
+    if !state
+        .login_rate_limiter
+        .lock()
+        .await
+        .is_allowed(peer_ip, now)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "Too many failed login attempts" })),
+        )
+            .into_response();
+    }
     if !secure_eq(&req.password, &state.web_password) {
+        state
+            .login_rate_limiter
+            .lock()
+            .await
+            .record_failure(peer_ip, now);
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Invalid password" })),
         )
             .into_response();
     }
+    state
+        .login_rate_limiter
+        .lock()
+        .await
+        .record_success(peer_ip);
     // Return the api_token as the Bearer token for subsequent API requests
     match &state.api_token {
         Some(token) if !token.is_empty() => {
@@ -220,7 +327,9 @@ pub(super) async fn handle_tasks(
 
 #[cfg(test)]
 mod tests {
-    use super::assign_session_id;
+    use super::{assign_session_id, LoginRateLimiter};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn assign_session_id_generates_new_id_when_missing() {
@@ -237,5 +346,34 @@ mod tests {
         let session_id = assign_session_id("default:1773470425266", "default");
 
         assert_eq!(session_id, "default:1773470425266");
+    }
+
+    #[test]
+    fn login_rate_limiter_blocks_repeated_failures_per_ip() {
+        let mut limiter =
+            LoginRateLimiter::new(3, Duration::from_secs(60), Duration::from_secs(300));
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let other = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11));
+        let now = Instant::now();
+
+        for _ in 0..3 {
+            assert!(limiter.is_allowed(ip, now));
+            limiter.record_failure(ip, now);
+        }
+        assert!(!limiter.is_allowed(ip, now));
+        assert!(limiter.is_allowed(other, now));
+        assert!(limiter.is_allowed(ip, now + Duration::from_secs(301)));
+    }
+
+    #[test]
+    fn successful_login_clears_failure_state() {
+        let mut limiter =
+            LoginRateLimiter::new(2, Duration::from_secs(60), Duration::from_secs(300));
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 12));
+        let now = Instant::now();
+
+        limiter.record_failure(ip, now);
+        limiter.record_success(ip);
+        assert!(limiter.is_allowed(ip, now));
     }
 }

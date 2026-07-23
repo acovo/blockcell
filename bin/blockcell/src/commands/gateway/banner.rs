@@ -18,13 +18,8 @@ mod ansi {
     pub const NEON_GREEN: &str = "\x1b[38;2;0;255;157m"; // #00ff9d
 }
 
-pub(super) fn rand_u32() -> u32 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    std::time::SystemTime::now().hash(&mut h);
-    std::process::id().hash(&mut h);
-    h.finish() as u32
+pub(super) fn generate_temp_password() -> String {
+    format!("bc-{}", uuid::Uuid::new_v4().simple())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -717,4 +712,19 @@ fn display_width(s: &str) -> usize {
         }
     }
     w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_temp_password;
+
+    #[test]
+    fn temporary_webui_password_has_high_entropy_shape() {
+        let first = generate_temp_password();
+        let second = generate_temp_password();
+
+        assert!(first.starts_with("bc-"));
+        assert!(first.len() >= 35);
+        assert_ne!(first, second);
+    }
 }

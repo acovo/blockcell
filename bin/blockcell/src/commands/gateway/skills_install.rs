@@ -1,5 +1,113 @@
 use super::*;
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    #[test]
+    fn external_skill_name_rejects_path_syntax() {
+        assert!(sanitize_skill_name("../escape").is_err());
+        assert!(sanitize_skill_name("nested/skill").is_err());
+        assert!(sanitize_skill_name(r"nested\skill").is_err());
+    }
+
+    #[test]
+    fn installed_skill_name_must_be_one_safe_component() {
+        assert_eq!(validate_installed_skill_name("weather").unwrap(), "weather");
+        for invalid in ["", ".", "..", "../escape", "nested/skill", r"nested\skill"] {
+            assert!(
+                validate_installed_skill_name(invalid).is_err(),
+                "accepted invalid installed skill name: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn hub_download_url_must_remain_same_origin() {
+        let hub = reqwest::Url::parse("https://hub.example/api").unwrap();
+
+        assert_eq!(
+            resolve_hub_download_url(&hub, "/downloads/weather.zip")
+                .unwrap()
+                .as_str(),
+            "https://hub.example/api/downloads/weather.zip"
+        );
+        assert_eq!(
+            resolve_hub_download_url(&hub, "v1/skills/weather/download")
+                .unwrap()
+                .as_str(),
+            "https://hub.example/api/v1/skills/weather/download"
+        );
+        assert!(resolve_hub_download_url(&hub, "https://evil.example/steal").is_err());
+        assert!(resolve_hub_download_url(&hub, "http://hub.example/downgrade").is_err());
+    }
+
+    #[tokio::test]
+    async fn streaming_download_stops_at_the_byte_limit() {
+        let chunks = stream::iter(vec![
+            Ok::<_, std::io::Error>(b"1234".to_vec()),
+            Ok(b"5678".to_vec()),
+        ]);
+
+        let err = collect_stream_limited(chunks, 7)
+            .await
+            .expect_err("an eighth byte must be rejected");
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn mapped_private_ipv4_is_blocked() {
+        let mapped = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(is_blocked_ip(mapped));
+    }
+
+    #[test]
+    fn archive_budget_rejects_too_many_or_too_large_entries() {
+        assert!(check_archive_budget(1, 10, 10, 10).is_ok());
+        assert!(check_archive_budget(11, 10, 1, 10).is_err());
+        assert!(check_archive_budget(1, 10, 11, 10).is_err());
+    }
+
+    #[test]
+    fn hub_extraction_propagates_filesystem_errors() {
+        use std::io::Write;
+
+        let mut zip_bytes = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut zip_bytes);
+            let mut writer = zip::ZipWriter::new(cursor);
+            writer
+                .start_file("skill/SKILL.md", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"hello").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let temp = std::env::temp_dir().join(format!("blockcell-extract-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temp, b"not a directory").unwrap();
+        let result = extract_hub_package(&zip_bytes, &temp);
+        let _ = std::fs::remove_file(&temp);
+
+        assert!(result.is_err(), "filesystem failure must not be ignored");
+    }
+
+    #[tokio::test]
+    async fn external_staging_write_propagates_filesystem_errors() {
+        let temp = std::env::temp_dir().join(format!("blockcell-staging-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temp, b"not a directory").await.unwrap();
+        let files = vec![DownloadedFile {
+            name: "SKILL.md".to_string(),
+            content: "hello".to_string(),
+        }];
+
+        let result = write_external_staging_files(&temp, &files, "demo", None, None).await;
+        let _ = tokio::fs::remove_file(&temp).await;
+
+        assert!(result.is_err(), "staging write failure must be returned");
+    }
+}
 // Skills management — delete / hub proxy / install external
 // ---------------------------------------------------------------------------
 
@@ -8,6 +116,10 @@ pub(super) async fn handle_skill_delete(
     State(state): State<GatewayState>,
     AxumPath(skill_name): AxumPath<String>,
 ) -> impl IntoResponse {
+    let skill_name = match validate_installed_skill_name(&skill_name) {
+        Ok(name) => name,
+        Err(message) => return Json(serde_json::json!({ "status": "error", "message": message })),
+    };
     let skill_dir = state.paths.skills_dir().join(&skill_name);
     if !skill_dir.exists() {
         return Json(serde_json::json!({ "status": "not_found", "skill": skill_name }));
@@ -33,6 +145,7 @@ pub(super) async fn handle_hub_skills(State(state): State<GatewayState>) -> impl
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default();
 
@@ -43,7 +156,9 @@ pub(super) async fn handle_hub_skills(State(state): State<GatewayState>) -> impl
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            let body = resp.text().await.unwrap_or_default();
+            let body = response_text_limited(resp, HUB_MAX_METADATA_BYTES)
+                .await
+                .unwrap_or_default();
             let val: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or(serde_json::json!({ "skills": [] }));
             Json(val)
@@ -61,8 +176,20 @@ pub(super) async fn handle_hub_skill_install(
     State(state): State<GatewayState>,
     AxumPath(skill_name): AxumPath<String>,
 ) -> impl IntoResponse {
+    let skill_name = match validate_installed_skill_name(&skill_name) {
+        Ok(name) => name,
+        Err(message) => return Json(serde_json::json!({ "status": "error", "message": message })),
+    };
     let hub_url = match state.config.community_hub_url() {
-        Some(u) => u,
+        Some(u) => match reqwest::Url::parse(&u) {
+            Ok(url) => url,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Invalid community hub URL: {e}")
+                }))
+            }
+        },
         None => {
             return Json(
                 serde_json::json!({ "status": "error", "message": "Community hub not configured" }),
@@ -74,13 +201,14 @@ pub(super) async fn handle_hub_skill_install(
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default();
 
     // Fetch skill metadata
     let info_url = format!(
         "{}/v1/skills/{}/latest",
-        hub_url,
+        hub_url.as_str().trim_end_matches('/'),
         urlencoding::encode(&skill_name)
     );
     let mut req = client.get(&info_url);
@@ -88,7 +216,11 @@ pub(super) async fn handle_hub_skill_install(
         req = req.header("Authorization", format!("Bearer {}", k));
     }
     let info: serde_json::Value = match req.send().await {
-        Ok(r) if r.status().is_success() => r.json().await.unwrap_or(serde_json::json!({})),
+        Ok(r) if r.status().is_success() => response_text_limited(r, HUB_MAX_METADATA_BYTES)
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_str(&body).ok())
+            .unwrap_or(serde_json::json!({})),
         _ => serde_json::json!({}),
     };
 
@@ -97,27 +229,15 @@ pub(super) async fn handle_hub_skill_install(
         .get("dist_url")
         .and_then(|v| v.as_str())
         .or_else(|| info.get("source_url").and_then(|v| v.as_str()));
-    let download_url = dist_url
-        .map(|u| {
-            if u.starts_with("http://") || u.starts_with("https://") {
-                u.to_string()
-            } else {
-                format!(
-                    "{}/{}",
-                    hub_url.trim_end_matches('/'),
-                    u.trim_start_matches('/')
-                )
-            }
-        })
-        .unwrap_or_else(|| {
-            format!(
-                "{}/v1/skills/{}/download",
-                hub_url,
-                urlencoding::encode(&skill_name)
-            )
-        });
+    let download_candidate = dist_url
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("v1/skills/{}/download", urlencoding::encode(&skill_name)));
+    let download_url = match resolve_hub_download_url(&hub_url, &download_candidate) {
+        Ok(url) => url,
+        Err(message) => return Json(serde_json::json!({ "status": "error", "message": message })),
+    };
 
-    let mut dl_req = client.get(&download_url);
+    let mut dl_req = client.get(download_url);
     if let Some(k) = &api_key {
         dl_req = dl_req.header("Authorization", format!("Bearer {}", k));
     }
@@ -134,72 +254,20 @@ pub(super) async fn handle_hub_skill_install(
         );
     }
 
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return Json(serde_json::json!({ "status": "error", "message": e.to_string() })),
+    let bytes = match response_bytes_limited(resp, HUB_MAX_DOWNLOAD_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) => return Json(serde_json::json!({ "status": "error", "message": e })),
     };
 
-    let skill_dir = skills_dir.join(&skill_name);
-    if skill_dir.exists() {
-        if let Err(e) = tokio::fs::remove_dir_all(&skill_dir).await {
-            return Json(serde_json::json!({ "status": "error", "message": e.to_string() }));
-        }
-    }
-    if let Err(e) = tokio::fs::create_dir_all(&skill_dir).await {
-        return Json(serde_json::json!({ "status": "error", "message": e.to_string() }));
-    }
-
-    // 将 zip 解压的阻塞 I/O 移至 spawn_blocking
-    let skill_dir_clone = skill_dir.clone();
-    let bytes_clone = bytes.to_vec();
-    let extract_result: Result<(), String> = tokio::task::spawn_blocking(move || {
-        let cursor = std::io::Cursor::new(&bytes_clone);
-        match zip::ZipArchive::new(cursor) {
-            Ok(mut archive) => {
-                for i in 0..archive.len() {
-                    if let Ok(mut file) = archive.by_index(i) {
-                        let out_path = if let Some(enclosed) = file.enclosed_name() {
-                            let components: Vec<_> = enclosed.components().collect();
-                            if components.len() > 1 {
-                                skill_dir_clone
-                                    .join(components[1..].iter().collect::<std::path::PathBuf>())
-                            } else {
-                                skill_dir_clone.join(enclosed)
-                            }
-                        } else {
-                            continue;
-                        };
-                        if file.is_dir() {
-                            std::fs::create_dir_all(&out_path).ok();
-                        } else {
-                            if let Some(p) = out_path.parent() {
-                                std::fs::create_dir_all(p).ok();
-                            }
-                            if let Ok(mut outfile) = std::fs::File::create(&out_path) {
-                                std::io::copy(&mut file, &mut outfile).ok();
-                            }
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                std::fs::write(skill_dir_clone.join("raw.bin"), &bytes_clone)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(())
-    })
-    .await
-    .unwrap_or(Err("spawn_blocking failed".to_string()));
-
-    if let Err(e) = extract_result {
+    let size_bytes = bytes.len();
+    if let Err(e) = install_hub_package_transactionally(&skills_dir, &skill_name, bytes).await {
         return Json(serde_json::json!({ "status": "error", "message": e }));
     }
 
     Json(serde_json::json!({
         "status": "installed",
         "skill": skill_name,
-        "size_bytes": bytes.len(),
+        "size_bytes": size_bytes,
     }))
 }
 
@@ -218,6 +286,220 @@ pub(super) struct DownloadedFile {
 const EXTERNAL_MAX_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024; // 5MB
 const EXTERNAL_MAX_FILES: usize = 200;
 const EXTERNAL_MAX_GITHUB_DEPTH: usize = 6;
+const HUB_MAX_METADATA_BYTES: usize = 1024 * 1024;
+const HUB_MAX_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
+const HUB_MAX_ARCHIVE_FILES: usize = 500;
+const HUB_MAX_UNPACKED_BYTES: u64 = 50 * 1024 * 1024;
+
+async fn collect_stream_limited<S, B, E>(mut stream: S, max_bytes: usize) -> Result<Vec<u8>, String>
+where
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt;
+
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Download failed: {e}"))?;
+        let bytes = chunk.as_ref();
+        if body.len().saturating_add(bytes.len()) > max_bytes {
+            return Err(format!("Download exceeds {max_bytes} byte limit"));
+        }
+        body.extend_from_slice(bytes);
+    }
+    Ok(body)
+}
+
+async fn response_bytes_limited(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!("Download exceeds {max_bytes} byte limit"));
+    }
+    collect_stream_limited(response.bytes_stream(), max_bytes).await
+}
+
+async fn response_text_limited(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let bytes = response_bytes_limited(response, max_bytes).await?;
+    String::from_utf8(bytes).map_err(|e| format!("Downloaded content is not UTF-8: {e}"))
+}
+
+fn check_archive_budget(
+    entry_count: usize,
+    max_entries: usize,
+    total_unpacked: u64,
+    max_unpacked: u64,
+) -> Result<(), String> {
+    if entry_count > max_entries {
+        return Err(format!("Archive contains more than {max_entries} entries"));
+    }
+    if total_unpacked > max_unpacked {
+        return Err(format!("Archive expands beyond {max_unpacked} bytes"));
+    }
+    Ok(())
+}
+
+fn extract_hub_package(bytes: &[u8], destination: &std::path::Path) -> Result<(), String> {
+    let cursor = std::io::Cursor::new(bytes);
+    let Ok(mut archive) = zip::ZipArchive::new(cursor) else {
+        std::fs::create_dir_all(destination).map_err(|e| e.to_string())?;
+        return std::fs::write(destination.join("raw.bin"), bytes).map_err(|e| e.to_string());
+    };
+
+    let entry_count = archive.len();
+    check_archive_budget(
+        entry_count,
+        HUB_MAX_ARCHIVE_FILES,
+        0,
+        HUB_MAX_UNPACKED_BYTES,
+    )?;
+    let mut unpacked_bytes = 0u64;
+
+    for i in 0..entry_count {
+        let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+        let declared_total = unpacked_bytes.saturating_add(file.size());
+        check_archive_budget(
+            entry_count,
+            HUB_MAX_ARCHIVE_FILES,
+            declared_total,
+            HUB_MAX_UNPACKED_BYTES,
+        )?;
+        let Some(enclosed) = file.enclosed_name() else {
+            return Err(format!("Archive entry has unsafe path: {}", file.name()));
+        };
+        let components: Vec<_> = enclosed.components().collect();
+        let relative = if components.len() > 1 {
+            components[1..].iter().collect::<std::path::PathBuf>()
+        } else {
+            enclosed.to_path_buf()
+        };
+        let out_path = destination.join(relative);
+        if file.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut outfile = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+        let remaining = HUB_MAX_UNPACKED_BYTES.saturating_sub(unpacked_bytes);
+        let mut limited = std::io::Read::take(&mut file, remaining.saturating_add(1));
+        let copied = std::io::copy(&mut limited, &mut outfile).map_err(|e| e.to_string())?;
+        unpacked_bytes = unpacked_bytes.saturating_add(copied);
+        check_archive_budget(
+            entry_count,
+            HUB_MAX_ARCHIVE_FILES,
+            unpacked_bytes,
+            HUB_MAX_UNPACKED_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+async fn install_hub_package_transactionally(
+    skills_dir: &std::path::Path,
+    skill_name: &str,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    tokio::fs::create_dir_all(skills_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let staging = skills_dir.join(format!(".install-{skill_name}-{nonce}"));
+    let backup = skills_dir.join(format!(".backup-{skill_name}-{nonce}"));
+    let target = skills_dir.join(skill_name);
+
+    tokio::fs::create_dir(&staging)
+        .await
+        .map_err(|e| e.to_string())?;
+    let extract_path = staging.clone();
+    let extract_result =
+        tokio::task::spawn_blocking(move || extract_hub_package(&bytes, &extract_path))
+            .await
+            .map_err(|e| format!("Archive extraction task failed: {e}"))?;
+    if let Err(error) = extract_result {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(error);
+    }
+
+    let had_target = target.exists();
+    if had_target {
+        tokio::fs::rename(&target, &backup)
+            .await
+            .map_err(|e| format!("Failed to preserve existing skill: {e}"))?;
+    }
+    if let Err(error) = tokio::fs::rename(&staging, &target).await {
+        if had_target {
+            let _ = tokio::fs::rename(&backup, &target).await;
+        }
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(format!("Failed to activate installed skill: {error}"));
+    }
+    if had_target {
+        if let Err(error) = tokio::fs::remove_dir_all(&backup).await {
+            tracing::warn!(
+                path = %backup.display(),
+                error = %error,
+                "Installed skill but could not remove backup directory"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn write_external_staging_files(
+    skill_dir: &std::path::Path,
+    downloaded_files: &[DownloadedFile],
+    skill_name: &str,
+    display_name: Option<&str>,
+    description: Option<&str>,
+) -> Result<usize, String> {
+    tokio::fs::create_dir_all(skill_dir)
+        .await
+        .map_err(|e| format!("Cannot create skill dir: {e}"))?;
+    let mut total_bytes = 0usize;
+    for file in downloaded_files {
+        total_bytes = total_bytes.saturating_add(file.content.len());
+        if total_bytes > EXTERNAL_MAX_DOWNLOAD_BYTES {
+            return Err(format!(
+                "Downloaded content too large (>{EXTERNAL_MAX_DOWNLOAD_BYTES} bytes)"
+            ));
+        }
+        let rel = normalize_relative_path(&file.name)
+            .ok_or_else(|| format!("Unsafe downloaded path: {}", file.name))?;
+        let out_path = skill_dir.join(rel);
+        if let Some(parent) = out_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Cannot create staging directory: {e}"))?;
+        }
+        tokio::fs::write(&out_path, &file.content)
+            .await
+            .map_err(|e| format!("Cannot write {}: {e}", out_path.display()))?;
+    }
+
+    if !skill_dir.join("meta.yaml").exists() {
+        let meta_value = serde_json::json!({
+            "name": display_name.unwrap_or(skill_name),
+            "description": description.unwrap_or("External skill (evolving)"),
+            "tools": [],
+        });
+        let meta_content = serde_yaml::to_string(&meta_value)
+            .map_err(|e| format!("Cannot serialize meta.yaml: {e}"))?;
+        tokio::fs::write(skill_dir.join("meta.yaml"), meta_content)
+            .await
+            .map_err(|e| format!("Cannot write meta.yaml: {e}"))?;
+    }
+    Ok(total_bytes)
+}
 
 fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     match ip {
@@ -230,7 +512,9 @@ fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
                 || v4.octets()[0] == 0
         }
         std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
+            v6.to_ipv4_mapped()
+                .is_some_and(|mapped| is_blocked_ip(std::net::IpAddr::V4(mapped)))
+                || v6.is_loopback()
                 || v6.is_multicast()
                 || v6.is_unspecified()
                 || v6.is_unique_local()
@@ -239,7 +523,7 @@ fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-async fn validate_external_url(url: &reqwest::Url) -> Result<(), String> {
+async fn validated_external_addrs(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, String> {
     match url.scheme() {
         "http" | "https" => {}
         s => return Err(format!("Unsupported URL scheme: {}", s)),
@@ -252,28 +536,46 @@ async fn validate_external_url(url: &reqwest::Url) -> Result<(), String> {
     if host.ends_with(".local") {
         return Err("Blocked host: .local".to_string());
     }
+    let port = url.port_or_known_default().unwrap_or(443);
 
     // If it's already an IP literal, validate directly.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if is_blocked_ip(ip) {
             return Err(format!("Blocked IP: {}", ip));
         }
-        return Ok(());
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
     }
 
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addrs = tokio::net::lookup_host((host.as_str(), port))
+    let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
         .await
-        .map_err(|e| format!("DNS lookup failed: {}", e))?;
-    for addr in addrs {
+        .map_err(|e| format!("DNS lookup failed: {}", e))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("DNS lookup returned no addresses".to_string());
+    }
+    for addr in &addrs {
         if is_blocked_ip(addr.ip()) {
             return Err(format!("Blocked resolved IP: {}", addr.ip()));
         }
     }
-    Ok(())
+    Ok(addrs)
+}
+
+async fn build_external_client(url: &reqwest::Url) -> Result<reqwest::Client, String> {
+    let addrs = validated_external_addrs(url).await?;
+    let host = url.host_str().ok_or("URL host is required")?;
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, &addrs)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
 }
 
 fn sanitize_skill_name(raw: &str) -> Result<String, String> {
+    if raw.contains(['/', '\\']) || matches!(raw.trim(), "." | "..") {
+        return Err("Invalid skill name (path syntax is not allowed)".to_string());
+    }
     let mut out = String::new();
     for ch in raw.chars() {
         let c = ch.to_ascii_lowercase();
@@ -295,6 +597,41 @@ fn sanitize_skill_name(raw: &str) -> Result<String, String> {
         // Keep as-is; consumers may rely on underscores.
     }
     Ok(out)
+}
+
+fn validate_installed_skill_name(raw: &str) -> Result<String, String> {
+    if raw.is_empty()
+        || raw.len() > 64
+        || raw.trim() != raw
+        || matches!(raw, "." | "..")
+        || raw.contains(['/', '\\'])
+        || raw.chars().any(|c| c.is_control())
+    {
+        return Err("Invalid skill name: expected one safe path component".to_string());
+    }
+    Ok(raw.to_string())
+}
+
+fn resolve_hub_download_url(
+    hub_url: &reqwest::Url,
+    candidate: &str,
+) -> Result<reqwest::Url, String> {
+    let resolved = match reqwest::Url::parse(candidate) {
+        Ok(url) => url,
+        Err(_) => reqwest::Url::parse(&format!(
+            "{}/{}",
+            hub_url.as_str().trim_end_matches('/'),
+            candidate.trim_start_matches('/')
+        ))
+        .map_err(|e| format!("Invalid Hub download URL: {e}"))?,
+    };
+    let same_origin = resolved.scheme() == hub_url.scheme()
+        && resolved.host_str() == hub_url.host_str()
+        && resolved.port_or_known_default() == hub_url.port_or_known_default();
+    if !same_origin {
+        return Err("Hub download URL must use the configured Hub origin".to_string());
+    }
+    Ok(resolved)
 }
 
 fn normalize_relative_path(rel: &str) -> Option<std::path::PathBuf> {
@@ -428,7 +765,6 @@ fn parse_openclaw_frontmatter(content: &str) -> (Option<String>, Option<String>)
 /// Download text files from a GitHub directory via the GitHub Contents API.
 /// Traverses subdirectories up to a fixed depth (iterative, avoids async recursion).
 async fn fetch_github_directory_recursive(
-    client: &reqwest::Client,
     api_url: &str,
     root_prefix: &str,
     depth: usize,
@@ -455,6 +791,9 @@ async fn fetch_github_directory_recursive(
             ));
         }
 
+        let parsed_url =
+            reqwest::Url::parse(&url).map_err(|e| format!("Invalid GitHub API URL: {e}"))?;
+        let client = build_external_client(&parsed_url).await?;
         let resp = client
             .get(&url)
             .header("User-Agent", "blockcell-agent/1.0")
@@ -470,10 +809,9 @@ async fn fetch_github_directory_recursive(
             ));
         }
 
-        let entries: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse GitHub API response: {}", e))?;
+        let response_body = response_text_limited(resp, HUB_MAX_METADATA_BYTES).await?;
+        let entries: serde_json::Value = serde_json::from_str(&response_body)
+            .map_err(|e| format!("Failed to parse GitHub API response: {e}"))?;
 
         let files_array = entries
             .as_array()
@@ -553,14 +891,17 @@ async fn fetch_github_directory_recursive(
                 continue;
             };
 
-            match client
+            let download_parsed = reqwest::Url::parse(&download_url)
+                .map_err(|e| format!("Invalid GitHub download URL: {e}"))?;
+            let download_client = build_external_client(&download_parsed).await?;
+            match download_client
                 .get(&download_url)
                 .header("User-Agent", "blockcell-agent/1.0")
                 .send()
                 .await
             {
                 Ok(r) if r.status().is_success() => {
-                    if let Ok(text) = r.text().await {
+                    if let Ok(text) = response_text_limited(r, *remaining_bytes).await {
                         if text.len() > *remaining_bytes {
                             return Err(format!(
                                 "Downloaded content too large (max {} bytes)",
@@ -601,14 +942,10 @@ pub(super) async fn handle_skill_install_external(
             }))
         }
     };
-    if let Err(e) = validate_external_url(&parsed_url).await {
-        return Json(serde_json::json!({ "status": "error", "message": e }));
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .unwrap_or_default();
+    let client = match build_external_client(&parsed_url).await {
+        Ok(client) => client,
+        Err(e) => return Json(serde_json::json!({ "status": "error", "message": e })),
+    };
 
     // ── Step 1: Download skill files ────────────────────────────────────────
 
@@ -638,18 +975,10 @@ pub(super) async fn handle_skill_install_external(
             }
         }
 
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                return Json(serde_json::json!({ "status": "error", "message": e.to_string() }))
-            }
+        let bytes = match response_bytes_limited(resp, EXTERNAL_MAX_DOWNLOAD_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(e) => return Json(serde_json::json!({ "status": "error", "message": e })),
         };
-        if bytes.len() > EXTERNAL_MAX_DOWNLOAD_BYTES {
-            return Json(serde_json::json!({
-                "status": "error",
-                "message": format!("ZIP too large ({} bytes, max {})", bytes.len(), EXTERNAL_MAX_DOWNLOAD_BYTES)
-            }));
-        }
         let cursor = std::io::Cursor::new(&bytes);
         if let Ok(mut archive) = zip::ZipArchive::new(cursor) {
             let mut files_left = EXTERNAL_MAX_FILES;
@@ -675,9 +1004,21 @@ pub(super) async fn handle_skill_install_external(
                         continue;
                     };
 
+                    if file.size() > remaining_bytes as u64 {
+                        return Json(serde_json::json!({
+                            "status": "error",
+                            "message": format!("Downloaded content too large (max {} bytes)", EXTERNAL_MAX_DOWNLOAD_BYTES)
+                        }));
+                    }
+
                     let mut content = String::new();
                     use std::io::Read;
-                    if file.read_to_string(&mut content).is_ok() {
+                    if file
+                        .by_ref()
+                        .take(remaining_bytes.saturating_add(1) as u64)
+                        .read_to_string(&mut content)
+                        .is_ok()
+                    {
                         if content.len() > remaining_bytes {
                             return Json(serde_json::json!({
                                 "status": "error",
@@ -706,7 +1047,6 @@ pub(super) async fn handle_skill_install_external(
         let mut remaining = EXTERNAL_MAX_FILES;
         let mut remaining_bytes = EXTERNAL_MAX_DOWNLOAD_BYTES;
         match fetch_github_directory_recursive(
-            &client,
             &api_url,
             &root_prefix,
             0,
@@ -735,11 +1075,12 @@ pub(super) async fn handle_skill_install_external(
                 }))
             }
         };
-        if let Err(e) = validate_external_url(&raw_parsed).await {
-            return Json(serde_json::json!({ "status": "error", "message": e }));
-        }
+        let raw_client = match build_external_client(&raw_parsed).await {
+            Ok(client) => client,
+            Err(e) => return Json(serde_json::json!({ "status": "error", "message": e })),
+        };
 
-        let resp: reqwest::Response = match client.get(&raw_url).send().await {
+        let resp: reqwest::Response = match raw_client.get(&raw_url).send().await {
             Ok(r) => r,
             Err(e) => {
                 return Json(
@@ -761,11 +1102,9 @@ pub(super) async fn handle_skill_install_external(
                 }));
             }
         }
-        let content = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                return Json(serde_json::json!({ "status": "error", "message": e.to_string() }))
-            }
+        let content = match response_text_limited(resp, EXTERNAL_MAX_DOWNLOAD_BYTES).await {
+            Ok(content) => content,
+            Err(e) => return Json(serde_json::json!({ "status": "error", "message": e })),
         };
         if content.len() > EXTERNAL_MAX_DOWNLOAD_BYTES {
             return Json(serde_json::json!({
@@ -873,7 +1212,12 @@ pub(super) async fn handle_skill_install_external(
     if skill_dir.exists() {
         let staging_root = state.paths.import_staging_skills_dir();
         if ensure_within_dir(&staging_root, &skill_dir) {
-            tokio::fs::remove_dir_all(&skill_dir).await.ok();
+            if let Err(e) = tokio::fs::remove_dir_all(&skill_dir).await {
+                return Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Cannot clear previous staging directory: {e}")
+                }));
+            }
         } else {
             return Json(serde_json::json!({
                 "status": "error",
@@ -881,49 +1225,21 @@ pub(super) async fn handle_skill_install_external(
             }));
         }
     }
-    if let Err(e) = tokio::fs::create_dir_all(&skill_dir).await {
-        return Json(
-            serde_json::json!({ "status": "error", "message": format!("Cannot create skill dir: {}", e) }),
-        );
-    }
-
-    let mut total_bytes = 0usize;
-    for df in &downloaded_files {
-        total_bytes += df.content.len();
-        if total_bytes > EXTERNAL_MAX_DOWNLOAD_BYTES {
-            return Json(serde_json::json!({
-                "status": "error",
-                "message": format!("Downloaded content too large (>{} bytes)", EXTERNAL_MAX_DOWNLOAD_BYTES)
-            }));
+    let total_bytes = match write_external_staging_files(
+        &skill_dir,
+        &downloaded_files,
+        &skill_name,
+        fm_name.as_deref(),
+        fm_description.as_deref(),
+    )
+    .await
+    {
+        Ok(total_bytes) => total_bytes,
+        Err(message) => {
+            let _ = tokio::fs::remove_dir_all(&skill_dir).await;
+            return Json(serde_json::json!({ "status": "error", "message": message }));
         }
-        let Some(rel) = normalize_relative_path(&df.name) else {
-            continue;
-        };
-        let out_path = skill_dir.join(rel);
-        if let Some(parent) = out_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        tokio::fs::write(out_path, &df.content).await.ok();
-    }
-
-    // Generate meta.yaml so blockcell's SkillManager can recognize the skill
-    // even before the evolution pipeline completes.
-    if !skill_dir.join("meta.yaml").exists() {
-        let display_name = fm_name.as_deref().unwrap_or(&skill_name);
-        let desc = fm_description
-            .as_deref()
-            .unwrap_or("External skill (evolving)");
-        let meta_value = serde_json::json!({
-            "name": display_name,
-            "description": desc,
-            "tools": [],
-        });
-        if let Ok(meta_content) = serde_yaml::to_string(&meta_value) {
-            tokio::fs::write(skill_dir.join("meta.yaml"), meta_content)
-                .await
-                .ok();
-        }
-    }
+    };
 
     // ── Step 4: Build evolution context and trigger the self-evolution pipeline
 
@@ -1064,10 +1380,11 @@ pub(super) async fn handle_skill_install_external(
         match svc.trigger_external_evolution(context).await {
             Ok(id) => id,
             Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&skill_dir).await;
                 return Json(serde_json::json!({
                     "status": "error",
                     "message": format!("Failed to queue evolution: {}", e)
-                }))
+                }));
             }
         }
     };

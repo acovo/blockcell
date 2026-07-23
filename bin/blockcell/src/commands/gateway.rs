@@ -233,6 +233,8 @@ struct GatewayState {
     tool_registry: Arc<ToolRegistry>,
     /// Password for WebUI login (configured or auto-generated)
     web_password: String,
+    /// Per-client failed login tracking for the public WebUI login endpoint.
+    login_rate_limiter: Arc<Mutex<LoginRateLimiter>>,
     /// Channel manager for status reporting
     channel_manager: Arc<blockcell_channels::ChannelManager>,
     /// Shared EvolutionService for trigger/delete/status handlers
@@ -585,6 +587,26 @@ async fn auth_middleware(
             "Unauthorized: invalid or missing Bearer token",
         )
             .into_response()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum GatewayShutdownCause {
+    Signal,
+    ServerFailure(String),
+}
+
+async fn wait_for_gateway_shutdown(
+    mut server_failure_rx: mpsc::UnboundedReceiver<String>,
+) -> anyhow::Result<GatewayShutdownCause> {
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            Ok(GatewayShutdownCause::Signal)
+        }
+        failure = server_failure_rx.recv() => Ok(GatewayShutdownCause::ServerFailure(
+            failure.unwrap_or_else(|| "server failure monitor closed unexpectedly".to_string())
+        )),
     }
 }
 
@@ -1592,7 +1614,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     let (web_password, webui_pass_is_temp) = match &config.gateway.webui_pass {
         Some(p) if !p.is_empty() => (p.clone(), false),
         _ => {
-            let tmp = format!("{:08x}", rand_u32());
+            let tmp = generate_temp_password();
             (tmp, true)
         }
     };
@@ -1623,6 +1645,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         cron_services: Arc::new(cron_services_map),
         tool_registry: tool_registry_shared,
         web_password: web_password.clone(),
+        login_rate_limiter: Arc::new(Mutex::new(LoginRateLimiter::default())),
         channel_manager: Arc::clone(&channel_manager),
         evolution_service: shared_evo_service,
         response_caches: response_caches.clone(),
@@ -1786,14 +1809,26 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
     let http_shutdown_rx = shutdown_tx.subscribe();
+    let (server_failure_tx, server_failure_rx) = mpsc::unbounded_channel::<String>();
+    let http_failure_tx = server_failure_tx.clone();
     let http_handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let mut rx = http_shutdown_rx;
-                let _ = rx.recv().await;
-            })
-            .await
-            .ok();
+        let result = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let mut rx = http_shutdown_rx;
+            let _ = rx.recv().await;
+        })
+        .await;
+        let message = match result {
+            Ok(()) => "HTTP server stopped unexpectedly".to_string(),
+            Err(error) => format!("HTTP server failed: {error}"),
+        };
+        if !http_failure_tx.is_closed() {
+            error!(message = %message);
+            let _ = http_failure_tx.send(message);
+        }
     });
 
     // ── WebUI static file server (embedded via rust-embed) ──
@@ -1813,15 +1848,24 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         .layer(build_webui_cors_layer(&config));
     let webui_listener = tokio::net::TcpListener::bind(&webui_bind).await?;
     let webui_shutdown_rx = shutdown_tx.subscribe();
+    let webui_failure_tx = server_failure_tx.clone();
     let webui_handle = tokio::spawn(async move {
-        axum::serve(webui_listener, webui_app)
+        let result = axum::serve(webui_listener, webui_app)
             .with_graceful_shutdown(async move {
                 let mut rx = webui_shutdown_rx;
                 let _ = rx.recv().await;
             })
-            .await
-            .ok();
+            .await;
+        let message = match result {
+            Ok(()) => "WebUI server stopped unexpectedly".to_string(),
+            Err(error) => format!("WebUI server failed: {error}"),
+        };
+        if !webui_failure_tx.is_closed() {
+            error!(message = %message);
+            let _ = webui_failure_tx.send(message);
+        }
     });
+    drop(server_failure_tx);
 
     // ── Print beautiful startup banner ──
     print_startup_banner(
@@ -1835,9 +1879,17 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         &bind_addr,
     );
 
-    // ── Wait for shutdown signal ──
-    tokio::signal::ctrl_c().await?;
-    info!("Shutdown signal received, draining tasks...");
+    // ── Wait for shutdown signal or a critical server failure ──
+    let shutdown_error = match wait_for_gateway_shutdown(server_failure_rx).await? {
+        GatewayShutdownCause::Signal => {
+            info!("Shutdown signal received, draining tasks...");
+            None
+        }
+        GatewayShutdownCause::ServerFailure(message) => {
+            error!(message = %message, "Critical server stopped; shutting down gateway");
+            Some(message)
+        }
+    };
 
     let _ = shutdown_tx.send(());
     drop(confirm_tx);
@@ -1913,6 +1965,9 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     }
 
     info!("Gateway stopped");
+    if let Some(message) = shutdown_error {
+        return Err(anyhow::anyhow!(message));
+    }
     Ok(())
 }
 
@@ -2275,5 +2330,18 @@ mod tests {
     fn test_resolve_requested_agent_rejects_missing_agent() {
         let config = Config::default();
         assert!(resolve_requested_agent_id(&config, Some("ghost")).is_err());
+    }
+
+    #[tokio::test]
+    async fn server_failure_wakes_gateway_shutdown_waiter() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send("http server failed: test error".to_string())
+            .unwrap();
+
+        let cause = wait_for_gateway_shutdown(rx).await.unwrap();
+        assert_eq!(
+            cause,
+            GatewayShutdownCause::ServerFailure("http server failed: test error".to_string())
+        );
     }
 }
