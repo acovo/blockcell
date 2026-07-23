@@ -3,7 +3,7 @@ import {
   FileText, Table2, Presentation, Image, FileAudio, File,
   Download, RefreshCw, FolderOpen, Search,
 } from 'lucide-react';
-import { getFiles, downloadFileUrl, type FileEntry } from '@/lib/api';
+import { getFiles, downloadFile, type FileEntry } from '@/lib/api';
 import { useT } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
 import { useAgentStore } from '@/lib/store';
@@ -110,11 +110,7 @@ export function DeliverablesPage() {
   });
 
   function handleDownload(file: DeliverableFile) {
-    const url = downloadFileUrl(file.path, selectedAgentId);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = file.name;
-    a.click();
+    void downloadFile(file.path, file.name, selectedAgentId);
   }
 
   return (

@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
-  getFiles, getFileContent, downloadFileUrl, uploadFile,
+  getFiles, getFileContent, downloadFile, uploadFile,
   type FileEntry, type FileContent,
 } from '@/lib/api';
 import { useT } from '@/lib/i18n';
@@ -287,14 +287,13 @@ export function FilesPage() {
                     {entry.modified ? new Date(entry.modified).toLocaleDateString() : ''}
                   </span>
                   {!entry.is_dir && (
-                    <a
-                      href={downloadFileUrl(entry.path, selectedAgentId)}
-                      onClick={(e) => e.stopPropagation()}
+                    <button
+                      onClick={(e) => { e.stopPropagation(); void downloadFile(entry.path, entry.name, selectedAgentId); }}
                       className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-accent text-muted-foreground transition-opacity"
                       title={t('common.download')}
                     >
                       <Download size={14} />
-                    </a>
+                    </button>
                   )}
                 </div>
               ))}
@@ -332,13 +331,13 @@ export function FilesPage() {
                 <span className="text-xs text-muted-foreground shrink-0">{formatSize(preview.size)}</span>
               </div>
               <div className="flex items-center gap-1 shrink-0">
-                <a
-                  href={downloadFileUrl(preview.path, selectedAgentId)}
+                <button
+                  onClick={() => void downloadFile(preview.path, preview.path.split('/').pop() || preview.path, selectedAgentId)}
                   className="p-1.5 rounded hover:bg-accent text-muted-foreground"
                   title={t('common.download')}
                 >
                   <Download size={14} />
-                </a>
+                </button>
                 <button
                   onClick={() => setPreview(null)}
                   className="p-1.5 rounded hover:bg-accent text-muted-foreground"
@@ -366,12 +365,12 @@ export function FilesPage() {
                 <div className="flex flex-col items-center justify-center h-32 text-muted-foreground">
                   <File size={32} className="mb-2 opacity-30" />
                   <p className="text-sm">{t('files.binaryFile', { mimeType: preview.mime_type })}</p>
-                  <a
-                    href={downloadFileUrl(preview.path, selectedAgentId)}
+                  <button
+                    onClick={() => void downloadFile(preview.path, preview.path.split('/').pop() || preview.path, selectedAgentId)}
                     className="mt-2 text-xs text-rust hover:text-rust-light underline"
                   >
                     {t('files.downloadToView')}
-                  </a>
+                  </button>
                 </div>
               )}
             </div>

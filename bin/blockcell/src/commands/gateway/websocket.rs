@@ -193,6 +193,17 @@ pub(super) async fn handle_ws_upgrade(
     State(state): State<GatewayState>,
     req: axum::extract::Request,
 ) -> impl IntoResponse {
+    let requested_protocol = req
+        .headers()
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .find(|protocol| protocol.starts_with("blockcell-auth."))
+                .map(str::to_string)
+        });
     // Validate token inside the WS handler so we can close with code 4401
     // instead of rejecting the HTTP upgrade with 401 (which gives client code 1006).
     let token_valid = match &state.api_token {
@@ -205,14 +216,21 @@ pub(super) async fn handle_ws_upgrade(
                 Some(h) if h.starts_with("Bearer ") => secure_eq(&h[7..], t.as_str()),
                 _ => false,
             };
-            let from_query = token_from_query(&req)
+            let from_protocol = requested_protocol
+                .as_deref()
+                .and_then(token_from_websocket_protocol)
                 .map(|v| secure_eq(&v, t.as_str()))
                 .unwrap_or(false);
-            from_header || from_query
+            from_header || from_protocol
         }
         _ => true, // no token configured → open access
     };
 
+    let ws = if let Some(protocol) = requested_protocol {
+        ws.protocols([protocol])
+    } else {
+        ws
+    };
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
@@ -228,6 +246,21 @@ pub(super) async fn handle_ws_upgrade(
             }
             handle_ws_connection(socket, state).await;
         })
+}
+
+fn token_from_websocket_protocol(header: &str) -> Option<String> {
+    let encoded = header
+        .split(',')
+        .map(str::trim)
+        .find_map(|protocol| protocol.strip_prefix("blockcell-auth."))?;
+    if encoded.is_empty() || encoded.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..encoded.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
 }
 
 pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState) {
@@ -665,6 +698,15 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_auth_protocol_decodes_token_without_query_parameters() {
+        let header = "chat, blockcell-auth.62635f74657374";
+        assert_eq!(
+            token_from_websocket_protocol(header).as_deref(),
+            Some("bc_test")
+        );
+    }
     use std::collections::HashSet;
 
     fn scope(agent_id: &str, chat_id: &str) -> WsSessionScope {

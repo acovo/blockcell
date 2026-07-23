@@ -4,15 +4,11 @@ import {
   X, ExternalLink, Save, CheckCircle, AlertCircle, Loader2, Plus, Trash2
 } from 'lucide-react';
 import {
-  clearChannelAccountOwner,
-  clearChannelOwner,
   getChannels,
   getChannelsStatus,
   getConfig,
-  setChannelAccountOwner,
-  setChannelOwner,
-  updateConfig,
   updateChannel,
+  updateChannelConfig,
   type ChannelInfo,
   type ChannelField,
   type ChannelRuntimeStatus,
@@ -497,12 +493,6 @@ function ChannelDrawer({
     setSaving(true);
     setError('');
     try {
-      const chResp = await updateChannel(channel.id, fields, enabled);
-      if (chResp.status !== 'ok') {
-        const msg = (chResp as any)?.message;
-        throw new Error(msg || t('channels.saving'));
-      }
-
       const accountsObj: Record<string, any> = {};
       const seenIds = new Set<string>();
       for (const draft of accountDrafts) {
@@ -555,59 +545,17 @@ function ChannelDrawer({
         }
       }
 
-      const latestConfig = await getConfig();
-      const nextConfig = { ...latestConfig };
-      if (!nextConfig.channels || typeof nextConfig.channels !== 'object') {
-        throw new Error(t('channels.configSaveFailed'));
-      }
-      const ch = { ...(nextConfig.channels[channel.id] ?? {}) };
-      ch.accounts = accountsObj;
-      ch.defaultAccountId = defaultId;
-      nextConfig.channels[channel.id] = ch;
-
-      const cfgResp = await updateConfig(nextConfig);
-      if (cfgResp.status !== 'ok') {
-        throw new Error((cfgResp as any)?.message || t('channels.configSaveFailed'));
-      }
-
       const owner = ownerAgent.trim();
-      if (owner) {
-        const ownerResp = await setChannelOwner(channel.id, owner);
-        if (ownerResp.status !== 'ok') {
-          const msg = (ownerResp as any)?.message;
-          throw new Error(msg || t('channels.ownerSaveFailed'));
-        }
-      } else {
-        const ownerResp = await clearChannelOwner(channel.id);
-        if (ownerResp.status !== 'ok') {
-          const msg = (ownerResp as any)?.message;
-          throw new Error(msg || t('channels.ownerSaveFailed'));
-        }
-      }
-
-      const previousAccountOwners = channel.accountOwners ?? {};
-      const accountIdsToSync = new Set<string>([
-        ...Object.keys(previousAccountOwners),
-        ...Object.keys(nextAccountOwners),
-      ]);
-      for (const accountId of accountIdsToSync) {
-        const previousOwner = (previousAccountOwners[accountId] ?? '').trim();
-        const nextOwner = (nextAccountOwners[accountId] ?? '').trim();
-        if (previousOwner === nextOwner) continue;
-
-        if (nextOwner) {
-          const ownerResp = await setChannelAccountOwner(channel.id, accountId, nextOwner);
-          if (ownerResp.status !== 'ok') {
-            const msg = (ownerResp as any)?.message;
-            throw new Error(msg || t('channels.accountOwnerSaveFailed'));
-          }
-        } else {
-          const ownerResp = await clearChannelAccountOwner(channel.id, accountId);
-          if (ownerResp.status !== 'ok') {
-            const msg = (ownerResp as any)?.message;
-            throw new Error(msg || t('channels.accountOwnerSaveFailed'));
-          }
-        }
+      const response = await updateChannelConfig(channel.id, {
+        fields,
+        enabled,
+        accounts: accountsObj,
+        defaultAccountId: defaultId,
+        ownerAgent: owner || undefined,
+        accountOwners: nextAccountOwners,
+      });
+      if (response.status !== 'ok') {
+        throw new Error(response.message || t('channels.configSaveFailed'));
       }
       setSaved(true);
       // Build updated channel object for immediate page refresh

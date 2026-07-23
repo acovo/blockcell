@@ -1,8 +1,7 @@
 //! Gateway 内部使用的纯工具函数：进度节流、进度条格式化、常量时间比较、
-//! URL 解码、查询参数取 token、workspace 相对路径校验，以及活动模型/Provider
+//! workspace 相对路径校验，以及活动模型/Provider
 //! 解析等。均为从 `gateway.rs` 抽离的独立函数，不依赖 GatewayState，不改变行为。
 
-use axum::http::Request;
 use blockcell_core::Config;
 use std::collections::HashMap;
 
@@ -73,59 +72,6 @@ pub(super) fn secure_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-pub(super) fn url_decode(input: &str) -> Option<String> {
-    // Decode into a byte buffer first, then validate as UTF-8. Percent-escapes
-    // encode raw bytes, so a multi-byte UTF-8 char (e.g. `%E4%B8%AD` → 中) spans
-    // several escapes; pushing each byte as a `char` would corrupt it.
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' => {
-                if i + 2 >= bytes.len() {
-                    return None;
-                }
-                let hi = bytes[i + 1];
-                let lo = bytes[i + 2];
-                let hex = |c: u8| -> Option<u8> {
-                    match c {
-                        b'0'..=b'9' => Some(c - b'0'),
-                        b'a'..=b'f' => Some(c - b'a' + 10),
-                        b'A'..=b'F' => Some(c - b'A' + 10),
-                        _ => None,
-                    }
-                };
-                let h = hex(hi)?;
-                let l = hex(lo)?;
-                out.push(h * 16 + l);
-                i += 3;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-pub(super) fn token_from_query(req: &Request<axum::body::Body>) -> Option<String> {
-    let q = req.uri().query()?;
-    for pair in q.split('&') {
-        let (k, v) = pair.split_once('=')?;
-
-        if k == "token" {
-            return url_decode(v);
-        }
-    }
-    None
-}
-
 pub(super) fn validate_workspace_relative_path(path: &str) -> Result<std::path::PathBuf, String> {
     if path.trim().is_empty() {
         return Err("path is required".to_string());
@@ -176,30 +122,4 @@ pub(super) fn active_model_and_provider(config: &Config) -> (String, Option<Stri
         config.agents.defaults.provider.clone(),
         "agents.defaults",
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn url_decode_handles_ascii_and_plus() {
-        assert_eq!(url_decode("bc_abc123").as_deref(), Some("bc_abc123"));
-        assert_eq!(url_decode("a+b%20c").as_deref(), Some("a b c"));
-    }
-
-    #[test]
-    fn url_decode_handles_multibyte_utf8() {
-        // %E4%B8%AD is the UTF-8 encoding of 中; decoding byte-by-byte as chars
-        // would corrupt it. The fix buffers bytes then validates as UTF-8.
-        assert_eq!(url_decode("%E4%B8%AD%E6%96%87").as_deref(), Some("中文"));
-    }
-
-    #[test]
-    fn url_decode_rejects_truncated_or_invalid_escape() {
-        assert_eq!(url_decode("%E4"), None);
-        assert_eq!(url_decode("%ZZ"), None);
-        // Lone high byte is not valid UTF-8.
-        assert_eq!(url_decode("%FF"), None);
-    }
 }

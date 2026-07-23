@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { User, Save, Sparkles, RefreshCw, FileText, Loader2, AlertTriangle, RotateCcw, ChevronDown, ChevronUp, Send } from 'lucide-react';
 import { getPersonaFiles, savePersonaFile, sendChat, type PersonaFile } from '@/lib/api';
 import { wsManager } from '@/lib/ws';
+import { applyPersonaContent, saveBeforeSwitch } from '@/lib/persona-operations';
 import { useT } from '@/lib/i18n';
 
 const FILE_META: Record<string, { label: string; desc: string; placeholder: string }> = {
@@ -140,6 +141,8 @@ export function PersonaPage() {
   const aiProgressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const aiPromptRef = useRef<HTMLTextAreaElement>(null);
   const aiBufferRef = useRef(''); // accumulates streamed tokens, applied on done
+  const aiFileRef = useRef('');
+  const aiOriginalContentRef = useRef('');
 
   // Unsaved-changes dialog state
   const [pendingSwitch, setPendingSwitch] = useState<string | null>(null); // target file name
@@ -166,17 +169,19 @@ export function PersonaPage() {
   // Check if any file has unsaved changes
   const hasAnyDirty = files.some(f => (contents[f.name] ?? '') !== (savedContents[f.name] ?? ''));
 
-  const handleSave = useCallback(async () => {
+  const handleSave = useCallback(async (fileName = activeFile, content = activeContent): Promise<boolean> => {
     setSaving(true);
     try {
-      await savePersonaFile(activeFile, activeContent);
-      setSavedContents(prev => ({ ...prev, [activeFile]: activeContent }));
+      await savePersonaFile(fileName, content);
+      setSavedContents(prev => ({ ...prev, [fileName]: content }));
       // Mark file as exists so sidebar 「未创建」label disappears immediately
-      setFiles(prev => prev.map(f => f.name === activeFile ? { ...f, exists: true } : f));
+      setFiles(prev => prev.map(f => f.name === fileName ? { ...f, exists: true } : f));
       setSaveStatus('saved');
       setTimeout(() => setSaveStatus('idle'), 2000);
+      return true;
     } catch {
       setSaveStatus('error');
+      return false;
     } finally {
       setSaving(false);
     }
@@ -231,15 +236,22 @@ export function PersonaPage() {
   const confirmSwitch = useCallback(async (saveFirst: boolean) => {
     if (!pendingSwitch) return;
     if (saveFirst) {
-      await handleSave();
+      const sourceFile = activeFile;
+      const sourceContent = activeContent;
+      const switched = await saveBeforeSwitch(
+        () => handleSave(sourceFile, sourceContent),
+        () => setActiveFile(pendingSwitch),
+      );
+      if (!switched) return;
+    } else {
+      setActiveFile(pendingSwitch);
     }
-    setActiveFile(pendingSwitch);
     setPendingSwitch(null);
     setShowAiPanel(false);
     setAiPrompt('');
     setAiError('');
     setOriginalContent(null);
-  }, [pendingSwitch, handleSave]);
+  }, [pendingSwitch, handleSave, activeFile, activeContent]);
 
   // AI streaming: accumulate tokens in buffer ref, apply to editor only on done
   useEffect(() => {
@@ -251,7 +263,7 @@ export function PersonaPage() {
       if (ev.chat_id !== aiChatIdRef.current) return;
       // Use buffered tokens if available (streaming), else fall back to ev.content (non-streaming)
       const result = aiBufferRef.current || ev.content || '';
-      setContents(prev => ({ ...prev, [activeFile]: result }));
+      setContents(prev => applyPersonaContent(prev, aiFileRef.current, result));
       setAiStreaming(false);
       setAiProgress(100);
       if (aiProgressTimerRef.current) clearInterval(aiProgressTimerRef.current);
@@ -263,17 +275,17 @@ export function PersonaPage() {
       setAiProgress(0);
       if (aiProgressTimerRef.current) clearInterval(aiProgressTimerRef.current);
       // restore original content on error
-      if (originalContent !== null) {
-        setContents(prev => ({ ...prev, [activeFile]: originalContent }));
-      }
+      setContents(prev => applyPersonaContent(prev, aiFileRef.current, aiOriginalContentRef.current));
     });
     return () => { offToken(); offDone(); offErr(); };
-  }, [activeFile, originalContent]);
+  }, []);
 
   const handleAiGenerate = useCallback(async () => {
     if (!aiPrompt.trim() || aiStreaming) return;
     const chatId = `persona-opt-${Date.now()}`;
     aiChatIdRef.current = chatId;
+    aiFileRef.current = activeFile;
+    aiOriginalContentRef.current = activeContent;
     aiBufferRef.current = ''; // reset buffer
     setAiError('');
     // save original content so we can undo (editor stays unchanged during generation)
@@ -309,19 +321,17 @@ ${activeContent || '（文件为空，请生成初始内容）'}
       setAiStreaming(false);
       setAiProgress(0);
       if (aiProgressTimerRef.current) clearInterval(aiProgressTimerRef.current);
-      if (originalContent !== null) {
-        setContents(prev => ({ ...prev, [activeFile]: originalContent }));
-      }
+      setContents(prev => applyPersonaContent(prev, aiFileRef.current, aiOriginalContentRef.current));
     }
   }, [aiPrompt, activeContent, activeFile, aiStreaming, originalContent]);
 
   const handleAiUndo = useCallback(() => {
     if (originalContent !== null) {
-      setContents(prev => ({ ...prev, [activeFile]: originalContent }));
+      setContents(prev => applyPersonaContent(prev, aiFileRef.current, aiOriginalContentRef.current));
       setOriginalContent(null);
       setAiProgress(0);
     }
-  }, [activeFile, originalContent]);
+  }, [originalContent]);
 
   const toggleAiPanel = useCallback(() => {
     setShowAiPanel(v => !v);
@@ -358,7 +368,7 @@ ${activeContent || '（文件为空，请生成初始内容）'}
             <RefreshCw size={14} />
           </button>
           <button
-            onClick={handleSave}
+            onClick={() => { void handleSave(); }}
             disabled={!isDirty || saving}
             className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
               saveStatus === 'saved' ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)]'

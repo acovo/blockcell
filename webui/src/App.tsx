@@ -11,6 +11,7 @@ import { wsManager, type WsEvent } from './lib/ws';
 import { WsEventBatcher } from './lib/ws-batcher';
 import { cn } from './lib/utils';
 import { registerShortcuts, handleGlobalKeyDown } from './lib/keyboard';
+import { clearAuthToken, getAuthToken } from './lib/auth';
 
 // Pages are lazy-loaded so each becomes its own chunk: only the active page's
 // code is fetched, keeping the initial bundle small. Named exports are mapped
@@ -52,7 +53,7 @@ export default function App() {
   const dismissReminderAlert = useReminderAlertsStore((s) => s.dismissAlert);
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const visibleReminderAlerts = reminderAlerts.filter((alert) => alert.agentId === selectedAgentId);
-  const [authenticated, setAuthenticated] = useState(() => !!localStorage.getItem('blockcell_token'));
+  const [authenticated, setAuthenticated] = useState(() => !!getAuthToken());
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialog | null>(null);
   const [showWizard, setShowWizard] = useState(() => {
     return authenticated && !localStorage.getItem('blockcell_wizard_done');
@@ -74,7 +75,7 @@ export default function App() {
   setConnectedRef.current = setConnected;
 
   useEffect(() => {
-    if (localStorage.getItem('blockcell_token')) {
+    if (getAuthToken()) {
       wsManager.connect();
     }
     const wsEventBatcher = new WsEventBatcher<WsEvent>((event) => {
@@ -92,7 +93,7 @@ export default function App() {
 
       // Only force re-login when backend explicitly rejects the token.
       if (state.reason === 'auth_failed') {
-        localStorage.removeItem('blockcell_token');
+        clearAuthToken();
         wsManager.disconnect();
         setAuthenticated(false);
       }

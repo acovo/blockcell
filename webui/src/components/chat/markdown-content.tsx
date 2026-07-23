@@ -4,8 +4,14 @@ import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { Copy, Check } from 'lucide-react';
-import { mediaFileUrl } from '@/lib/api';
 import { useAgentStore } from '@/lib/store';
+import { useAuthenticatedFileUrl } from '@/lib/use-authenticated-file-url';
+
+function LocalMarkdownImage({ path, alt, agentId }: { path: string; alt: string; agentId?: string }) {
+  const url = useAuthenticatedFileUrl(path, agentId);
+  if (!url) return null;
+  return <img src={url} alt={alt} className="my-2 max-h-[300px] max-w-full rounded-xl border border-border/70 object-contain shadow-sm" loading="lazy" />;
+}
 
 function CodeBlock({ language, code }: { language: string; code: string }) {
   const [copied, setCopied] = useState(false);
@@ -109,10 +115,12 @@ export const MarkdownContent = memo(function MarkdownContent({ content }: { cont
             // Route any local file path (relative or absolute) through the serve
             // endpoint; only http(s)/data/blob URLs are passed through unchanged.
             const isRemoteUrl = src && /^(https?:|data:|blob:)/i.test(src);
-            const resolvedSrc = !isRemoteUrl ? mediaFileUrl(src ?? '', selectedAgentId) : src;
+            if (!isRemoteUrl) {
+              return <LocalMarkdownImage path={src ?? ''} alt={alt || ''} agentId={selectedAgentId} />;
+            }
             return (
               <img
-                src={resolvedSrc}
+                src={src}
                 alt={alt || ''}
                 className="my-2 max-h-[300px] max-w-full rounded-xl border border-border/70 object-contain shadow-sm"
                 loading="lazy"
@@ -133,4 +141,3 @@ export const MarkdownContent = memo(function MarkdownContent({ content }: { cont
     </div>
   );
 });
-

@@ -1,3 +1,6 @@
+import { authProtocol, clearAuthToken, getAuthToken } from './auth';
+import { forCurrentSocket, sendJson } from './ws-connection';
+
 export type WsEventType =
   | 'token'
   | 'stream_reset'
@@ -130,20 +133,22 @@ class WebSocketManager {
     this.emitConnectionState();
 
     try {
-      const token = localStorage.getItem('blockcell_token');
-      const url = token ? `${this.url}?token=${token}` : this.url;
-      this.ws = new WebSocket(url);
+      const token = getAuthToken();
+      const socket = token
+        ? new WebSocket(this.url, [authProtocol(token)])
+        : new WebSocket(this.url);
+      this.ws = socket;
 
-      this.ws.onopen = () => {
+      socket.onopen = forCurrentSocket(() => this.ws, socket, () => {
         this.reconnectDelay = 1000;
         this._reconnectAttempt = 0;
         this._reason = 'none';
         this._wasConnected = true;
         this.emitInternal('_connected');
         this.emitConnectionState();
-      };
+      });
 
-      this.ws.onmessage = (event) => {
+      socket.onmessage = forCurrentSocket(() => this.ws, socket, (event: MessageEvent) => {
         try {
           const data: WsEvent = JSON.parse(event.data);
           this.emit(data.type, data);
@@ -151,9 +156,9 @@ class WebSocketManager {
         } catch {
           // ignore non-JSON messages
         }
-      };
+      });
 
-      this.ws.onclose = (event) => {
+      socket.onclose = forCurrentSocket(() => this.ws, socket, (event: CloseEvent) => {
         // Only treat explicit 4401 as auth failure.
         // code 1006 (abnormal close) is ambiguous — it fires on server restarts,
         // network blips, and CORS issues, NOT just auth failures. Treating it as
@@ -175,7 +180,7 @@ class WebSocketManager {
         // this is often caused by the gateway restarting and invalidating the token.
         // Probe /v1/health to distinguish auth failure from server down.
         if (this._reason === 'server_down' && !this._healthProbed) {
-          const token = localStorage.getItem('blockcell_token');
+          const token = getAuthToken();
           if (token && !this._wasConnected) {
             this._healthProbed = true;
             const gen = this._generation;
@@ -190,14 +195,14 @@ class WebSocketManager {
         if (this.shouldReconnect && this._reason !== 'auth_failed') {
           this.scheduleReconnect();
         }
-      };
+      });
 
-      this.ws.onerror = () => {
+      socket.onerror = forCurrentSocket(() => this.ws, socket, () => {
         // Only close if still connecting/open — avoids "closed before established" warning
-        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-          this.ws.close();
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+          socket.close();
         }
-      };
+      });
     } catch {
       this._reason = 'network_error';
       this.emitConnectionState();
@@ -239,7 +244,7 @@ class WebSocketManager {
   /** Re-login: clear token and signal auth_failed so App shows login */
   relogin() {
     this.disconnect();
-    localStorage.removeItem('blockcell_token');
+    clearAuthToken();
     window.location.reload();
   }
 
@@ -285,22 +290,20 @@ class WebSocketManager {
     }, delay);
   }
 
-  send(data: { type: string; content?: string; chat_id?: string; media?: string[]; agent_id?: string; [key: string]: unknown }) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data));
-    }
+  send(data: { type: string; content?: string; chat_id?: string; media?: string[]; agent_id?: string; [key: string]: unknown }): boolean {
+    return sendJson(this.ws, data, WebSocket.OPEN);
   }
 
-  sendChat(content: string, chatId?: string, media: string[] = [], agentId?: string) {
-    this.send({ type: 'chat', content, chat_id: chatId, media, agent_id: agentId });
+  sendChat(content: string, chatId?: string, media: string[] = [], agentId?: string): boolean {
+    return this.send({ type: 'chat', content, chat_id: chatId, media, agent_id: agentId });
   }
 
-  sendCancel(chatId = 'default', agentId?: string) {
-    this.send({ type: 'cancel', chat_id: chatId, agent_id: agentId });
+  sendCancel(chatId = 'default', agentId?: string): boolean {
+    return this.send({ type: 'cancel', chat_id: chatId, agent_id: agentId });
   }
 
-  sendConfirmResponse(requestId: string, approved: boolean) {
-    this.send({ type: 'confirm_response', request_id: requestId, approved });
+  sendConfirmResponse(requestId: string, approved: boolean): boolean {
+    return this.send({ type: 'confirm_response', request_id: requestId, approved });
   }
 
   on(event: string, listener: WsListener) {

@@ -273,6 +273,69 @@ pub(super) struct ChannelUpdateRequest {
     enabled: Option<bool>,
 }
 
+fn apply_channel_fields(
+    root: &mut serde_json::Value,
+    channel_id: &str,
+    fields: &serde_json::Map<String, serde_json::Value>,
+    enabled: Option<bool>,
+) -> anyhow::Result<()> {
+    let channels = root
+        .get_mut("channels")
+        .and_then(|value| value.as_object_mut())
+        .ok_or_else(|| anyhow::anyhow!("no channels section in config"))?;
+    let channel = channels
+        .entry(channel_id)
+        .or_insert_with(|| serde_json::json!({}));
+    let obj = channel
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("invalid channel config for '{}'", channel_id))?;
+
+    for (key, value) in fields {
+        let coerced = match key.as_str() {
+            "proxy" => match value.as_str().unwrap_or("") {
+                "" => serde_json::Value::Null,
+                _ => value.clone(),
+            },
+            "channels" => serde_json::json!(value
+                .as_str()
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()),
+            "pollIntervalSecs" | "agentId" => {
+                serde_json::json!(value.as_str().unwrap_or("0").parse::<i64>().unwrap_or(0))
+            }
+            _ => value.clone(),
+        };
+        obj.insert(key.clone(), coerced);
+    }
+    if let Some(enabled) = enabled {
+        obj.insert("enabled".to_string(), serde_json::json!(enabled));
+    }
+    for key in [
+        "bot_token",
+        "app_token",
+        "app_id",
+        "app_secret",
+        "app_key",
+        "corp_id",
+        "corp_secret",
+        "agent_id",
+        "bridge_url",
+        "allow_from",
+        "poll_interval_secs",
+        "encrypt_key",
+        "verification_token",
+        "robot_code",
+        "callback_token",
+        "encoding_aes_key",
+    ] {
+        obj.remove(key);
+    }
+    Ok(())
+}
+
 pub(super) async fn handle_channel_update(
     State(state): State<GatewayState>,
     AxumPath(channel_id): AxumPath<String>,
@@ -282,78 +345,8 @@ pub(super) async fn handle_channel_update(
     let result: anyhow::Result<serde_json::Value> = async {
         let mut root = load_config_value_or_state(&state)?;
 
-        let channels = root
-            .get_mut("channels")
-            .and_then(|v| v.as_object_mut())
-            .ok_or_else(|| anyhow::anyhow!("no channels section in config"))?;
-
         let ch_key = channel_id.as_str();
-        let ch = channels
-            .entry(ch_key)
-            .or_insert_with(|| serde_json::json!({}));
-
-        if let Some(obj) = ch.as_object_mut() {
-            // Insert fields with type coercion for non-string config fields
-            for (k, v) in &req.fields {
-                let coerced = match k.as_str() {
-                    // Option<String>: empty string → null
-                    "proxy" => {
-                        let s = v.as_str().unwrap_or("");
-                        if s.is_empty() {
-                            serde_json::Value::Null
-                        } else {
-                            v.clone()
-                        }
-                    }
-                    // Vec<String>: comma-separated string → JSON array
-                    "channels" => {
-                        let s = v.as_str().unwrap_or("");
-                        let arr: Vec<&str> = if s.is_empty() {
-                            vec![]
-                        } else {
-                            s.split(',')
-                                .map(|x| x.trim())
-                                .filter(|x| !x.is_empty())
-                                .collect()
-                        };
-                        serde_json::json!(arr)
-                    }
-                    // u32/i64 numeric fields: string → number
-                    "pollIntervalSecs" | "agentId" => {
-                        let s = v.as_str().unwrap_or("0");
-                        let n: i64 = s.parse().unwrap_or(0);
-                        serde_json::json!(n)
-                    }
-                    _ => v.clone(),
-                };
-                obj.insert(k.clone(), coerced);
-            }
-            if let Some(en) = req.enabled {
-                obj.insert("enabled".to_string(), serde_json::json!(en));
-            }
-            // Clean up stale snake_case keys from previous buggy saves
-            let stale: &[&str] = &[
-                "bot_token",
-                "app_token",
-                "app_id",
-                "app_secret",
-                "app_key",
-                "corp_id",
-                "corp_secret",
-                "agent_id",
-                "bridge_url",
-                "allow_from",
-                "poll_interval_secs",
-                "encrypt_key",
-                "verification_token",
-                "robot_code",
-                "callback_token",
-                "encoding_aes_key",
-            ];
-            for key in stale {
-                obj.remove(*key);
-            }
-        }
+        apply_channel_fields(&mut root, ch_key, &req.fields, req.enabled)?;
 
         write_json5_pretty(&config_path, &root)?;
         Ok(serde_json::json!({ "status": "ok", "channel": ch_key }))
@@ -363,6 +356,93 @@ pub(super) async fn handle_channel_update(
     match result {
         Ok(v) => Json(v),
         Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() })),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ChannelConfigUpdateRequest {
+    fields: serde_json::Map<String, serde_json::Value>,
+    enabled: Option<bool>,
+    accounts: serde_json::Value,
+    #[serde(default)]
+    default_account_id: String,
+    owner_agent: Option<String>,
+    #[serde(default)]
+    account_owners: HashMap<String, String>,
+}
+
+fn apply_channel_config_update(
+    cfg: &mut Config,
+    channel: &str,
+    req: &ChannelConfigUpdateRequest,
+) -> anyhow::Result<()> {
+    if !SUPPORTED_OWNER_CHANNELS.contains(&channel) {
+        anyhow::bail!("Unsupported channel '{}'", channel);
+    }
+    let mut root = serde_json::to_value(&*cfg)?;
+    apply_channel_fields(&mut root, channel, &req.fields, req.enabled)?;
+    let channel_value = root
+        .get_mut("channels")
+        .and_then(|value| value.get_mut(channel))
+        .and_then(|value| value.as_object_mut())
+        .ok_or_else(|| anyhow::anyhow!("invalid channel config for '{}'", channel))?;
+    channel_value.insert("accounts".to_string(), req.accounts.clone());
+    channel_value.insert(
+        "defaultAccountId".to_string(),
+        if req.default_account_id.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(req.default_account_id.trim())
+        },
+    );
+
+    let mut next: Config = serde_json::from_value(root)?;
+    let default_id = req.default_account_id.trim();
+    let known_accounts = known_account_ids(&next, channel);
+    if !default_id.is_empty() && !known_accounts.iter().any(|id| id == default_id) {
+        anyhow::bail!(
+            "Default account '{}' is not defined for channel '{}'",
+            default_id,
+            channel
+        );
+    }
+
+    clear_owner_binding(&mut next, channel, None)?;
+    if let Some(owner) = req
+        .owner_agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        set_owner_binding(&mut next, channel, None, owner)?;
+    }
+    next.channel_account_owners.remove(channel);
+    for (account_id, owner) in &req.account_owners {
+        let owner = owner.trim();
+        if !owner.is_empty() {
+            set_owner_binding(&mut next, channel, Some(account_id), owner)?;
+        }
+    }
+    *cfg = next;
+    Ok(())
+}
+
+pub(super) async fn handle_channel_config_update(
+    State(state): State<GatewayState>,
+    AxumPath(channel): AxumPath<String>,
+    Json(req): Json<ChannelConfigUpdateRequest>,
+) -> impl IntoResponse {
+    let result: anyhow::Result<serde_json::Value> = async {
+        let mut cfg = load_config_or_state(&state);
+        apply_channel_config_update(&mut cfg, &channel, &req)?;
+        cfg.save(&state.paths.config_file())?;
+        Ok(serde_json::json!({ "status": "ok", "channel": channel }))
+    }
+    .await;
+    match result {
+        Ok(value) => Json(value),
+        Err(error) => Json(serde_json::json!({ "status": "error", "message": error.to_string() })),
     }
 }
 
@@ -681,5 +761,65 @@ mod tests {
         let payload = clear_owner_binding(&mut cfg, "telegram", Some("bot2")).unwrap();
         assert_eq!(cfg.resolve_channel_account_owner("telegram", "bot2"), None);
         assert_eq!(payload["accountId"], serde_json::json!("bot2"));
+    }
+
+    #[test]
+    fn test_apply_channel_config_update_changes_all_related_settings_together() {
+        let mut cfg = Config::default();
+        cfg.agents
+            .list
+            .push(blockcell_core::config::AgentProfileConfig {
+                id: "ops".to_string(),
+                enabled: true,
+                ..Default::default()
+            });
+        let request = ChannelConfigUpdateRequest {
+            fields: serde_json::Map::from_iter([
+                ("token".to_string(), serde_json::json!("secret")),
+                ("proxy".to_string(), serde_json::json!("")),
+            ]),
+            enabled: Some(true),
+            accounts: serde_json::json!({
+                "bot2": { "enabled": true, "token": "second", "allowFrom": [], "proxy": null }
+            }),
+            default_account_id: "bot2".to_string(),
+            owner_agent: Some("ops".to_string()),
+            account_owners: std::collections::HashMap::from([(
+                "bot2".to_string(),
+                "ops".to_string(),
+            )]),
+        };
+
+        apply_channel_config_update(&mut cfg, "telegram", &request).unwrap();
+
+        assert!(cfg.channels.telegram.enabled);
+        assert_eq!(cfg.channels.telegram.token, "secret");
+        assert_eq!(
+            cfg.channels.telegram.default_account_id.as_deref(),
+            Some("bot2")
+        );
+        assert!(cfg.channels.telegram.accounts.contains_key("bot2"));
+        assert_eq!(cfg.resolve_channel_owner("telegram"), Some("ops"));
+        assert_eq!(
+            cfg.resolve_channel_account_owner("telegram", "bot2"),
+            Some("ops")
+        );
+    }
+
+    #[test]
+    fn test_apply_channel_config_update_rejects_unknown_default_before_mutating() {
+        let mut cfg = Config::default();
+        let before = serde_json::to_value(&cfg).unwrap();
+        let request = ChannelConfigUpdateRequest {
+            fields: serde_json::Map::new(),
+            enabled: Some(true),
+            accounts: serde_json::json!({}),
+            default_account_id: "missing".to_string(),
+            owner_agent: None,
+            account_owners: std::collections::HashMap::new(),
+        };
+
+        assert!(apply_channel_config_update(&mut cfg, "telegram", &request).is_err());
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), before);
     }
 }

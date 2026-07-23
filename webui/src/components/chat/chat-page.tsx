@@ -348,7 +348,13 @@ export function ChatPage() {
 
     const content = text || (mediaPaths.length > 0 ? `[Attached ${mediaPaths.length} file(s)]` : '');
 
-    // Add user message to UI
+    const hasPersistedSession = !!currentSessionId && sessions.some((s) => s.id === currentSessionId);
+    const chatId = hasPersistedSession ? currentSessionId.replace(/_/g, ':') : undefined;
+
+    // Send via WebSocket
+    if (!wsManager.sendChat(content, chatId, mediaPaths, selectedAgentId)) {
+      return;
+    }
     addMessage({
       id: `user_${Date.now()}`,
       role: 'user',
@@ -356,12 +362,6 @@ export function ChatPage() {
       media: mediaPaths.length > 0 ? mediaPaths : undefined,
       timestamp: Date.now(),
     });
-
-    const hasPersistedSession = !!currentSessionId && sessions.some((s) => s.id === currentSessionId);
-    const chatId = hasPersistedSession ? currentSessionId.replace(/_/g, ':') : undefined;
-
-    // Send via WebSocket
-    wsManager.sendChat(content, chatId, mediaPaths, selectedAgentId);
     setInput('');
     setLoading(true);
   }

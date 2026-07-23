@@ -4,6 +4,7 @@ import { BlockcellLogo } from './blockcell-logo';
 import { cn } from '@/lib/utils';
 import { useI18nStore, useT, type Locale } from '@/lib/i18n';
 import { API_BASE } from '@/lib/api';
+import { setAuthToken } from '@/lib/auth';
 
 interface LoginPageProps {
   onLogin: () => void;
@@ -39,7 +40,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
       const data = await res.json();
 
       if (res.ok && data.token) {
-        localStorage.setItem('blockcell_token', data.token);
+        setAuthToken(data.token);
         onLogin();
       } else {
         setError(data.error || t('login.invalidPassword'));

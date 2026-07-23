@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { Image, Volume2, Download, Maximize2, X, FileAudio } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { mediaFileUrl, downloadFileUrl } from '@/lib/api';
+import { downloadFile } from '@/lib/api';
+import { useAuthenticatedFileUrl } from '@/lib/use-authenticated-file-url';
 import { useAgentStore } from '@/lib/store';
 
 const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'heic', 'heif', 'tiff', 'tif'];
@@ -55,23 +56,25 @@ export function extractMediaPaths(text: string): string[] {
 export function MediaAttachment({ path }: { path: string }) {
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const type = isMediaPath(path);
-  const url = mediaFileUrl(path, selectedAgentId);
-  const dlUrl = downloadFileUrl(path, selectedAgentId);
+  const url = useAuthenticatedFileUrl(path, selectedAgentId);
   const filename = path.split('/').pop() || path;
+  const onDownload = () => { void downloadFile(path, filename, selectedAgentId); };
+
+  if (!url) return null;
 
   if (type === 'image') {
-    return <ImageAttachment url={url} dlUrl={dlUrl} filename={filename} />;
+    return <ImageAttachment url={url} onDownload={onDownload} filename={filename} />;
   }
   if (type === 'audio') {
-    return <AudioAttachment url={url} dlUrl={dlUrl} filename={filename} />;
+    return <AudioAttachment url={url} onDownload={onDownload} filename={filename} />;
   }
   if (type === 'video') {
-    return <VideoAttachment url={url} dlUrl={dlUrl} filename={filename} />;
+    return <VideoAttachment url={url} onDownload={onDownload} filename={filename} />;
   }
   return null;
 }
 
-function ImageAttachment({ url, dlUrl, filename }: { url: string; dlUrl: string; filename: string }) {
+function ImageAttachment({ url, onDownload, filename }: { url: string; onDownload: () => void; filename: string }) {
   const [expanded, setExpanded] = useState(false);
   const [error, setError] = useState(false);
 
@@ -80,7 +83,7 @@ function ImageAttachment({ url, dlUrl, filename }: { url: string; dlUrl: string;
       <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/50 rounded-lg px-3 py-2">
         <Image size={14} />
         <span className="truncate">{filename}</span>
-        <a href={dlUrl} download className="ml-auto hover:text-foreground"><Download size={14} /></a>
+        <button onClick={onDownload} className="ml-auto hover:text-foreground"><Download size={14} /></button>
       </div>
     );
   }
@@ -103,9 +106,9 @@ function ImageAttachment({ url, dlUrl, filename }: { url: string; dlUrl: string;
           >
             <Maximize2 size={12} />
           </button>
-          <a href={dlUrl} download className="p-1 rounded bg-black/60 text-white hover:bg-black/80">
+          <button onClick={onDownload} className="p-1 rounded bg-black/60 text-white hover:bg-black/80">
             <Download size={12} />
-          </a>
+          </button>
         </div>
         <div className="px-2 py-1 text-[10px] text-muted-foreground truncate">{filename}</div>
       </div>
@@ -134,15 +137,15 @@ function ImageAttachment({ url, dlUrl, filename }: { url: string; dlUrl: string;
   );
 }
 
-function AudioAttachment({ url, dlUrl, filename }: { url: string; dlUrl: string; filename: string }) {
+function AudioAttachment({ url, onDownload, filename }: { url: string; onDownload: () => void; filename: string }) {
   return (
     <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-card/50 p-3 max-w-sm">
       <div className="flex items-center gap-2 text-xs">
         <FileAudio size={14} className="text-[hsl(var(--brand-green))] shrink-0" />
         <span className="truncate font-medium">{filename}</span>
-        <a href={dlUrl} download className="ml-auto text-muted-foreground hover:text-foreground">
+        <button onClick={onDownload} className="ml-auto text-muted-foreground hover:text-foreground">
           <Download size={14} />
-        </a>
+        </button>
       </div>
       <audio controls preload="metadata" className="w-full h-8 [&::-webkit-media-controls-panel]:bg-transparent">
         <source src={url} />
@@ -151,7 +154,7 @@ function AudioAttachment({ url, dlUrl, filename }: { url: string; dlUrl: string;
   );
 }
 
-function VideoAttachment({ url, dlUrl, filename }: { url: string; dlUrl: string; filename: string }) {
+function VideoAttachment({ url, onDownload, filename }: { url: string; onDownload: () => void; filename: string }) {
   return (
     <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-card/50 overflow-hidden max-w-md">
       <video controls preload="metadata" className="max-w-full max-h-[300px]">
@@ -160,9 +163,9 @@ function VideoAttachment({ url, dlUrl, filename }: { url: string; dlUrl: string;
       <div className="flex items-center gap-2 text-xs px-2 pb-2">
         <Volume2 size={14} className="text-[hsl(var(--brand-green))] shrink-0" />
         <span className="truncate">{filename}</span>
-        <a href={dlUrl} download className="ml-auto text-muted-foreground hover:text-foreground">
+        <button onClick={onDownload} className="ml-auto text-muted-foreground hover:text-foreground">
           <Download size={14} />
-        </a>
+        </button>
       </div>
     </div>
   );

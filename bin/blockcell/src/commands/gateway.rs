@@ -555,6 +555,11 @@ async fn auth_middleware(
     if path == "/v1/health" || path == "/v1/auth/login" {
         return next.run(req).await;
     }
+    // Browser WebSockets cannot set Authorization. The upgrade handler validates
+    // the token carried in the negotiated subprotocol and emits close code 4401.
+    if path == "/v1/ws" {
+        return next.run(req).await;
+    }
 
     let auth_header = req
         .headers()
@@ -566,20 +571,7 @@ async fn auth_middleware(
         _ => false,
     };
 
-    // A `?token=` query param is only honoured for endpoints the browser must
-    // reach without being able to set an Authorization header: the WebSocket
-    // upgrade and media/download links opened directly by the browser. For all
-    // other endpoints (called via fetch/XHR, which can send the header) the
-    // query token is rejected so tokens don't leak into access logs / Referer.
-    let query_token_allowed = matches!(path, "/v1/ws" | "/v1/files/download" | "/v1/files/serve");
-
-    let authorized = authorized_by_header
-        || (query_token_allowed
-            && token_from_query(&req)
-                .map(|v| secure_eq(&v, token.as_str()))
-                .unwrap_or(false));
-
-    if authorized {
+    if authorized_by_header {
         next.run(req).await
     } else {
         (
@@ -1732,6 +1724,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         .route("/v1/channels/status", get(handle_channels_status))
         .route("/v1/channels", get(handle_channels_list))
         .route("/v1/channels/:id", put(handle_channel_update))
+        .route("/v1/channels/:id/config", put(handle_channel_config_update))
         .route("/v1/channel-owners", get(handle_channel_owners_get))
         .route(
             "/v1/channel-owners/:channel",

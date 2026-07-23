@@ -1,3 +1,6 @@
+import { clearAuthToken, getAuthToken } from './auth';
+import { authenticatedFileEndpoint } from './authenticated-file';
+
 declare global {
   interface Window {
     BLOCKCELL_API_BASE?: string;
@@ -40,7 +43,7 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${API_BASE}/v1${path}`;
-  const token = localStorage.getItem('blockcell_token');
+  const token = getAuthToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options?.headers as Record<string, string>),
@@ -75,7 +78,7 @@ export async function login(password: string): Promise<{ token?: string; error?:
 }
 
 export function logout() {
-  localStorage.removeItem('blockcell_token');
+  clearAuthToken();
   window.location.reload();
 }
 
@@ -331,16 +334,33 @@ export function getFileContent(path: string, agentId?: string) {
   return request<FileContent>(`/files/content${buildQuery({ path, agent: agentId })}`);
 }
 
-export function downloadFileUrl(path: string, agentId?: string) {
-  const token = localStorage.getItem('blockcell_token');
-  const base = `${API_BASE}/v1/files/download${buildQuery({ path, agent: agentId })}`;
-  return token ? `${base}&token=${token}` : base;
+async function fetchFileBlob(path: string, agentId: string | undefined, inline: boolean): Promise<Blob> {
+  const token = getAuthToken();
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetchWithTimeout(
+    authenticatedFileEndpoint(API_BASE, path, agentId, inline),
+    { headers },
+  );
+  if (!response.ok) throw new Error(`API ${response.status}: ${await response.text()}`);
+  return response.blob();
 }
 
-export function mediaFileUrl(path: string, agentId?: string) {
-  const token = localStorage.getItem('blockcell_token');
-  const base = `${API_BASE}/v1/files/serve${buildQuery({ path, agent: agentId })}`;
-  return token ? `${base}&token=${token}` : base;
+export function getMediaFileBlob(path: string, agentId?: string) {
+  return fetchFileBlob(path, agentId, true);
+}
+
+export async function downloadFile(path: string, filename: string, agentId?: string) {
+  const blob = await fetchFileBlob(path, agentId, false);
+  const url = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+  } finally {
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
 }
 
 export function uploadFile(path: string, content: string, encoding: 'utf-8' | 'base64' = 'utf-8', agentId?: string) {
@@ -625,6 +645,20 @@ export function updateChannel(id: string, fields: Record<string, string>, enable
   return request<{ status: string; channel: string }>(`/channels/${id}`, {
     method: 'PUT',
     body: JSON.stringify({ fields, enabled }),
+  });
+}
+
+export function updateChannelConfig(id: string, data: {
+  fields: Record<string, string>;
+  enabled: boolean;
+  accounts: Record<string, any>;
+  defaultAccountId: string;
+  ownerAgent?: string;
+  accountOwners: Record<string, string>;
+}) {
+  return request<{ status: string; channel: string; message?: string }>(`/channels/${id}/config`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
   });
 }
 

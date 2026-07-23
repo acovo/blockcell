@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { getConfig, updateConfig, testProvider, reloadConfig } from '@/lib/api';
 import { useT } from '@/lib/i18n';
+import { mergeLlmConfig, normalizeProviders } from '@/lib/config-merge';
 
 // ── Provider metadata ────────────────────────────────────────────────────────
 
@@ -55,7 +56,6 @@ interface ModelEntry {
 
 export function LLMPage() {
   const t = useT();
-  const [rawConfig, setRawConfig] = useState<any>(null);
   const [providers, setProviders] = useState<Record<string, { apiKey?: string; apiBase?: string; apiType?: string; proxy?: string }>>({})
   const [modelPool, setModelPool] = useState<ModelEntry[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<string>('');
@@ -75,17 +75,7 @@ export function LLMPage() {
     setLoading(true);
     try {
       const cfg = await getConfig();
-      setRawConfig(cfg);
-      const providersNormalized = Object.fromEntries(
-        Object.entries(cfg.providers || {}).map(([k, v]) => {
-          const proxy = (v as any)?.proxy;
-          if (proxy == null || (typeof proxy === 'string' && proxy.trim().length === 0)) {
-            const { proxy: _p, ...rest } = (v as any);
-            return [k, rest];
-          }
-          return [k, v];
-        })
-      );
+      const providersNormalized = normalizeProviders(cfg.providers || {});
       setProviders(providersNormalized as any);
       const defaults = cfg.agents?.defaults || {};
       const pool = defaults.modelPool || [];
@@ -108,57 +98,24 @@ export function LLMPage() {
       
       // Select first provider
       const providerKeys = Object.keys(providersNormalized || {});
-      if (providerKeys.length > 0 && !selectedProvider) {
-        setSelectedProvider(providerKeys[0]);
-      }
+      setSelectedProvider((current) => current && providerKeys.includes(current) ? current : (providerKeys[0] || ''));
     } finally {
       setLoading(false);
     }
-  }, [selectedProvider]);
+  }, []);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
 
   const handleSave = useCallback(async () => {
     setSaving(true); setSaveStatus('idle');
     try {
-      const defaults: any = {
-        ...(rawConfig?.agents?.defaults || {}),
-        modelPool: modelPool.map(e => ({
-          model: e.model,
-          provider: e.provider,
-          weight: e.weight,
-          priority: e.priority,
-          toolCallMode: e.toolCallMode ?? 'native',
-          temperature: e.temperature,
-          maxTokens: e.maxTokens,
-          inputPrice: e.inputPrice,
-          outputPrice: e.outputPrice,
-        })),
-      };
-
-      const primaryModel = modelPool.find(e => e.model.trim());
-      if (primaryModel) {
-        defaults.model = primaryModel.model.trim();
-        defaults.provider = primaryModel.provider?.trim() || defaults.provider;
-      }
-
-      const providersNormalized = Object.fromEntries(
-        Object.entries(providers || {}).map(([k, v]) => {
-          const proxy = (v as any)?.proxy;
-          if (proxy == null || (typeof proxy === 'string' && proxy.trim().length === 0)) {
-            const { proxy: _p, ...rest } = (v as any);
-            return [k, rest];
-          }
-          return [k, v];
-        })
-      );
-
-      const newConfig = { ...rawConfig, providers: providersNormalized, agents: { ...(rawConfig?.agents || {}), defaults } };
+      const latestConfig = await getConfig();
+      const providersNormalized = normalizeProviders(providers || {});
+      const newConfig = mergeLlmConfig(latestConfig, providersNormalized, modelPool);
       const res = await updateConfig(newConfig);
       setSaveStatus(res.status === 'ok' ? 'saved' : 'error');
       setSaveMsg(res.status === 'ok' ? t('settings.proxySaved') : res.message || '');
       if (res.status === 'ok') {
-        setRawConfig(newConfig);
         setProviders(providersNormalized as any);
         try {
           const reloadRes = await reloadConfig();
@@ -177,7 +134,7 @@ export function LLMPage() {
     } finally {
       setSaving(false);
     }
-  }, [rawConfig, providers, modelPool]);
+  }, [providers, modelPool, t]);
 
   const addProvider = () => {
     const id = newProviderId.trim().toLowerCase();
@@ -252,11 +209,12 @@ export function LLMPage() {
     }
   };
 
-  // 切换provider时清空测试结果
-  if (selectedProvider !== prevSelectedProvider) {
-    setTestResult(null);
-    setPrevSelectedProvider(selectedProvider);
-  }
+  useEffect(() => {
+    if (selectedProvider !== prevSelectedProvider) {
+      setTestResult(null);
+      setPrevSelectedProvider(selectedProvider);
+    }
+  }, [selectedProvider, prevSelectedProvider]);
 
   const selectedProviderModels = modelPool.filter(m => m.provider === selectedProvider);
   const selectedProviderConfig = providers[selectedProvider];
