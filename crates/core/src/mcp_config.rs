@@ -4,6 +4,7 @@ use std::fs;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::file_store::atomic_write;
 use crate::paths::Paths;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,7 +131,7 @@ impl McpRootConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, content)?;
+        atomic_write(path, content.as_bytes())?;
         Ok(())
     }
 }

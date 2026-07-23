@@ -110,7 +110,9 @@ pub(super) async fn handle_sessions_list(
                 // automatically in the background and would otherwise flood the
                 // user's session list. Their session key is `ghost:ghost_<ts>`,
                 // i.e. a file stem whose channel segment is `ghost`.
-                if file_stem.split('_').next() == Some("ghost") {
+                if file_stem.split('_').next() == Some("ghost")
+                    || file_stem.starts_with("s~ghost~3A")
+                {
                     continue;
                 }
 
@@ -252,15 +254,20 @@ pub(super) async fn handle_session_delete(
     let session_stems = session_file_stems(&agent_paths.sessions_dir());
     let session_key =
         resolve_session_key_from_id(&session_id, session_stems.iter().map(|s| s.as_str()));
-    let path = agent_paths.session_file(&session_key);
+    let session_store = SessionStore::new(agent_paths);
     let session_id_clone = session_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
+    let result = tokio::task::spawn_blocking(move || match session_store.clear(&session_key) {
+        Ok(true) => {
             serde_json::json!({ "status": "deleted", "session_id": session_id_clone })
-        } else {
+        }
+        Ok(false) => {
             serde_json::json!({ "status": "not_found", "session_id": session_id_clone })
         }
+        Err(error) => serde_json::json!({
+            "status": "error",
+            "message": error.to_string(),
+            "session_id": session_id_clone,
+        }),
     })
     .await;
 

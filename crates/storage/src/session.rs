@@ -113,7 +113,7 @@ impl SessionStore {
     }
 
     pub fn load(&self, session_key: &str) -> Result<Vec<ChatMessage>> {
-        let path = self.paths.session_file(session_key);
+        let path = self.read_path(session_key);
 
         if !path.exists() {
             return Ok(Vec::new());
@@ -151,7 +151,7 @@ impl SessionStore {
     /// 而非 metadata 子对象内部的内容。Layer 2 时间触发轻量压缩需要 updated_at 来判断
     /// 会话是否长时间未更新。
     pub fn load_timestamps(&self, session_key: &str) -> Result<(Option<String>, Option<String>)> {
-        let path = self.paths.session_file(session_key);
+        let path = self.read_path(session_key);
 
         if !path.exists() {
             return Ok((None, None));
@@ -176,7 +176,7 @@ impl SessionStore {
     }
 
     pub fn load_metadata(&self, session_key: &str) -> Result<Value> {
-        let path = self.paths.session_file(session_key);
+        let path = self.read_path(session_key);
 
         if !path.exists() {
             return Ok(Value::Object(serde_json::Map::new()));
@@ -255,6 +255,20 @@ impl SessionStore {
         }
     }
 
+    fn read_path(&self, session_key: &str) -> std::path::PathBuf {
+        let current = self.paths.session_file(session_key);
+        if current.exists() {
+            current
+        } else {
+            let legacy = self.paths.legacy_session_file(session_key);
+            if legacy.exists() {
+                legacy
+            } else {
+                current
+            }
+        }
+    }
+
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> Result<()> {
         let path = self.paths.session_file(session_key);
 
@@ -324,20 +338,29 @@ impl SessionStore {
     pub fn clear(&self, session_key: &str) -> Result<bool> {
         let path = self.paths.session_file(session_key);
         let _lock = lock_exclusive(&path)?;
+        let legacy_path = self.paths.legacy_session_file(session_key);
 
         // 同步删除 sidecar marker 文件，避免会话清理后同 key 复用时 marker 残留
-        let marker_path = path.with_extension("dream_counted");
-        if marker_path.exists() {
-            let _ = std::fs::remove_file(&marker_path);
+        for marker_path in [
+            path.with_extension("dream_counted"),
+            legacy_path.with_extension("dream_counted"),
+        ] {
+            if marker_path.exists() {
+                let _ = std::fs::remove_file(&marker_path);
+            }
         }
 
+        let mut deleted = false;
         if path.exists() {
             std::fs::remove_file(&path)?;
             debug!(session_key = %session_key, path = %path.display(), "Session file deleted");
-            Ok(true)
-        } else {
-            Ok(false)
+            deleted = true;
         }
+        if legacy_path != path && legacy_path.exists() {
+            std::fs::remove_file(&legacy_path)?;
+            deleted = true;
+        }
+        Ok(deleted)
     }
 
     /// 原子标记会话已被 Dream 计数，使用独立 marker 文件 + create_new 实现并发安全。
@@ -467,6 +490,37 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let paths = Paths::with_base(dir.path().to_path_buf());
         (SessionStore::new(paths), dir)
+    }
+
+    #[test]
+    fn load_reads_legacy_sanitized_session_file() {
+        let (store, dir) = test_store();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let legacy_path = sessions_dir.join("ws_default_123.jsonl");
+        let message = ChatMessage::user("legacy message");
+        std::fs::write(
+            legacy_path,
+            format!("{}\n", serde_json::to_string(&message).expect("serialize")),
+        )
+        .expect("write legacy session");
+
+        let loaded = store.load("ws:default_123").expect("load legacy session");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, serde_json::json!("legacy message"));
+    }
+
+    #[test]
+    fn clear_deletes_legacy_sanitized_session_file() {
+        let (store, dir) = test_store();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let legacy_path = sessions_dir.join("ws_default_123.jsonl");
+        std::fs::write(&legacy_path, "legacy").expect("write legacy session");
+
+        assert!(store.clear("ws:default_123").expect("clear legacy"));
+        assert!(!legacy_path.exists());
     }
 
     #[test]

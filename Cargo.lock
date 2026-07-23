@@ -555,6 +555,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "dirs",
+ "fs2",
  "glob",
  "iana-time-zone",
  "json5",

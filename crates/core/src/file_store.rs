@@ -1,16 +1,12 @@
+use fs2::FileExt;
 use std::io::{Error, ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A cross-process exclusive lock backed by an atomically-created file.
-///
-/// The lock file stores `pid:unix_timestamp:token`. The random token makes
-/// releasing ownership-safe when a stale lock is replaced while an old holder
-/// is still unwinding.
+/// A cross-process exclusive lock backed by an OS advisory file lock.
 #[derive(Debug)]
 pub struct ExclusiveFileLock {
-    path: PathBuf,
-    token: String,
+    file: std::fs::File,
     held: bool,
 }
 
@@ -23,29 +19,37 @@ impl ExclusiveFileLock {
             std::fs::create_dir_all(parent)?;
         }
 
-        match Self::create(path) {
-            Ok(lock) => Ok(lock),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                let observed = std::fs::read_to_string(path).unwrap_or_default();
-                if !holder_is_alive(&observed)
-                    && std::fs::read_to_string(path).ok().as_deref() == Some(observed.as_str())
-                {
-                    match std::fs::remove_file(path) {
-                        Ok(()) => Self::create(path),
-                        Err(remove_error) if remove_error.kind() == ErrorKind::NotFound => {
-                            Self::create(path)
-                        }
-                        Err(remove_error) => Err(remove_error),
-                    }
-                } else {
-                    Err(Error::new(
-                        ErrorKind::WouldBlock,
-                        format!("file lock is already held: {}", path.display()),
-                    ))
-                }
-            }
-            Err(error) => Err(error),
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+        if let Err(error) = file.try_lock_exclusive() {
+            return if error.kind() == ErrorKind::WouldBlock {
+                Err(Error::new(
+                    ErrorKind::WouldBlock,
+                    format!("file lock is already held: {}", path.display()),
+                ))
+            } else {
+                Err(error)
+            };
         }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        file.set_len(0)?;
+        write!(
+            file,
+            "{}:{}:{}",
+            std::process::id(),
+            timestamp,
+            uuid::Uuid::new_v4()
+        )?;
+        file.sync_all()?;
+
+        Ok(Self { file, held: true })
     }
 
     pub fn acquire(path: &Path) -> std::io::Result<Self> {
@@ -66,40 +70,11 @@ impl ExclusiveFileLock {
         ))
     }
 
-    fn create(path: &Path) -> std::io::Result<Self> {
-        let token = uuid::Uuid::new_v4().to_string();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        write!(file, "{}:{}:{}", std::process::id(), timestamp, token)?;
-        file.sync_all()?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            token,
-            held: true,
-        })
-    }
-
     pub fn release(&mut self) -> std::io::Result<()> {
         if !self.held {
             return Ok(());
         }
-        let owned = std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|content| lock_token(&content).map(str::to_owned))
-            .is_some_and(|token| token == self.token);
-        if owned {
-            match std::fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
+        self.file.unlock()?;
         self.held = false;
         Ok(())
     }
@@ -109,40 +84,6 @@ impl Drop for ExclusiveFileLock {
     fn drop(&mut self) {
         let _ = self.release();
     }
-}
-
-fn lock_token(content: &str) -> Option<&str> {
-    let mut fields = content.trim().splitn(3, ':');
-    fields.next()?;
-    fields.next()?;
-    fields.next()
-}
-
-fn holder_is_alive(content: &str) -> bool {
-    let pid = content
-        .trim()
-        .split(':')
-        .next()
-        .and_then(|value| value.parse::<u32>().ok());
-    pid.is_some_and(process_is_alive)
-}
-
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
-        .unwrap_or(false)
 }
 
 /// Durably writes a complete replacement in the target directory and then
@@ -240,7 +181,9 @@ mod tests {
         );
 
         drop(first);
-        assert!(!path.exists());
+        let reacquired = ExclusiveFileLock::try_acquire(&path).expect("lock after release");
+        drop(reacquired);
+        std::fs::remove_file(path).expect("cleanup lock file");
     }
 
     #[test]
@@ -267,6 +210,22 @@ mod tests {
 
         assert!(path.exists(), "old owner must not delete replacement lock");
         std::fs::remove_file(path).expect("cleanup replacement");
+    }
+
+    #[test]
+    fn live_file_lock_cannot_be_bypassed_by_replacing_its_contents() {
+        let path = temp_path("tampered-live-lock");
+        let _first = ExclusiveFileLock::try_acquire(&path).expect("first lock");
+        std::fs::write(&path, "4294967295:1:fake-stale-token").expect("tamper contents");
+
+        let second = ExclusiveFileLock::try_acquire(&path);
+
+        assert_eq!(
+            second
+                .expect_err("live advisory lock must remain exclusive")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::session_file_stem;
+use crate::{legacy_session_file_stem, session_file_stem, stable_hash_session_key};
 
 /// Default content written to `~/.blockcell/BLOCKCELL.md` on first run.
 ///
@@ -169,8 +169,13 @@ impl Paths {
         }
         // 命名 agent 使用独立的工作空间（base/agents/<id>/workspace），
         // 不继承根级别的 workspace_override。
+        let directory_name = if is_safe_agent_directory_name(agent_id) {
+            agent_id.to_string()
+        } else {
+            format!("agent-{}", stable_hash_session_key(agent_id))
+        };
         Self {
-            base: self.base.join("agents").join(agent_id),
+            base: self.base.join("agents").join(directory_name),
             workspace_override: None,
         }
     }
@@ -193,6 +198,11 @@ impl Paths {
     pub fn session_file(&self, session_key: &str) -> PathBuf {
         let safe_key = session_file_stem(session_key);
         self.sessions_dir().join(format!("{}.jsonl", safe_key))
+    }
+
+    pub fn legacy_session_file(&self, session_key: &str) -> PathBuf {
+        self.sessions_dir()
+            .join(format!("{}.jsonl", legacy_session_file_stem(session_key)))
     }
 
     pub fn audit_dir(&self) -> PathBuf {
@@ -354,6 +364,14 @@ impl Paths {
     }
 }
 
+fn is_safe_agent_directory_name(agent_id: &str) -> bool {
+    agent_id != "."
+        && agent_id != ".."
+        && agent_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
 impl Default for Paths {
     fn default() -> Self {
         Self::new()
@@ -411,6 +429,20 @@ mod tests {
             ops_paths.audit_dir(),
             PathBuf::from("/tmp/blockcell/agents/ops/audit")
         );
+    }
+
+    #[test]
+    fn test_for_agent_keeps_unsafe_id_under_agents_dir() {
+        use std::path::Component;
+
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell"));
+        let escaped = paths.for_agent("../../outside");
+
+        assert!(escaped.base.starts_with("/tmp/blockcell/agents"));
+        assert!(!escaped
+            .base
+            .components()
+            .any(|component| component == Component::ParentDir));
     }
 
     #[test]

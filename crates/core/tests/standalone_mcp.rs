@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use blockcell_core::{Config, Paths};
+use blockcell_core::{mcp_config::McpRootConfig, Config, Paths};
 
 fn unique_temp_base(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -115,4 +115,22 @@ fn standalone_mcp_agent_permissions_inherit_and_override() {
         resolved.defaults.allowed_mcp_tools,
         vec!["github__list_issues".to_string()]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn standalone_mcp_save_atomically_replaces_the_target_inode() {
+    let base = unique_temp_base("blockcell-core-mcp-atomic");
+    fs::create_dir_all(&base).expect("create base");
+    let path = base.join("mcp.json");
+    let old_link = base.join("old-mcp.json");
+    fs::write(&path, r#"{"servers":{"old":{"command":"old"}}}"#).expect("write old");
+    fs::hard_link(&path, &old_link).expect("hard link old inode");
+
+    McpRootConfig::default().save(&path).expect("atomic save");
+
+    assert!(fs::read_to_string(&old_link)
+        .expect("read old inode")
+        .contains("old"));
+    let _ = fs::remove_dir_all(base);
 }

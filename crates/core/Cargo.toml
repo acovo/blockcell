@@ -23,6 +23,7 @@ uuid = { workspace = true }
 dirs = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
+fs2 = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

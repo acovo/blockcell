@@ -3,6 +3,8 @@ use blockcell_core::tool_policy::{
     ToolPolicyDecision, ToolPolicyRule,
 };
 use std::collections::HashMap;
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn ctx<'a>(
     tool_name: &'a str,
@@ -171,6 +173,39 @@ fn invalid_or_oversized_regex_rule_fails_safe() {
         "cli",
     ));
 
-    assert_eq!(eval.decision, ToolPolicyDecision::Allow);
+    assert_eq!(eval.decision, ToolPolicyDecision::Deny);
     assert_eq!(eval.matched_rule, None);
+}
+
+#[test]
+fn malformed_policy_file_fails_closed() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("blockcell-tool-policy-{nonce}"));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("tool_policy.yaml");
+    fs::write(&path, "rules: [not valid").expect("write malformed policy");
+
+    let policy = ToolPolicy::load(&path);
+    let eval = policy.evaluate(&ctx("exec", &serde_json::json!({}), "cli"));
+
+    assert_eq!(eval.decision, ToolPolicyDecision::Deny);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn unknown_inherited_group_fails_closed() {
+    let mut inherited = rule("strict", "*", ToolPolicyDecision::Ask);
+    inherited.inherit_from = Some("missing-group".to_string());
+    let policy = ToolPolicy::from_config(ToolPolicyConfig {
+        default_decision: ToolPolicyDecision::Allow,
+        rules: vec![inherited],
+        ..Default::default()
+    });
+
+    let eval = policy.evaluate(&ctx("exec", &serde_json::json!({}), "cli"));
+
+    assert_eq!(eval.decision, ToolPolicyDecision::Deny);
 }

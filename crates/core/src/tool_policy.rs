@@ -138,18 +138,18 @@ impl ToolPolicy {
                     warn!(
                         path = %policy_file.display(),
                         error = %e,
-                        "Failed to parse tool policy; using permissive defaults"
+                        "Failed to parse tool policy; denying all tool calls"
                     );
-                    Self::permissive()
+                    Self::fail_closed(true)
                 }
             },
             Err(e) => {
                 warn!(
                     path = %policy_file.display(),
                     error = %e,
-                    "Failed to read tool policy; using permissive defaults"
+                    "Failed to read tool policy; denying all tool calls"
                 );
-                Self::permissive()
+                Self::fail_closed(true)
             }
         }
     }
@@ -167,13 +167,25 @@ impl ToolPolicy {
         }
     }
 
+    fn fail_closed(from_file: bool) -> Self {
+        Self {
+            compiled: Vec::new(),
+            default_decision: ToolPolicyDecision::Deny,
+            simulation_mode: false,
+            from_file,
+        }
+    }
+
     fn compile(config: ToolPolicyConfig, from_file: bool) -> Self {
         let mut compiled = Vec::new();
+        let mut invalid = false;
         for rule in &config.rules {
             if let Some(group_name) = &rule.inherit_from {
                 if let Some(group_rules) = config.rule_groups.get(group_name) {
                     for group_rule in group_rules {
-                        Self::push_compiled(&mut compiled, group_rule);
+                        if Self::push_compiled(&mut compiled, group_rule).is_err() {
+                            invalid = true;
+                        }
                     }
                 } else {
                     warn!(
@@ -181,9 +193,16 @@ impl ToolPolicy {
                         group = %group_name,
                         "Tool policy inherit_from references an unknown rule group"
                     );
+                    invalid = true;
                 }
             }
-            Self::push_compiled(&mut compiled, rule);
+            if Self::push_compiled(&mut compiled, rule).is_err() {
+                invalid = true;
+            }
+        }
+
+        if invalid {
+            return Self::fail_closed(from_file);
         }
 
         Self {
@@ -194,7 +213,7 @@ impl ToolPolicy {
         }
     }
 
-    fn push_compiled(out: &mut Vec<CompiledRule>, rule: &ToolPolicyRule) {
+    fn push_compiled(out: &mut Vec<CompiledRule>, rule: &ToolPolicyRule) -> Result<(), ()> {
         let mut tool_globs = Vec::new();
         for glob in rule
             .tool
@@ -204,16 +223,19 @@ impl ToolPolicy {
         {
             match Pattern::new(glob) {
                 Ok(pattern) => tool_globs.push(pattern),
-                Err(e) => warn!(
-                    rule = %rule.name,
-                    glob,
-                    error = %e,
-                    "Invalid tool glob in policy rule"
-                ),
+                Err(e) => {
+                    warn!(
+                        rule = %rule.name,
+                        glob,
+                        error = %e,
+                        "Invalid tool glob in policy rule"
+                    );
+                    return Err(());
+                }
             }
         }
         if tool_globs.is_empty() {
-            return;
+            return Err(());
         }
 
         let command_regex = match rule
@@ -227,7 +249,7 @@ impl ToolPolicy {
                     len = regex_text.len(),
                     "Tool policy command_regex exceeds max length; skipping rule"
                 );
-                return;
+                return Err(());
             }
             Some(regex_text) => match Regex::new(regex_text) {
                 Ok(regex) => Some(regex),
@@ -238,7 +260,7 @@ impl ToolPolicy {
                         error = %e,
                         "Invalid tool policy command_regex; skipping rule"
                     );
-                    return;
+                    return Err(());
                 }
             },
             None => None,
@@ -260,7 +282,7 @@ impl ToolPolicy {
                             error = %e,
                             "Invalid tool policy path_glob; skipping rule"
                         );
-                        return;
+                        return Err(());
                     }
                 }
             }
@@ -283,6 +305,7 @@ impl ToolPolicy {
                 .and_then(|condition| condition.channel.clone()),
             description: rule.description.clone(),
         });
+        Ok(())
     }
 
     pub fn evaluate(&self, ctx: &ToolCallContext<'_>) -> PolicyEvalResult {

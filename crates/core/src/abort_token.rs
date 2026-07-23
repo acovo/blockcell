@@ -1,9 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-/// 最大链深度限制，防止无限递归
-const MAX_CHAIN_DEPTH: u32 = 16;
-
 /// Agent级别的取消信号
 /// 参考: Claude Code AbortController 链
 ///
@@ -49,31 +46,16 @@ impl AbortToken {
 
     /// 检查是否已取消
     pub fn is_cancelled(&self) -> bool {
-        self.is_cancelled_with_depth(0)
-    }
-
-    /// 带深度限制的取消检查
-    fn is_cancelled_with_depth(&self, depth: u32) -> bool {
-        if depth > MAX_CHAIN_DEPTH {
-            // 链过深，视为未取消而非静默终止操作。
-            // 深链可能表示 bug（循环引用或无限嵌套），记录警告并返回 false
-            // 让 agent 继续运行，而非错误地终止。
-            tracing::warn!(
-                depth,
-                max = MAX_CHAIN_DEPTH,
-                "Abort chain depth exceeded, treating as not cancelled (possible circular reference)"
-            );
-            return false;
+        let mut current = self;
+        loop {
+            if current.cancelled.load(Ordering::SeqCst) {
+                return true;
+            }
+            match &current.parent {
+                Some(parent) => current = parent.as_ref(),
+                None => return false,
+            }
         }
-        // 检查自身
-        if self.cancelled.load(Ordering::SeqCst) {
-            return true;
-        }
-        // 检查父级（链式传递）
-        if let Some(parent) = &self.parent {
-            return parent.is_cancelled_with_depth(depth + 1);
-        }
-        false
     }
 
     /// 检查取消状态，返回错误
@@ -144,11 +126,14 @@ impl CleanupRegistry {
 
     /// 执行所有 cleanup 函数
     pub fn run_all(&self) {
-        let mut handlers = match self.handlers.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+        let handlers: Vec<_> = {
+            let mut handlers = match self.handlers.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            handlers.drain(..).collect()
         };
-        for handler in handlers.drain(..) {
+        for handler in handlers {
             handler();
         }
     }
@@ -164,20 +149,18 @@ impl Drop for CleanupHandle {
     fn drop(&mut self) {
         // Drop 时执行 cleanup handler
         // Recover from poisoned mutex to avoid panic-during-drop (process abort)
-        let mut handlers = match self.registry.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+        let handler = {
+            let mut handlers = match self.registry.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            handlers
+                .get_mut(self.index)
+                .map(|handler| std::mem::replace(handler, Box::new(|| {})))
         };
-        if self.index < handlers.len() {
-            // 使用 mem::replace 替换为空闭包，保持索引稳定
-            // 这样其他 CleanupHandle 的 index 仍然有效
-            if let Some(handler) = handlers.get_mut(self.index) {
-                let handler = std::mem::replace(handler, Box::new(|| {}));
-                // Use catch_unwind to prevent panic-during-drop from aborting the process
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handler();
-                }));
-            }
+        if let Some(handler) = handler {
+            // Use catch_unwind to prevent panic-during-drop from aborting the process
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(handler));
         }
     }
 }
@@ -210,6 +193,19 @@ mod tests {
     }
 
     #[test]
+    fn test_abort_token_deep_chain_inherits_root_cancellation() {
+        let root = AbortToken::new();
+        let mut leaf = root.clone();
+        for _ in 0..32 {
+            leaf = leaf.child();
+        }
+
+        root.cancel();
+
+        assert!(leaf.is_cancelled());
+    }
+
+    #[test]
     fn test_abort_token_check_returns_error() {
         let token = AbortToken::new();
         assert!(token.check().is_ok());
@@ -230,6 +226,26 @@ mod tests {
 
         registry.run_all();
         assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_handler_can_register_another_handler() {
+        let registry = Arc::new(CleanupRegistry::new());
+        let registry_for_handler = registry.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = registry.register(move || {
+            let nested = registry_for_handler.register(|| {});
+            std::mem::forget(nested);
+            done_tx.send(()).expect("signal completion");
+        });
+        std::mem::forget(handle);
+
+        let registry_for_thread = registry.clone();
+        std::thread::spawn(move || registry_for_thread.run_all());
+
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_ok());
     }
 
     #[test]
