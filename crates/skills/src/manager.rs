@@ -352,7 +352,13 @@ fn skill_dir_contains_local_script(dir: &Path) -> bool {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             if skill_dir_contains_local_script(&path) {
                 return true;
             }
@@ -826,7 +832,11 @@ impl SkillManager {
     pub fn reload_skills(&mut self, paths: &Paths) -> Result<Vec<String>> {
         let before: std::collections::HashSet<String> = self.skills.keys().cloned().collect();
         Self::invalidate_prompt_snapshot(paths)?;
-        self.load_from_paths(paths)?;
+        let previous_skills = std::mem::take(&mut self.skills);
+        if let Err(error) = self.load_from_paths(paths) {
+            self.skills = previous_skills;
+            return Err(error);
+        }
         let new_skills: Vec<String> = self
             .skills
             .keys()
@@ -904,8 +914,9 @@ impl SkillManager {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+            let file_type = entry.file_type()?;
 
-            if !path.is_dir() {
+            if file_type.is_symlink() || !file_type.is_dir() {
                 continue;
             }
 
@@ -926,7 +937,19 @@ impl SkillManager {
                 continue;
             }
 
-            if let Some(skill) = self.load_skill(&path)? {
+            let skill = match self.load_skill(&path) {
+                Ok(skill) => skill,
+                Err(error) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "Failed to load skill, skipping isolated invalid entry"
+                    );
+                    continue;
+                }
+            };
+
+            if let Some(skill) = skill {
                 let skill_name = skill.name.clone();
 
                 // Workspace skills override built-in skills
@@ -1736,6 +1759,96 @@ description: Deploy docs
         let second_snapshot = fs::read_to_string(&snapshot_path).expect("read updated snapshot");
         assert!(second_snapshot.contains("rollback notes"));
         assert_ne!(first_snapshot, second_snapshot);
+    }
+
+    #[test]
+    fn test_reload_removes_deleted_skill() {
+        let base = temp_skill_dir("blockcell-skill-reload-delete");
+        let paths = Paths::with_base(base.clone());
+        let skill_dir = paths.skills_dir().join("temporary_skill");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("meta.yaml"),
+            "name: temporary_skill\ndescription: temporary\n",
+        )
+        .expect("write meta");
+        fs::write(skill_dir.join("SKILL.md"), "Temporary skill.").expect("write skill doc");
+        let mut manager = SkillManager::new();
+        manager.load_from_paths(&paths).expect("load skill");
+        assert!(manager.get("temporary_skill").is_some());
+
+        fs::remove_dir_all(&skill_dir).expect("remove skill");
+        manager.reload_skills(&paths).expect("reload skills");
+
+        assert!(manager.get("temporary_skill").is_none());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_malformed_skill_does_not_abort_directory_scan() {
+        let base = temp_skill_dir("blockcell-skill-malformed-scan");
+        let paths = Paths::with_base(base.clone());
+        let malformed = paths.skills_dir().join("a_malformed");
+        let valid = paths.skills_dir().join("z_valid");
+        fs::create_dir_all(&malformed).expect("create malformed skill");
+        fs::create_dir_all(&valid).expect("create valid skill");
+        fs::write(malformed.join("meta.yaml"), "name: [\n").expect("write malformed meta");
+        fs::write(malformed.join("SKILL.md"), "Malformed.").expect("write malformed doc");
+        fs::write(
+            valid.join("meta.yaml"),
+            "name: z_valid\ndescription: valid\n",
+        )
+        .expect("write valid meta");
+        fs::write(valid.join("SKILL.md"), "Valid skill.").expect("write valid doc");
+
+        let mut manager = SkillManager::new();
+        manager
+            .load_from_paths(&paths)
+            .expect("one malformed skill should be isolated");
+
+        assert!(manager.get("z_valid").is_some());
+        assert!(manager.get("a_malformed").is_none());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_script_detection_does_not_follow_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_skill_dir("blockcell-skill-script-symlink");
+        let outside = temp_skill_dir("blockcell-skill-script-outside");
+        fs::write(outside.join("run.sh"), "echo outside\n").expect("write outside script");
+        symlink(&outside, root.join("linked_scripts")).expect("create directory symlink");
+
+        assert!(!skill_dir_contains_local_script(&root));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_skill_scan_does_not_load_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_skill_dir("blockcell-skill-scan-symlink");
+        let paths = Paths::with_base(base.clone());
+        let outside = temp_skill_dir("blockcell-skill-scan-outside");
+        fs::write(
+            outside.join("meta.yaml"),
+            "name: outside_skill\ndescription: outside\n",
+        )
+        .expect("write outside meta");
+        fs::write(outside.join("SKILL.md"), "Outside skill.").expect("write outside doc");
+        fs::create_dir_all(paths.skills_dir()).expect("create skills root");
+        symlink(&outside, paths.skills_dir().join("linked_skill")).expect("create skill symlink");
+
+        let mut manager = SkillManager::new();
+        manager.load_from_paths(&paths).expect("scan skills");
+
+        assert!(manager.get("outside_skill").is_none());
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]

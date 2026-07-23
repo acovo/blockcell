@@ -3,7 +3,11 @@ use rhai::{Dynamic, Engine, Map, Scope};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+const DISPATCHER_MAX_OPERATIONS: u64 = 100_000;
+const DISPATCHER_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn safe_char_boundary_prefix(s: &str, max_chars: i64) -> String {
     if max_chars <= 0 {
@@ -146,6 +150,22 @@ impl SkillDispatcher {
         engine.set_max_map_size(10_000);
         engine.set_max_call_levels(64);
         engine.set_max_expr_depths(64, 64);
+        let started_at = Instant::now();
+        engine.on_progress(move |operations| {
+            if operations >= DISPATCHER_MAX_OPERATIONS {
+                return Some(Dynamic::from(format!(
+                    "Operation limit exceeded: {} operations",
+                    DISPATCHER_MAX_OPERATIONS
+                )));
+            }
+            if started_at.elapsed() >= DISPATCHER_TIMEOUT {
+                return Some(Dynamic::from(format!(
+                    "Execution timeout exceeded: {} seconds",
+                    DISPATCHER_TIMEOUT.as_secs()
+                )));
+            }
+            None
+        });
 
         // Register call_tool(name, params) -> Dynamic
         {
@@ -658,6 +678,28 @@ mod tests {
 
         assert!(result.success, "weather result: {:?}", result.output);
         assert_eq!(result.output, Value::String("Hello, world".to_string()));
+    }
+
+    #[test]
+    fn test_dispatcher_enforces_operation_budget() {
+        let dispatcher = SkillDispatcher::new();
+        let result = dispatcher
+            .execute_sync(
+                r#"
+                let total = 0;
+                for value in 0..200000 {
+                    total += value;
+                }
+                total
+                "#,
+                "",
+                HashMap::new(),
+                |_name, _params| Ok(serde_json::json!({"ok": true})),
+            )
+            .unwrap();
+
+        assert!(!result.success, "over-budget script unexpectedly succeeded");
+        assert!(result.error.is_some());
     }
 
     #[test]

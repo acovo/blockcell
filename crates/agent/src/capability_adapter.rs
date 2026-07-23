@@ -126,8 +126,8 @@ impl CapabilityRegistryOps for CapabilityRegistryAdapter {
     }
 
     async fn execute_capability(&self, id: &str, input: Value) -> Result<Value> {
-        let mut registry = self.inner.lock().await;
-        registry.execute(id, input).await
+        blockcell_skills::capability_provider::execute_registered_capability(&self.inner, id, input)
+            .await
     }
 
     async fn generate_brief(&self) -> String {

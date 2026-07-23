@@ -6,8 +6,152 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+
+const DEFAULT_CAPABILITY_TIMEOUT_SECS: u64 = 30;
+const MAX_CAPABILITY_OUTPUT_BYTES: usize = 1024 * 1024;
+
+struct BoundedProcessOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+struct BoundedRead {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_bounded<R>(mut reader: R) -> std::io::Result<BoundedRead>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut retained = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let remaining = MAX_CAPABILITY_OUTPUT_BYTES.saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..count.min(remaining)]);
+        if count > remaining {
+            truncated = true;
+        }
+    }
+    Ok(BoundedRead {
+        bytes: retained,
+        truncated,
+    })
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut tokio::process::Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut tokio::process::Command) {}
+
+async fn terminate_process_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: the child is started in its own process group above.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+async fn run_bounded_process(
+    command: &mut tokio::process::Command,
+    input: Option<&[u8]>,
+    timeout_secs: u64,
+) -> Result<BoundedProcessOutput> {
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    configure_process_group(command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| Error::Tool(format!("Failed to spawn capability process: {}", e)))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Tool("Capability stdout pipe was not created".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::Tool("Capability stderr pipe was not created".to_string()))?;
+    let stdout_task = tokio::spawn(read_bounded(stdout));
+    let stderr_task = tokio::spawn(read_bounded(stderr));
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+
+    if let Some(input) = input {
+        if let Some(mut stdin) = child.stdin.take() {
+            match tokio::time::timeout(timeout, stdin.write_all(input)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    terminate_process_tree(&mut child).await;
+                    return Err(Error::Tool(format!(
+                        "Failed to write capability input: {}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    terminate_process_tree(&mut child).await;
+                    return Err(Error::Tool(format!(
+                        "Capability process timed out after {} seconds",
+                        timeout_secs.max(1)
+                    )));
+                }
+            }
+        }
+    }
+    drop(child.stdin.take());
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(result) => {
+            result.map_err(|e| Error::Tool(format!("Capability process wait failed: {}", e)))?
+        }
+        Err(_) => {
+            terminate_process_tree(&mut child).await;
+            return Err(Error::Tool(format!(
+                "Capability process timed out after {} seconds",
+                timeout_secs.max(1)
+            )));
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .map_err(|e| Error::Tool(format!("Capability stdout reader failed: {}", e)))??;
+    let stderr = stderr_task
+        .await
+        .map_err(|e| Error::Tool(format!("Capability stderr reader failed: {}", e)))??;
+    if stdout.truncated || stderr.truncated {
+        return Err(Error::Tool(format!(
+            "Capability process output limit exceeded: {} bytes per stream",
+            MAX_CAPABILITY_OUTPUT_BYTES
+        )));
+    }
+
+    Ok(BoundedProcessOutput {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
 
 /// 动态能力的执行接口
 ///
@@ -30,7 +174,6 @@ pub struct ProcessProvider {
     command: String,
     args: Vec<String>,
     working_dir: Option<PathBuf>,
-    #[allow(dead_code)]
     timeout_secs: u64,
 }
 
@@ -41,7 +184,7 @@ impl ProcessProvider {
             command: command.to_string(),
             args: Vec::new(),
             working_dir: None,
-            timeout_secs: 30,
+            timeout_secs: DEFAULT_CAPABILITY_TIMEOUT_SECS,
         }
     }
 
@@ -54,44 +197,29 @@ impl ProcessProvider {
         self.working_dir = Some(dir);
         self
     }
+
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs.max(1);
+        self
+    }
 }
 
 #[async_trait::async_trait]
 impl CapabilityExecutor for ProcessProvider {
     async fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value> {
-        use std::process::Stdio;
         use tokio::process::Command;
 
         let input_str = serde_json::to_string(&input)?;
 
         let mut cmd = Command::new(&self.command);
-        cmd.args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.args(&self.args);
 
         if let Some(ref dir) = self.working_dir {
             cmd.current_dir(dir);
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            Error::Tool(format!("Failed to spawn process '{}': {}", self.command, e))
-        })?;
-
-        // Write input to stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin
-                .write_all(input_str.as_bytes())
-                .await
-                .map_err(|e| Error::Tool(format!("Failed to write to process stdin: {}", e)))?;
-            drop(stdin);
-        }
-
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| Error::Tool(format!("Process execution failed: {}", e)))?;
+        let output =
+            run_bounded_process(&mut cmd, Some(input_str.as_bytes()), self.timeout_secs).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -125,6 +253,7 @@ pub struct ScriptProvider {
     capability_id: String,
     script_path: PathBuf,
     interpreter: String,
+    timeout_secs: u64,
 }
 
 impl ScriptProvider {
@@ -141,27 +270,31 @@ impl ScriptProvider {
             capability_id: capability_id.to_string(),
             script_path,
             interpreter,
+            timeout_secs: DEFAULT_CAPABILITY_TIMEOUT_SECS,
         }
+    }
+
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs.max(1);
+        self
     }
 }
 
 #[async_trait::async_trait]
 impl CapabilityExecutor for ScriptProvider {
     async fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value> {
-        use std::process::Stdio;
         use tokio::process::Command;
 
         let input_str = serde_json::to_string(&input)?;
 
-        let output = Command::new(&self.interpreter)
-            .arg(self.script_path.to_str().unwrap_or(""))
-            .env("CAPABILITY_INPUT", &input_str)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| Error::Tool(format!("Script execution failed: {}", e)))?;
+        let mut command = Command::new(&self.interpreter);
+        command.arg(&self.script_path);
+        if input_str.len() <= 32 * 1024 {
+            command.env("CAPABILITY_INPUT", &input_str);
+        }
+        let output =
+            run_bounded_process(&mut command, Some(input_str.as_bytes()), self.timeout_secs)
+                .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -291,6 +424,9 @@ impl CapabilityRegistry {
             // Built-in capabilities skip canary
             self.lifecycles
                 .insert(id.clone(), CapabilityLifecycle::Active);
+            if let Some(desc) = self.descriptors.get_mut(&id) {
+                desc.status = CapabilityStatus::Active;
+            }
         } else {
             // Evolved capabilities enter canary (Observing) stage
             self.lifecycles
@@ -334,38 +470,31 @@ impl CapabilityRegistry {
         Ok(())
     }
 
-    /// 执行一个能力
-    ///
-    /// If the capability is in canary stage, execution results are tracked.
-    /// After CANARY_MIN_CALLS with error rate < CANARY_MAX_ERROR_RATE, it is promoted.
-    /// If error rate exceeds threshold, the capability is marked unavailable.
-    pub async fn execute(
-        &mut self,
-        id: &str,
-        input: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let executor = self
-            .executors
+    pub fn prepare_execution(&self, id: &str) -> Result<Arc<dyn CapabilityExecutor>> {
+        let descriptor = self
+            .descriptors
             .get(id)
-            .ok_or_else(|| Error::NotFound(format!("No executor for capability '{}'", id)))?
-            .clone();
+            .ok_or_else(|| Error::NotFound(format!("Capability '{}' not registered", id)))?;
+        if !descriptor.is_available() {
+            return Err(Error::Tool(format!(
+                "Capability '{}' is not executable while status is {:?}",
+                id, descriptor.status
+            )));
+        }
+        self.executors
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("No executor for capability '{}'", id)))
+    }
 
-        debug!(capability_id = %id, "🔌 [能力] 执行: {}", id);
-        let result = executor.execute(input).await;
-
-        // Track canary results — collect decision first to avoid borrow conflicts
+    pub fn record_execution_result(&mut self, id: &str, is_error: bool) {
         let canary_action = if let Some(tracker) = self.canary_trackers.get_mut(id) {
-            tracker.record(result.is_err());
+            tracker.record(is_error);
             if tracker.total_calls >= CANARY_MIN_CALLS {
                 let rate = tracker.error_rate();
-                let calls = tracker.total_calls;
-                if rate <= CANARY_MAX_ERROR_RATE {
-                    Some((true, calls, rate)) // promote
-                } else {
-                    Some((false, calls, rate)) // fail
-                }
+                Some((rate <= CANARY_MAX_ERROR_RATE, tracker.total_calls, rate))
             } else {
-                None // not enough calls yet
+                None
             }
         } else {
             None
@@ -374,7 +503,6 @@ impl CapabilityRegistry {
         if let Some((passed, calls, rate)) = canary_action {
             self.canary_trackers.remove(id);
             if passed {
-                // Promote: Observing → Active
                 self.lifecycles
                     .insert(id.to_string(), CapabilityLifecycle::Active);
                 if let Some(desc) = self.descriptors.get_mut(id) {
@@ -383,14 +511,14 @@ impl CapabilityRegistry {
                 }
                 info!(
                     capability_id = %id,
-                    calls = calls,
+                    calls,
                     error_rate = rate,
                     "🔌 [能力] ✅ 灰度验证通过，已提升为 Active: {}", id
                 );
             } else {
                 info!(
                     capability_id = %id,
-                    calls = calls,
+                    calls,
                     error_rate = rate,
                     "🔌 [能力] ❌ 灰度验证失败，标记为不可用: {}", id
                 );
@@ -406,6 +534,24 @@ impl CapabilityRegistry {
                 );
             }
         }
+    }
+
+    /// 执行一个能力
+    ///
+    /// If the capability is in canary stage, execution results are tracked.
+    /// After CANARY_MIN_CALLS with error rate < CANARY_MAX_ERROR_RATE, it is promoted.
+    /// If error rate exceeds threshold, the capability is marked unavailable.
+    pub async fn execute(
+        &mut self,
+        id: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let executor = self.prepare_execution(id)?;
+
+        debug!(capability_id = %id, "🔌 [能力] 执行: {}", id);
+        let result = executor.execute(input).await;
+
+        self.record_execution_result(id, result.is_err());
 
         result
     }
@@ -707,6 +853,26 @@ pub struct RegistryStats {
 /// 线程安全的能力注册表句柄
 pub type CapabilityRegistryHandle = Arc<Mutex<CapabilityRegistry>>;
 
+pub async fn execute_registered_capability(
+    registry: &CapabilityRegistryHandle,
+    id: &str,
+    input: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let executor = {
+        let registry = registry.lock().await;
+        registry.prepare_execution(id)?
+    };
+
+    debug!(capability_id = %id, "🔌 [能力] 执行: {}", id);
+    let result = executor.execute(input).await;
+
+    {
+        let mut registry = registry.lock().await;
+        registry.record_execution_result(id, result.is_err());
+    }
+    result
+}
+
 /// 创建一个线程安全的注册表句柄
 pub fn new_registry_handle(registry_dir: PathBuf) -> CapabilityRegistryHandle {
     Arc::new(Mutex::new(CapabilityRegistry::new(registry_dir)))
@@ -715,7 +881,12 @@ pub fn new_registry_handle(registry_dir: PathBuf) -> CapabilityRegistryHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     struct MockExecutor;
+
+    struct SlowExecutor {
+        delay: Duration,
+    }
 
     #[async_trait::async_trait]
     impl CapabilityExecutor for MockExecutor {
@@ -728,6 +899,75 @@ mod tests {
         async fn shutdown(&self) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[async_trait::async_trait]
+    impl CapabilityExecutor for SlowExecutor {
+        async fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value> {
+            tokio::time::sleep(self.delay).await;
+            Ok(input)
+        }
+        async fn health_check(&self) -> Result<bool> {
+            Ok(true)
+        }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_process_provider_times_out() {
+        let provider = ProcessProvider::new("test.timeout", "sh")
+            .with_args(vec!["-c".to_string(), "sleep 5".to_string()])
+            .with_timeout_secs(1);
+        let started = Instant::now();
+
+        let error = provider
+            .execute(serde_json::json!({}))
+            .await
+            .expect_err("process should time out");
+
+        assert!(format!("{}", error).contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_process_provider_rejects_oversized_output() {
+        let provider = ProcessProvider::new("test.output_limit", "sh").with_args(vec![
+            "-c".to_string(),
+            "head -c 1100000 /dev/zero".to_string(),
+        ]);
+
+        let error = provider
+            .execute(serde_json::json!({}))
+            .await
+            .expect_err("oversized output must be rejected");
+
+        assert!(format!("{}", error).contains("output limit"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_script_provider_times_out() {
+        let script_path = std::env::temp_dir().join(format!(
+            "blockcell-script-timeout-{}.sh",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&script_path, "sleep 5\nprintf '{\"ok\":true}'\n").unwrap();
+        let provider =
+            ScriptProvider::new("test.timeout", script_path.clone()).with_timeout_secs(1);
+        let started = Instant::now();
+
+        let error = provider
+            .execute(serde_json::json!({}))
+            .await
+            .expect_err("script should time out");
+
+        let _ = std::fs::remove_file(script_path);
+        assert!(format!("{}", error).contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
@@ -769,6 +1009,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["echo"]["msg"], "hello");
+    }
+
+    #[tokio::test]
+    async fn test_unavailable_capability_is_not_executable() {
+        let dir = std::env::temp_dir().join("test_cap_registry_unavailable");
+        let mut registry = CapabilityRegistry::new(dir);
+        let cap = CapabilityDescriptor::new(
+            "test.disabled",
+            "Disabled",
+            "Disabled capability",
+            CapabilityType::Internal,
+            ProviderKind::BuiltIn,
+        );
+        registry.register_with_executor(cap, Arc::new(MockExecutor));
+        registry.set_status(
+            "test.disabled",
+            CapabilityStatus::Unavailable {
+                reason: "disabled by canary".to_string(),
+            },
+        );
+
+        let error = registry
+            .execute("test.disabled", serde_json::json!({}))
+            .await
+            .expect_err("unavailable capability must be blocked");
+
+        assert!(format!("{}", error).contains("not executable"));
+    }
+
+    #[tokio::test]
+    async fn test_shared_execution_does_not_hold_registry_lock() {
+        let handle = new_registry_handle(std::env::temp_dir().join("test_cap_registry_lock"));
+        {
+            let mut registry = handle.lock().await;
+            let cap = CapabilityDescriptor::new(
+                "test.slow",
+                "Slow",
+                "Slow capability",
+                CapabilityType::Internal,
+                ProviderKind::BuiltIn,
+            );
+            registry.register_with_executor(
+                cap,
+                Arc::new(SlowExecutor {
+                    delay: Duration::from_millis(500),
+                }),
+            );
+        }
+
+        let execution_handle = handle.clone();
+        let execution = tokio::spawn(async move {
+            execute_registered_capability(&execution_handle, "test.slow", serde_json::json!({}))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stats_available = tokio::time::timeout(Duration::from_millis(200), async {
+            handle.lock().await.stats()
+        })
+        .await;
+        execution.await.unwrap().unwrap();
+
+        assert!(
+            stats_available.is_ok(),
+            "registry lock was held across execute"
+        );
     }
 
     #[tokio::test]

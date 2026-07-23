@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+const MAX_IMPORT_ENTRIES: usize = 1024;
+const MAX_IMPORT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_IMPORT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
 /// 技能版本信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillVersion {
@@ -533,13 +537,26 @@ impl VersionManager {
     }
 
     fn copy_path_recursive(src: &Path, dst: &Path) -> Result<()> {
-        if src.is_dir() {
+        let metadata = std::fs::symlink_metadata(src)?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Skill(format!(
+                "Refusing to copy symbolic link: {}",
+                src.display()
+            )));
+        }
+        if metadata.is_dir() {
             std::fs::create_dir_all(dst)?;
             for entry in std::fs::read_dir(src)? {
                 let entry = entry?;
                 Self::copy_path_recursive(&entry.path(), &dst.join(entry.file_name()))?;
             }
             return Ok(());
+        }
+        if !metadata.is_file() {
+            return Err(Error::Skill(format!(
+                "Refusing to copy special file: {}",
+                src.display()
+            )));
         }
 
         if let Some(parent) = dst.parent() {
@@ -708,6 +725,21 @@ impl VersionManager {
 
     /// 导入版本
     pub fn import_version(&self, skill_name: &str, archive_path: &Path) -> Result<SkillVersion> {
+        if Path::new(skill_name).components().count() != 1
+            || matches!(
+                Path::new(skill_name).components().next(),
+                Some(std::path::Component::ParentDir)
+                    | Some(std::path::Component::CurDir)
+                    | Some(std::path::Component::RootDir)
+                    | Some(std::path::Component::Prefix(_))
+                    | None
+            )
+        {
+            return Err(Error::Skill(format!(
+                "Invalid skill name for import: {}",
+                skill_name
+            )));
+        }
         let file = std::fs::File::open(archive_path)?;
         let dec = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(dec);
@@ -720,7 +752,71 @@ impl VersionManager {
         let temp_dir =
             std::env::temp_dir().join(format!("skill_import_{}_{}", std::process::id(), now_ns));
         std::fs::create_dir_all(&temp_dir)?;
-        archive.unpack(&temp_dir)?;
+        let extraction_result: Result<()> = (|| {
+            let mut entry_count = 0_usize;
+            let mut total_bytes = 0_u64;
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                entry_count += 1;
+                if entry_count > MAX_IMPORT_ENTRIES {
+                    return Err(Error::Skill(format!(
+                        "Skill archive entry limit exceeded: {}",
+                        MAX_IMPORT_ENTRIES
+                    )));
+                }
+
+                let path = entry.path()?.into_owned();
+                let mut components = path.components();
+                let inside_skill_root = matches!(
+                    components.next(),
+                    Some(std::path::Component::Normal(component)) if component == skill_name
+                ) && components
+                    .all(|component| matches!(component, std::path::Component::Normal(_)));
+                if !inside_skill_root {
+                    return Err(Error::Skill(format!(
+                        "Skill archive entry is outside '{}' root: {}",
+                        skill_name,
+                        path.display()
+                    )));
+                }
+
+                let entry_type = entry.header().entry_type();
+                if !entry_type.is_file() && !entry_type.is_dir() {
+                    return Err(Error::Skill(format!(
+                        "Skill archive links and special files are not allowed: {}",
+                        path.display()
+                    )));
+                }
+                let size = entry.header().size()?;
+                if size > MAX_IMPORT_FILE_BYTES {
+                    return Err(Error::Skill(format!(
+                        "Skill archive file exceeds {} byte limit: {}",
+                        MAX_IMPORT_FILE_BYTES,
+                        path.display()
+                    )));
+                }
+                total_bytes = total_bytes
+                    .checked_add(size)
+                    .ok_or_else(|| Error::Skill("Skill archive total size overflow".to_string()))?;
+                if total_bytes > MAX_IMPORT_TOTAL_BYTES {
+                    return Err(Error::Skill(format!(
+                        "Skill archive exceeds {} byte total limit",
+                        MAX_IMPORT_TOTAL_BYTES
+                    )));
+                }
+                if !entry.unpack_in(&temp_dir)? {
+                    return Err(Error::Skill(format!(
+                        "Skill archive entry escaped extraction directory: {}",
+                        path.display()
+                    )));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = extraction_result {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(error);
+        }
 
         // 读取版本元数据
         let version_meta_path = temp_dir.join(skill_name).join("version.json");
@@ -771,6 +867,7 @@ impl VersionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -788,6 +885,28 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("create temp skills dir");
         root
+    }
+
+    fn append_archive_file<W: Write>(tar: &mut tar::Builder<W>, path: &str, contents: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, path, contents).unwrap();
+    }
+
+    fn version_json() -> Vec<u8> {
+        serde_json::to_vec(&SkillVersion {
+            version: "v1".to_string(),
+            hash: "test".to_string(),
+            created_at: 0,
+            created_by: VersionSource::Manual,
+            changelog: None,
+            parent_version: None,
+            layout: Some(SkillLayout::PromptTool),
+            source_path: Some("SKILL.md".to_string()),
+        })
+        .unwrap()
     }
 
     #[test]
@@ -923,6 +1042,82 @@ mod tests {
             "#!/bin/sh\necho run\n"
         );
 
+        let _ = std::fs::remove_dir_all(skills_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_import_version_rejects_symlink_entries() {
+        let skills_dir = temp_skills_dir("import_symlink");
+        let skill_name = "symlink_skill";
+        let archive_path = skills_dir.join("symlink.tar.gz");
+        let file = std::fs::File::create(&archive_path).expect("create archive");
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        append_archive_file(
+            &mut tar,
+            &format!("{}/version.json", skill_name),
+            &version_json(),
+        );
+        append_archive_file(
+            &mut tar,
+            &format!("{}/SKILL.md", skill_name),
+            b"# symlink skill\n",
+        );
+        append_archive_file(&mut tar, "outside-secret.txt", b"secret-data");
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name("../outside-secret.txt").unwrap();
+        header.set_cksum();
+        tar.append_data(
+            &mut header,
+            format!("{}/leak.txt", skill_name),
+            std::io::empty(),
+        )
+        .unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+
+        let error = VersionManager::new(skills_dir.clone())
+            .import_version(skill_name, &archive_path)
+            .expect_err("symlink archive must be rejected");
+
+        assert!(format!("{}", error).contains("link"));
+        assert!(!skills_dir
+            .join(skill_name)
+            .join("versions/v1/leak.txt")
+            .exists());
+        let _ = std::fs::remove_dir_all(skills_dir);
+    }
+
+    #[test]
+    fn test_import_version_rejects_too_many_entries() {
+        let skills_dir = temp_skills_dir("import_entry_limit");
+        let skill_name = "large_skill";
+        let archive_path = skills_dir.join("large.tar.gz");
+        let file = std::fs::File::create(&archive_path).expect("create archive");
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(encoder);
+        append_archive_file(
+            &mut tar,
+            &format!("{}/version.json", skill_name),
+            &version_json(),
+        );
+        for index in 0..1025 {
+            append_archive_file(
+                &mut tar,
+                &format!("{}/assets/{}.txt", skill_name, index),
+                b"x",
+            );
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+
+        let error = VersionManager::new(skills_dir.clone())
+            .import_version(skill_name, &archive_path)
+            .expect_err("oversized archive must be rejected");
+
+        assert!(format!("{}", error).contains("entry limit"));
         let _ = std::fs::remove_dir_all(skills_dir);
     }
 
