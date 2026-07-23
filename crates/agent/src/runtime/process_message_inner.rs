@@ -392,6 +392,28 @@ impl AgentRuntime {
         // Now add user message to history for session persistence
         history.push(ChatMessage::user(&msg.content));
 
+        let runtime_task_id = msg
+            .metadata
+            .get("runtime_task_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let mut checkpoint_turn = 0_u32;
+        if let Some(task_id) = runtime_task_id.as_deref() {
+            let checkpoint = crate::checkpoint::TaskCheckpoint::new_for_origin(
+                task_id,
+                history.clone(),
+                checkpoint_turn,
+                &msg.channel,
+                &msg.chat_id,
+                &persist_session_key,
+            );
+            if let Err(e) =
+                crate::checkpoint::CheckpointManager::new(&self.paths.workspace()).save(&checkpoint)
+            {
+                warn!(task_id = %task_id, error = %e, "Failed to save initial task checkpoint");
+            }
+        }
+
         // Layer 4: Initialize memory system if needed
         // 使用 persist_session_key（非 session_key）：cron delivery/转发场景下
         // Session Memory 文件、pending marker、.session_memory_state.json
@@ -1142,6 +1164,24 @@ impl AgentRuntime {
                     history.push(tool_msg);
                 }
 
+                checkpoint_turn = checkpoint_turn.saturating_add(1);
+                if let Some(task_id) = runtime_task_id.as_deref() {
+                    let checkpoint = crate::checkpoint::TaskCheckpoint::new_for_origin(
+                        task_id,
+                        history.clone(),
+                        checkpoint_turn,
+                        &msg.channel,
+                        &msg.chat_id,
+                        &persist_session_key,
+                    );
+                    if let Err(e) =
+                        crate::checkpoint::CheckpointManager::new(&self.paths.workspace())
+                            .save(&checkpoint)
+                    {
+                        warn!(task_id = %task_id, error = %e, "Failed to save task checkpoint after tool round");
+                    }
+                }
+
                 if wants_forced_answer && !over_iteration {
                     if !web_search_thin_results.is_empty() {
                         // Thin results: guide LLM to fetch actual page content instead of giving up
@@ -1317,7 +1357,7 @@ impl AgentRuntime {
         {
             let running_tasks = self
                 .task_manager
-                .list_tasks(Some(&TaskStatus::Running))
+                .list_tasks_for_origin(&msg.channel, &msg.chat_id, Some(&TaskStatus::Running))
                 .await;
             let typed_running: Vec<_> = running_tasks
                 .iter()
@@ -1369,7 +1409,7 @@ impl AgentRuntime {
                 // 收集已完成的结果，做一次汇总LLM调用
                 let completed_tasks = self
                     .task_manager
-                    .list_tasks(Some(&TaskStatus::Completed))
+                    .list_tasks_for_origin(&msg.channel, &msg.chat_id, Some(&TaskStatus::Completed))
                     .await;
                 let uninject_completed: Vec<_> = completed_tasks
                     .iter()

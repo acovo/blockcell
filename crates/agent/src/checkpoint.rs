@@ -7,8 +7,24 @@ use blockcell_core::types::ChatMessage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tracing;
+
+const CHECKPOINT_LOCK_STRIPES: usize = 64;
+static CHECKPOINT_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+
+fn checkpoint_lock(path: &Path) -> &'static Mutex<()> {
+    let locks = CHECKPOINT_LOCKS.get_or_init(|| {
+        (0..CHECKPOINT_LOCK_STRIPES)
+            .map(|_| Mutex::new(()))
+            .collect()
+    });
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    &locks[hasher.finish() as usize % CHECKPOINT_LOCK_STRIPES]
+}
 
 /// 任务断点信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +39,44 @@ pub struct TaskCheckpoint {
     pub created_at: DateTime<Utc>,
     /// 是否已完成（完成后不再需要恢复）
     pub completed: bool,
+    /// Origin channel that owns this checkpoint.
+    #[serde(default)]
+    pub origin_channel: String,
+    /// Origin chat that owns this checkpoint.
+    #[serde(default)]
+    pub origin_chat_id: String,
+    /// Exact session key whose history is stored in this checkpoint.
+    #[serde(default)]
+    pub session_key: String,
+}
+
+impl TaskCheckpoint {
+    pub fn new_for_origin(
+        task_id: impl Into<String>,
+        messages: Vec<ChatMessage>,
+        turn: u32,
+        origin_channel: impl Into<String>,
+        origin_chat_id: impl Into<String>,
+        session_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            task_id: task_id.into(),
+            messages,
+            turn,
+            created_at: Utc::now(),
+            completed: false,
+            origin_channel: origin_channel.into(),
+            origin_chat_id: origin_chat_id.into(),
+            session_key: session_key.into(),
+        }
+    }
+
+    pub fn belongs_to_origin(&self, channel: &str, chat_id: &str) -> bool {
+        !self.origin_channel.is_empty()
+            && !self.origin_chat_id.is_empty()
+            && self.origin_channel == channel
+            && self.origin_chat_id == chat_id
+    }
 }
 
 /// Checkpoint 管理器
@@ -68,15 +122,25 @@ impl CheckpointManager {
         let file_path = self
             .checkpoint_dir
             .join(format!("{}.json", checkpoint.task_id));
-        let tmp_path = self
-            .checkpoint_dir
-            .join(format!("{}.json.tmp", checkpoint.task_id));
+        let file_lock = checkpoint_lock(&file_path);
+        let _guard = file_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(existing) = Self::load_file(&file_path)? {
+            if existing.completed && !checkpoint.completed {
+                return Ok(());
+            }
+            if existing.turn > checkpoint.turn {
+                return Ok(());
+            }
+        }
+
         let json = serde_json::to_string_pretty(checkpoint)
             .map_err(|e| format!("序列化 checkpoint 失败: {}", e))?;
 
-        // 原子写入：先写临时文件，再 rename
-        fs::write(&tmp_path, &json).map_err(|e| format!("写入临时文件失败: {}", e))?;
-        fs::rename(&tmp_path, &file_path).map_err(|e| format!("重命名临时文件失败: {}", e))?;
+        crate::fs_util::atomic_write(&file_path, json.as_bytes())
+            .map_err(|e| format!("原子写入 checkpoint 失败 ({}): {}", file_path.display(), e))?;
 
         tracing::debug!(
             task_id = %checkpoint.task_id,
@@ -93,6 +157,14 @@ impl CheckpointManager {
         Self::validate_task_id(task_id)?;
         let file_path = self.checkpoint_dir.join(format!("{}.json", task_id));
 
+        let file_lock = checkpoint_lock(&file_path);
+        let _guard = file_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::load_file(&file_path)
+    }
+
+    fn load_file(file_path: &Path) -> Result<Option<TaskCheckpoint>, String> {
         if !file_path.exists() {
             return Ok(None);
         }
@@ -104,6 +176,17 @@ impl CheckpointManager {
             serde_json::from_str(&json).map_err(|e| format!("解析 checkpoint 文件失败: {}", e))?;
 
         Ok(Some(checkpoint))
+    }
+
+    pub fn load_for_origin(
+        &self,
+        task_id: &str,
+        channel: &str,
+        chat_id: &str,
+    ) -> Result<Option<TaskCheckpoint>, String> {
+        Ok(self
+            .load(task_id)?
+            .filter(|checkpoint| checkpoint.belongs_to_origin(channel, chat_id)))
     }
 
     /// 查找所有未完成的 checkpoint（可恢复的任务）
@@ -158,12 +241,28 @@ impl CheckpointManager {
         result
     }
 
+    pub fn find_unfinished_for_origin(&self, channel: &str, chat_id: &str) -> Vec<TaskCheckpoint> {
+        self.find_unfinished()
+            .into_iter()
+            .filter(|checkpoint| checkpoint.belongs_to_origin(channel, chat_id))
+            .collect()
+    }
+
     /// 标记 checkpoint 为已完成
     pub fn mark_completed(&self, task_id: &str) -> Result<(), String> {
         Self::validate_task_id(task_id)?;
-        if let Some(mut checkpoint) = self.load(task_id)? {
+        let file_path = self.checkpoint_dir.join(format!("{}.json", task_id));
+        let file_lock = checkpoint_lock(&file_path);
+        let _guard = file_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(mut checkpoint) = Self::load_file(&file_path)? {
             checkpoint.completed = true;
-            self.save(&checkpoint)?;
+            let json = serde_json::to_string_pretty(&checkpoint)
+                .map_err(|e| format!("序列化 checkpoint 失败: {}", e))?;
+            crate::fs_util::atomic_write(&file_path, json.as_bytes()).map_err(|e| {
+                format!("原子写入 checkpoint 失败 ({}): {}", file_path.display(), e)
+            })?;
         }
         Ok(())
     }
@@ -244,6 +343,9 @@ mod tests {
             turn: 2,
             created_at: Utc::now(),
             completed: false,
+            origin_channel: String::new(),
+            origin_chat_id: String::new(),
+            session_key: String::new(),
         };
 
         manager.save(&checkpoint).unwrap();
@@ -267,6 +369,9 @@ mod tests {
             turn: 1,
             created_at: Utc::now(),
             completed: false,
+            origin_channel: String::new(),
+            origin_chat_id: String::new(),
+            session_key: String::new(),
         };
         let cp2 = TaskCheckpoint {
             task_id: "task-2".to_string(),
@@ -274,6 +379,9 @@ mod tests {
             turn: 1,
             created_at: Utc::now(),
             completed: true,
+            origin_channel: String::new(),
+            origin_chat_id: String::new(),
+            session_key: String::new(),
         };
 
         manager.save(&cp1).unwrap();
@@ -297,6 +405,9 @@ mod tests {
                 turn: i,
                 created_at: base_time + chrono::Duration::seconds(i as i64),
                 completed: false,
+                origin_channel: String::new(),
+                origin_chat_id: String::new(),
+                session_key: String::new(),
             };
             manager.save(&checkpoint).unwrap();
         }
@@ -318,6 +429,9 @@ mod tests {
             turn: 0,
             created_at: Utc::now(),
             completed: false,
+            origin_channel: String::new(),
+            origin_chat_id: String::new(),
+            session_key: String::new(),
         };
 
         manager.save(&checkpoint).unwrap();
@@ -342,6 +456,9 @@ mod tests {
             turn: 0,
             created_at: Utc::now(),
             completed: true,
+            origin_channel: String::new(),
+            origin_chat_id: String::new(),
+            session_key: String::new(),
         };
         let cp2 = TaskCheckpoint {
             task_id: "active-1".to_string(),
@@ -349,6 +466,9 @@ mod tests {
             turn: 0,
             created_at: Utc::now(),
             completed: false,
+            origin_channel: String::new(),
+            origin_chat_id: String::new(),
+            session_key: String::new(),
         };
 
         manager.save(&cp1).unwrap();
@@ -389,6 +509,9 @@ mod tests {
             turn: 1,
             created_at: Utc::now(),
             completed: false,
+            origin_channel: String::new(),
+            origin_chat_id: String::new(),
+            session_key: String::new(),
         };
 
         manager.save(&checkpoint).unwrap();
@@ -402,5 +525,84 @@ mod tests {
         // 正式文件应存在
         let loaded = manager.load("atomic-test").unwrap().unwrap();
         assert_eq!(loaded.task_id, "atomic-test");
+    }
+
+    #[test]
+    fn test_checkpoint_origin_scope_rejects_foreign_session() {
+        let dir = TempDir::new().unwrap();
+        let manager = CheckpointManager::new(dir.path());
+        let checkpoint = TaskCheckpoint::new_for_origin(
+            "task-owned",
+            vec![make_message("user", "secret")],
+            1,
+            "ws",
+            "chat-a",
+            "ws:chat-a",
+        );
+        manager.save(&checkpoint).unwrap();
+
+        assert!(manager
+            .load_for_origin("task-owned", "ws", "chat-b")
+            .unwrap()
+            .is_none());
+        assert_eq!(manager.find_unfinished_for_origin("ws", "chat-a").len(), 1);
+        assert!(manager
+            .find_unfinished_for_origin("ws", "chat-b")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_checkpoint_saves_do_not_share_temp_file() {
+        let dir = TempDir::new().unwrap();
+        let manager = CheckpointManager::new(dir.path());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let mut handles = Vec::new();
+        for turn in 0..16 {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let checkpoint = TaskCheckpoint::new_for_origin(
+                    "task-concurrent",
+                    vec![make_message("user", &format!("turn-{turn}"))],
+                    turn,
+                    "ws",
+                    "chat-a",
+                    "ws:chat-a",
+                );
+                barrier.wait();
+                manager.save(&checkpoint)
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.join().unwrap().is_ok());
+        }
+        assert!(manager.load("task-concurrent").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_checkpoint_save_does_not_regress_turn_or_completion() {
+        let dir = TempDir::new().unwrap();
+        let manager = CheckpointManager::new(dir.path());
+        let mut newest = TaskCheckpoint::new_for_origin(
+            "task-monotonic",
+            vec![make_message("user", "newest")],
+            5,
+            "ws",
+            "chat-a",
+            "ws:chat-a",
+        );
+        manager.save(&newest).unwrap();
+        manager.mark_completed("task-monotonic").unwrap();
+
+        newest.turn = 2;
+        newest.completed = false;
+        newest.messages = vec![make_message("user", "stale")];
+        manager.save(&newest).unwrap();
+
+        let loaded = manager.load("task-monotonic").unwrap().unwrap();
+        assert_eq!(loaded.turn, 5);
+        assert!(loaded.completed);
+        assert_eq!(loaded.messages[0].content.as_str(), Some("newest"));
     }
 }

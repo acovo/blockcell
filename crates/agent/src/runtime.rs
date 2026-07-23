@@ -55,7 +55,7 @@ use crate::system_event_orchestrator::{
     HeartbeatDecision, NotificationRequest, SystemEventOrchestrator,
 };
 use crate::system_event_store::{InMemorySystemEventStore, SystemEventStoreOps};
-use crate::task_manager::{TaskManager, TaskStatus};
+use crate::task_manager::{OriginScopedTaskManager, TaskManager, TaskStatus};
 use crate::token::estimate_messages_tokens;
 
 // 学习与记忆协调方法 — 已移至 runtime/learning.rs
@@ -273,6 +273,7 @@ impl SpawnHandle for RuntimeSpawnHandle {
             agent_id,
             event_tx,
             origin_history_seed,
+            self.origin_session_key.clone(),
             self.event_emitter.clone(),
             agent_type_str,
             child_abort_token,

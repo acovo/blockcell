@@ -99,6 +99,12 @@ pub(crate) async fn run_message_task(
     abort_token: AbortToken,
 ) {
     // 注意：任务已通过 create_and_start_task 标记为 Running，无需再调用 set_running
+    let checkpoint_manager = crate::checkpoint::CheckpointManager::new(&paths.workspace());
+    let resumed_task_id = msg
+        .metadata
+        .get("resumed_task_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
 
     // 发送开始进度
     task_manager
@@ -171,6 +177,14 @@ pub(crate) async fn run_message_task(
             // The periodic cleanup loop will evict them after the grace period.
             // This way users can see recently completed tasks via /tasks.
             task_manager.set_completed(&task_id, &response).await;
+            if let Err(e) = checkpoint_manager.mark_completed(&task_id) {
+                warn!(task_id = %task_id, error = %e, "Failed to mark message checkpoint completed");
+            }
+            if let Some(resumed_task_id) = resumed_task_id.as_deref() {
+                if let Err(e) = checkpoint_manager.mark_completed(resumed_task_id) {
+                    warn!(task_id = %resumed_task_id, error = %e, "Failed to mark resumed checkpoint completed");
+                }
+            }
         }
         Err(e) => {
             let err_msg = format!("{}", e);

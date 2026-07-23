@@ -13,6 +13,10 @@ struct StreamingRetryProvider {
     attempts: AtomicUsize,
 }
 struct StreamingCloseProvider;
+struct HangingStreamProvider {
+    started: Arc<tokio::sync::Notify>,
+    senders: Mutex<Vec<mpsc::Sender<StreamChunk>>>,
+}
 struct ConnectionFailingProvider;
 struct SuccessfulFallbackProvider;
 struct UnifiedEntryProvider {
@@ -261,6 +265,28 @@ impl blockcell_providers::Provider for TestProvider {
         };
 
         Ok(response)
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for HangingStreamProvider {
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        std::future::pending().await
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<mpsc::Receiver<StreamChunk>> {
+        let (tx, rx) = mpsc::channel(1);
+        self.senders.lock().unwrap().push(tx);
+        self.started.notify_one();
+        Ok(rx)
     }
 }
 
@@ -2701,6 +2727,44 @@ fn test_main_session_inbound(channel: &str, chat_id: &str) -> InboundMessage {
     }
 }
 
+#[tokio::test]
+async fn run_loop_cancels_active_message_when_inbound_closes() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(HangingStreamProvider {
+        started: started.clone(),
+        senders: Mutex::new(Vec::new()),
+    });
+    let paths = Paths::with_base(std::env::temp_dir().join(format!(
+        "blockcell-run-loop-close-test-{}",
+        uuid::Uuid::new_v4()
+    )));
+    paths.ensure_dirs().expect("create runtime dirs");
+    let mut runtime = test_runtime_with_provider_and_paths(paths, provider, Config::default());
+    let task_manager = runtime.task_manager.clone();
+    let (inbound_tx, inbound_rx) = mpsc::channel(1);
+    let run_loop = tokio::spawn(async move {
+        runtime.run_loop(inbound_rx, None).await;
+    });
+
+    inbound_tx
+        .send(test_main_session_inbound("ws", "close-chat"))
+        .await
+        .expect("send inbound");
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .expect("message task did not reach provider");
+    drop(inbound_tx);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), run_loop)
+        .await
+        .expect("run loop did not stop")
+        .expect("run loop panicked");
+    assert!(task_manager
+        .list_tasks_for_origin("ws", "close-chat", None)
+        .await
+        .is_empty());
+}
+
 async fn wait_for_runtime_review_runs(paths: &Paths, expected: usize) {
     for _ in 0..50 {
         let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
@@ -3634,6 +3698,34 @@ async fn test_deliver_subagent_result_to_ws_origin_emits_message_done_event() {
     assert_eq!(json["content"], "第15条内容已经整理完成");
     assert_eq!(json["background_delivery"], true);
     assert_eq!(json["task_id"], "task-test123");
+}
+
+#[tokio::test]
+async fn test_deliver_subagent_result_persists_origin_session() {
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-subagent-delivery-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let paths = Paths::with_base(base);
+    paths.ensure_dirs().expect("create runtime dirs");
+    let store = SessionStore::new(paths);
+
+    deliver_subagent_result_to_origin(
+        "ws",
+        "chat-persist",
+        "background result",
+        "task-persist",
+        Some("default"),
+        None,
+        None,
+        Some(&store),
+        Some("ws:chat-persist"),
+    )
+    .await;
+
+    let history = store.load("ws:chat-persist").expect("load origin session");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].content.as_str(), Some("background result"));
 }
 
 // resolve_effective_tool_names 测试

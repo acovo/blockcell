@@ -209,7 +209,11 @@ impl AgentRuntime {
                                 if !task_id.is_empty() {
                                     // 从 checkpoint 加载对话历史并注入当前会话
                                     let checkpoint_manager = crate::checkpoint::CheckpointManager::new(&self.paths.workspace());
-                                    match checkpoint_manager.load(&task_id) {
+                                    match checkpoint_manager.load_for_origin(
+                                        &task_id,
+                                        &msg.channel,
+                                        &msg.chat_id,
+                                    ) {
                                         Ok(Some(cp)) => {
                                             // 将 checkpoint 的对话历史注入到 session store
                                             let session_key = msg.session_key();
@@ -383,6 +387,16 @@ impl AgentRuntime {
                                 false,  // one_shot
                             ).await;
 
+                            if !msg.metadata.is_object() {
+                                msg.metadata = serde_json::json!({});
+                            }
+                            if let Some(metadata) = msg.metadata.as_object_mut() {
+                                metadata.insert(
+                                    "runtime_task_id".to_string(),
+                                    serde_json::Value::String(task_id.clone()),
+                                );
+                            }
+
                             if let Some(prev_task_id) = active_chat_tasks.remove(&chat_id_for_task) {
                                 active_steering_senders.remove(&chat_id_for_task);
                                 if let Some(registry) = active_steering_registry.as_ref() {
@@ -451,6 +465,15 @@ impl AgentRuntime {
                             if let Err(e) = self.capture_main_session_end_learning_boundary().await {
                                 warn!(error = %e, "Ghost learning session-end capture failed on inbound close");
                             }
+                            abort_active_message_tasks(
+                                &self.task_manager,
+                                &runtime_agent_id,
+                                active_steering_registry.as_ref(),
+                                &mut active_chat_tasks,
+                                &mut active_steering_senders,
+                                &mut active_message_tasks,
+                                &mut active_abort_tokens,
+                            ).await;
                             break
                         }, // channel closed
                     }

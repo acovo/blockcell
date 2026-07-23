@@ -18,6 +18,7 @@ pub(crate) async fn run_subagent_task(
     agent_id: Option<String>,
     event_tx: Option<broadcast::Sender<String>>,
     origin_history_seed: Vec<ChatMessage>,
+    origin_session_key: String,
     event_emitter: EventEmitterHandle,
     agent_type: Option<String>,
     abort_token: Option<AbortToken>,
@@ -89,9 +90,12 @@ pub(crate) async fn run_subagent_task(
     // Create a unique session key for this subagent
     let session_key = format!("subagent:{}", task_id);
     if !origin_history_seed.is_empty() {
-        let _ = sub_runtime
+        if let Err(e) = sub_runtime
             .session_store
-            .save(&session_key, &origin_history_seed);
+            .save(&session_key, &origin_history_seed)
+        {
+            warn!(task_id = %task_id, error = %e, "Failed to seed subagent session history");
+        }
     }
 
     let mut subagent_metadata = build_subagent_metadata(agent_id.as_deref());
@@ -152,7 +156,7 @@ pub(crate) async fn run_subagent_task(
                 outbound_tx.clone(),
                 event_tx.clone(),
                 Some(&SessionStore::new(paths_for_persist.clone())),
-                None, // session_key not available in this context
+                Some(&origin_session_key),
             )
             .await;
         }
@@ -193,7 +197,7 @@ pub(crate) async fn run_subagent_task(
                 outbound_tx.clone(),
                 event_tx.clone(),
                 Some(&SessionStore::new(paths_for_persist.clone())),
-                None, // session_key not available in this context
+                Some(&origin_session_key),
             )
             .await;
         }

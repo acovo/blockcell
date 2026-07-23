@@ -28,8 +28,8 @@ impl TaskManager {
         let tasks_dir = Self::tasks_dir(workspace_dir);
 
         // 确保目录存在
-        if tokio::fs::create_dir_all(&tasks_dir).await.is_err() {
-            tracing::warn!("Failed to create tasks dir");
+        if let Err(e) = tokio::fs::create_dir_all(&tasks_dir).await {
+            tracing::warn!(path = %tasks_dir.display(), error = %e, "Failed to create tasks dir");
             return;
         }
 
@@ -38,12 +38,25 @@ impl TaskManager {
 
         match content {
             Ok(json) => {
-                if tokio::fs::write(&file_path, json).await.is_ok() {
-                    tracing::debug!(task_id = %task.id, "Task persisted to disk");
+                let write_path = file_path.clone();
+                let write_result = tokio::task::spawn_blocking(move || {
+                    crate::fs_util::atomic_write(&write_path, json.as_bytes())
+                })
+                .await;
+                match write_result {
+                    Ok(Ok(())) => {
+                        tracing::debug!(task_id = %task.id, path = %file_path.display(), "Task persisted to disk");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(task_id = %task.id, path = %file_path.display(), error = %e, "Failed to persist task to disk");
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id = %task.id, path = %file_path.display(), error = %e, "Task persistence worker failed");
+                    }
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to serialize task: {}", e);
+                tracing::warn!(task_id = %task.id, path = %file_path.display(), error = %e, "Failed to serialize task");
             }
         }
     }
@@ -68,7 +81,10 @@ impl TaskManager {
 
         let mut entries = match tokio::fs::read_dir(&tasks_dir).await {
             Ok(e) => e,
-            Err(_) => return 0,
+            Err(e) => {
+                tracing::warn!(path = %tasks_dir.display(), error = %e, "Failed to read persisted tasks directory");
+                return 0;
+            }
         };
 
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -83,37 +99,48 @@ impl TaskManager {
 
             let path = entry.path();
             if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                    if let Ok(task) = serde_json::from_str::<TaskInfo>(&content) {
-                        // 只恢复未完成的任务
-                        if !is_terminal_status(&task.status) {
-                            // 标记为 Failed 而非 Queued，因为没有机制重新执行恢复的任务
-                            // 避免僵尸任务永远停留在 Queued 状态
-                            let mut restored_task = task.clone();
-                            restored_task.status = TaskStatus::Failed;
-                            restored_task.started_at = None;
-                            restored_task.completed_at = Some(Utc::now());
-                            restored_task.progress = None;
-                            restored_task.result = None;
-                            restored_task.error = Some(
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(content) => match serde_json::from_str::<TaskInfo>(&content) {
+                        Ok(task) => {
+                            // 只恢复未完成的任务
+                            if !is_terminal_status(&task.status) {
+                                // 标记为 Failed 而非 Queued，因为没有机制重新执行恢复的任务
+                                // 避免僵尸任务永远停留在 Queued 状态
+                                let mut restored_task = task.clone();
+                                restored_task.status = TaskStatus::Failed;
+                                restored_task.started_at = None;
+                                restored_task.completed_at = Some(Utc::now());
+                                restored_task.progress = None;
+                                restored_task.result = None;
+                                restored_task.error = Some(
                                 "Task restored from disk after restart; not re-executed automatically".to_string()
                             );
 
-                            let restored_task_for_persist = restored_task.clone();
-                            self.tasks
-                                .lock()
-                                .await
-                                .insert(task.id.clone(), restored_task);
-                            self.persist_task_to_disk(workspace_dir, &restored_task_for_persist)
+                                let restored_task_for_persist = restored_task.clone();
+                                self.tasks
+                                    .lock()
+                                    .await
+                                    .insert(task.id.clone(), restored_task);
+                                self.persist_task_to_disk(
+                                    workspace_dir,
+                                    &restored_task_for_persist,
+                                )
                                 .await;
-                            count += 1;
+                                count += 1;
 
-                            tracing::info!(
-                                task_id = %task.id,
-                                agent_type = ?task.agent_type,
-                                "Restored unfinished task"
-                            );
+                                tracing::info!(
+                                    task_id = %task.id,
+                                    agent_type = ?task.agent_type,
+                                    "Restored unfinished task"
+                                );
+                            }
                         }
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), error = %e, "Skipping invalid persisted task")
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "Failed to read persisted task")
                     }
                 }
             }

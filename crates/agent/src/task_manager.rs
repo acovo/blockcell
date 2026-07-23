@@ -90,6 +90,10 @@ pub struct TaskInfo {
 }
 
 impl TaskInfo {
+    pub fn belongs_to_origin(&self, channel: &str, chat_id: &str) -> bool {
+        self.origin_channel == channel && self.origin_chat_id == chat_id
+    }
+
     /// 是否发送系统事件
     pub fn emit_system_events(&self) -> bool {
         self.emit_system_events
@@ -679,6 +683,20 @@ impl TaskManager {
             .collect()
     }
 
+    /// Find tasks by ID prefix, restricted to the originating conversation.
+    pub async fn find_task_by_prefix_for_origin(
+        &self,
+        prefix: &str,
+        channel: &str,
+        chat_id: &str,
+    ) -> Vec<TaskInfo> {
+        self.find_task_by_prefix(prefix)
+            .await
+            .into_iter()
+            .filter(|task| task.belongs_to_origin(channel, chat_id))
+            .collect()
+    }
+
     /// 取消运行中的任务。
     /// 将任务状态设为 Cancelled，并触发已注册的 AbortToken。
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), Error> {
@@ -742,6 +760,40 @@ impl TaskManager {
             .collect();
         result.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         result
+    }
+
+    /// List tasks restricted to the originating conversation.
+    pub async fn list_tasks_for_origin(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        status_filter: Option<&TaskStatus>,
+    ) -> Vec<TaskInfo> {
+        self.list_tasks(status_filter)
+            .await
+            .into_iter()
+            .filter(|task| task.belongs_to_origin(channel, chat_id))
+            .collect()
+    }
+
+    /// Get task counts restricted to the originating conversation.
+    pub async fn summary_for_origin(
+        &self,
+        channel: &str,
+        chat_id: &str,
+    ) -> (usize, usize, usize, usize) {
+        let tasks = self.list_tasks_for_origin(channel, chat_id, None).await;
+        let mut counts = (0, 0, 0, 0);
+        for task in tasks {
+            match task.status {
+                TaskStatus::Queued => counts.0 += 1,
+                TaskStatus::Running => counts.1 += 1,
+                TaskStatus::Completed => counts.2 += 1,
+                TaskStatus::Failed => counts.3 += 1,
+                TaskStatus::Cancelled => {}
+            }
+        }
+        counts
     }
 
     /// Get counts of tasks by status.
@@ -1058,6 +1110,113 @@ impl Default for TaskManager {
     }
 }
 
+#[derive(Clone)]
+pub struct OriginScopedTaskManager {
+    inner: TaskManager,
+    channel: String,
+    chat_id: String,
+}
+
+impl OriginScopedTaskManager {
+    pub fn new(inner: TaskManager, channel: impl Into<String>, chat_id: impl Into<String>) -> Self {
+        Self {
+            inner,
+            channel: channel.into(),
+            chat_id: chat_id.into(),
+        }
+    }
+
+    async fn get_owned_task(&self, task_id: &str) -> Option<TaskInfo> {
+        self.inner
+            .get_task(task_id)
+            .await
+            .filter(|task| task.belongs_to_origin(&self.channel, &self.chat_id))
+    }
+}
+
+fn task_summary_json(t: &TaskInfo) -> serde_json::Value {
+    json!({
+        "id": t.id,
+        "label": t.label,
+        "task": t.task_description,
+        "status": t.status.to_string(),
+        "created_at": t.created_at.to_rfc3339(),
+        "started_at": t.started_at.map(|d| d.to_rfc3339()),
+        "completed_at": t.completed_at.map(|d| d.to_rfc3339()),
+        "progress": t.progress,
+        "result": t.result,
+        "error": t.error,
+        "agent_id": t.agent_id,
+        "agent_type": t.agent_type,
+        "one_shot": t.one_shot,
+    })
+}
+
+fn task_detail_json(t: &TaskInfo) -> serde_json::Value {
+    let mut value = task_summary_json(t);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("origin_channel".to_string(), json!(t.origin_channel));
+        object.insert("origin_chat_id".to_string(), json!(t.origin_chat_id));
+    }
+    value
+}
+
+#[async_trait]
+impl TaskManagerOps for OriginScopedTaskManager {
+    async fn list_tasks_json(&self, status_filter: Option<String>) -> serde_json::Value {
+        let filter = status_filter.and_then(|status| match status.as_str() {
+            "queued" => Some(TaskStatus::Queued),
+            "running" => Some(TaskStatus::Running),
+            "completed" => Some(TaskStatus::Completed),
+            "failed" => Some(TaskStatus::Failed),
+            "cancelled" => Some(TaskStatus::Cancelled),
+            _ => None,
+        });
+        serde_json::Value::Array(
+            self.inner
+                .list_tasks_for_origin(&self.channel, &self.chat_id, filter.as_ref())
+                .await
+                .iter()
+                .map(task_summary_json)
+                .collect(),
+        )
+    }
+
+    async fn get_task_json(&self, task_id: &str) -> Option<serde_json::Value> {
+        self.get_owned_task(task_id)
+            .await
+            .as_ref()
+            .map(task_detail_json)
+    }
+
+    async fn summary_json(&self) -> serde_json::Value {
+        let (queued, running, completed, failed) = self
+            .inner
+            .summary_for_origin(&self.channel, &self.chat_id)
+            .await;
+        json!({
+            "queued": queued,
+            "running": running,
+            "completed": completed,
+            "failed": failed,
+            "total": queued + running + completed + failed
+        })
+    }
+
+    async fn send_message(&self, task_id: &str, message: String) -> Result<(), Error> {
+        if self.get_owned_task(task_id).await.is_none() {
+            return Err(Error::NotFound(format!("Task not found: {}", task_id)));
+        }
+        self.inner.send_message(task_id, message).await
+    }
+
+    async fn is_one_shot_task(&self, task_id: &str) -> bool {
+        self.get_owned_task(task_id)
+            .await
+            .is_some_and(|task| task.one_shot)
+    }
+}
+
 #[async_trait]
 impl TaskManagerOps for TaskManager {
     async fn list_tasks_json(&self, status_filter: Option<String>) -> serde_json::Value {
@@ -1070,49 +1229,12 @@ impl TaskManagerOps for TaskManager {
             _ => None,
         });
         let tasks = self.list_tasks(filter.as_ref()).await;
-        let items: Vec<serde_json::Value> = tasks
-            .iter()
-            .map(|t| {
-                json!({
-                    "id": t.id,
-                    "label": t.label,
-                    "task": t.task_description,
-                    "status": t.status.to_string(),
-                    "created_at": t.created_at.to_rfc3339(),
-                    "started_at": t.started_at.map(|d| d.to_rfc3339()),
-                    "completed_at": t.completed_at.map(|d| d.to_rfc3339()),
-                    "progress": t.progress,
-                    "result": t.result,
-                    "error": t.error,
-                    "agent_id": t.agent_id,
-                    "agent_type": t.agent_type,
-                    "one_shot": t.one_shot,
-                })
-            })
-            .collect();
+        let items: Vec<serde_json::Value> = tasks.iter().map(task_summary_json).collect();
         serde_json::Value::Array(items)
     }
 
     async fn get_task_json(&self, task_id: &str) -> Option<serde_json::Value> {
-        self.get_task(task_id).await.map(|t| {
-            json!({
-                "id": t.id,
-                "label": t.label,
-                "task": t.task_description,
-                "status": t.status.to_string(),
-                "created_at": t.created_at.to_rfc3339(),
-                "started_at": t.started_at.map(|d| d.to_rfc3339()),
-                "completed_at": t.completed_at.map(|d| d.to_rfc3339()),
-                "progress": t.progress,
-                "result": t.result,
-                "error": t.error,
-                "origin_channel": t.origin_channel,
-                "origin_chat_id": t.origin_chat_id,
-                "agent_id": t.agent_id,
-                "agent_type": t.agent_type,
-                "one_shot": t.one_shot,
-            })
-        })
+        self.get_task(task_id).await.as_ref().map(task_detail_json)
     }
 
     async fn summary_json(&self) -> serde_json::Value {
@@ -1175,6 +1297,77 @@ mod tests {
         let tasks = manager.list_tasks(None).await;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].agent_id.as_deref(), Some("ops"));
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_origin_scope_excludes_foreign_tasks() {
+        let manager = TaskManager::new();
+        for (id, channel, chat_id) in [
+            ("task-local", "ws", "chat-a"),
+            ("task-other-chat", "ws", "chat-b"),
+            ("task-other-channel", "cli", "chat-a"),
+        ] {
+            manager
+                .create_and_start_task(
+                    id,
+                    id,
+                    "scope test",
+                    channel,
+                    chat_id,
+                    None,
+                    false,
+                    Some("explore"),
+                    true,
+                )
+                .await;
+        }
+
+        let tasks = manager
+            .list_tasks_for_origin("ws", "chat-a", Some(&TaskStatus::Running))
+            .await;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "task-local");
+
+        assert!(manager
+            .find_task_by_prefix_for_origin("task-other", "ws", "chat-a")
+            .await
+            .is_empty());
+        assert_eq!(
+            manager.summary_for_origin("ws", "chat-a").await,
+            (0, 1, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_origin_scoped_task_manager_ops_hide_foreign_tasks() {
+        let manager = TaskManager::new();
+        for (id, chat_id) in [("task-local", "chat-a"), ("task-foreign", "chat-b")] {
+            manager
+                .create_and_start_task(
+                    id,
+                    id,
+                    "scope test",
+                    "ws",
+                    chat_id,
+                    None,
+                    false,
+                    None,
+                    false,
+                )
+                .await;
+        }
+        let scoped = OriginScopedTaskManager::new(manager, "ws", "chat-a");
+
+        let listed = TaskManagerOps::list_tasks_json(&scoped, None).await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert!(TaskManagerOps::get_task_json(&scoped, "task-foreign")
+            .await
+            .is_none());
+        assert!(
+            TaskManagerOps::send_message(&scoped, "task-foreign", "hello".to_string())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -308,7 +308,11 @@ impl AgentRuntime {
         }
 
         // Build TaskManager handle for tools
-        let tm_handle: TaskManagerHandle = Arc::new(self.task_manager.clone());
+        let tm_handle: TaskManagerHandle = Arc::new(OriginScopedTaskManager::new(
+            self.task_manager.clone(),
+            &msg.channel,
+            &msg.chat_id,
+        ));
 
         // Build spawn handle for tools
         let spawn_handle = Arc::new(RuntimeSpawnHandle {

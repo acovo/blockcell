@@ -44,7 +44,7 @@ impl SlashCommand for TasksCommand {
 
         // 子命令: /tasks clear — 清空所有已结束的任务
         if trimmed == "clear" {
-            return Self::clear_finished_tasks(task_manager).await;
+            return Self::clear_finished_tasks(task_manager, &ctx.source).await;
         }
 
         // 子命令: /tasks cancel <task_id> — 取消运行中的任务
@@ -56,7 +56,7 @@ impl SlashCommand for TasksCommand {
                         .to_string(),
                 ));
             }
-            return Self::cancel_task(task_id, task_manager).await;
+            return Self::cancel_task(task_id, task_manager, &ctx.source).await;
         }
 
         // 子命令: /tasks resume [task_id] — 从断点恢复未完成的任务
@@ -79,7 +79,7 @@ impl SlashCommand for TasksCommand {
                         .to_string(),
                 ));
             }
-            return Self::restart_task(task_id, task_manager).await;
+            return Self::restart_task(task_id, task_manager, &ctx.source).await;
         }
 
         // 子命令: /tasks delete <task_id> — 删除指定任务
@@ -90,24 +90,31 @@ impl SlashCommand for TasksCommand {
                     "❌ 请指定要删除的任务 ID\n\n用法: `/tasks delete <task_id>`".to_string(),
                 ));
             }
-            return Self::delete_task(task_id, task_manager).await;
+            return Self::delete_task(task_id, task_manager, &ctx.source).await;
         }
 
         // 如果提供了参数，则查看指定任务详情
         if !trimmed.is_empty() {
-            return Self::show_task_detail(trimmed, task_manager).await;
+            return Self::show_task_detail(trimmed, task_manager, &ctx.source).await;
         }
 
         // 否则列出所有任务
-        Self::list_all_tasks(task_manager).await
+        Self::list_all_tasks(task_manager, &ctx.source).await
     }
 }
 
 impl TasksCommand {
     /// 列出所有任务
-    async fn list_all_tasks(task_manager: &blockcell_agent::TaskManager) -> CommandResult {
-        let (queued, running, completed, failed) = task_manager.summary().await;
-        let task_list = task_manager.list_tasks(None).await;
+    async fn list_all_tasks(
+        task_manager: &blockcell_agent::TaskManager,
+        source: &CommandSource,
+    ) -> CommandResult {
+        let (queued, running, completed, failed) = task_manager
+            .summary_for_origin(&source.channel, &source.chat_id)
+            .await;
+        let task_list = task_manager
+            .list_tasks_for_origin(&source.channel, &source.chat_id, None)
+            .await;
 
         let mut content = String::new();
         content.push_str("📋 **Task overview:**\n\n");
@@ -148,8 +155,11 @@ impl TasksCommand {
     async fn cancel_task(
         task_id_prefix: &str,
         task_manager: &blockcell_agent::TaskManager,
+        source: &CommandSource,
     ) -> CommandResult {
-        let matches = task_manager.find_task_by_prefix(task_id_prefix).await;
+        let matches = task_manager
+            .find_task_by_prefix_for_origin(task_id_prefix, &source.channel, &source.chat_id)
+            .await;
 
         match matches.len() {
             0 => CommandResult::Handled(CommandResponse::markdown(format!(
@@ -204,7 +214,8 @@ impl TasksCommand {
 
         if task_id_prefix.is_empty() {
             // 列出所有可恢复的 checkpoint
-            let unfinished = checkpoint_manager.find_unfinished();
+            let unfinished = checkpoint_manager
+                .find_unfinished_for_origin(&ctx.source.channel, &ctx.source.chat_id);
             if unfinished.is_empty() {
                 return CommandResult::Handled(CommandResponse::markdown(
                     "✅ 没有可恢复的断点任务\n".to_string(),
@@ -232,7 +243,8 @@ impl TasksCommand {
         }
 
         // 查找匹配的 checkpoint
-        let unfinished = checkpoint_manager.find_unfinished();
+        let unfinished =
+            checkpoint_manager.find_unfinished_for_origin(&ctx.source.channel, &ctx.source.chat_id);
         let matches: Vec<_> = unfinished
             .iter()
             .filter(|cp| cp.task_id.starts_with(task_id_prefix))
@@ -278,8 +290,11 @@ impl TasksCommand {
     async fn restart_task(
         task_id_prefix: &str,
         task_manager: &blockcell_agent::TaskManager,
+        source: &CommandSource,
     ) -> CommandResult {
-        let matches = task_manager.find_task_by_prefix(task_id_prefix).await;
+        let matches = task_manager
+            .find_task_by_prefix_for_origin(task_id_prefix, &source.channel, &source.chat_id)
+            .await;
 
         match matches.len() {
             0 => CommandResult::Handled(CommandResponse::markdown(format!(
@@ -327,8 +342,11 @@ impl TasksCommand {
     async fn delete_task(
         task_id_prefix: &str,
         task_manager: &blockcell_agent::TaskManager,
+        source: &CommandSource,
     ) -> CommandResult {
-        let matches = task_manager.find_task_by_prefix(task_id_prefix).await;
+        let matches = task_manager
+            .find_task_by_prefix_for_origin(task_id_prefix, &source.channel, &source.chat_id)
+            .await;
 
         match matches.len() {
             0 => CommandResult::Handled(CommandResponse::markdown(format!(
@@ -367,8 +385,13 @@ impl TasksCommand {
     }
 
     /// 清空所有已结束的任务（completed/failed/cancelled）
-    async fn clear_finished_tasks(task_manager: &blockcell_agent::TaskManager) -> CommandResult {
-        let task_list = task_manager.list_tasks(None).await;
+    async fn clear_finished_tasks(
+        task_manager: &blockcell_agent::TaskManager,
+        source: &CommandSource,
+    ) -> CommandResult {
+        let task_list = task_manager
+            .list_tasks_for_origin(&source.channel, &source.chat_id, None)
+            .await;
         let to_remove: Vec<_> = task_list
             .iter()
             .filter(|t| {
@@ -402,7 +425,9 @@ impl TasksCommand {
         }
 
         // 清空后再次检查Running状态
-        let remaining = task_manager.list_tasks(None).await;
+        let remaining = task_manager
+            .list_tasks_for_origin(&source.channel, &source.chat_id, None)
+            .await;
         let running_count = remaining
             .iter()
             .filter(|t| t.status == TaskStatus::Running)
@@ -425,8 +450,11 @@ impl TasksCommand {
     async fn show_task_detail(
         task_id_prefix: &str,
         task_manager: &blockcell_agent::TaskManager,
+        source: &CommandSource,
     ) -> CommandResult {
-        let matches = task_manager.find_task_by_prefix(task_id_prefix).await;
+        let matches = task_manager
+            .find_task_by_prefix_for_origin(task_id_prefix, &source.channel, &source.chat_id)
+            .await;
 
         match matches.len() {
             0 => CommandResult::Handled(CommandResponse::markdown(format!(
@@ -533,5 +561,46 @@ mod tests {
         if let CommandResult::Handled(response) = result {
             assert!(response.content.contains("not available"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_tasks_command_only_lists_current_origin() {
+        let manager = blockcell_agent::TaskManager::new();
+        manager
+            .create_and_start_task(
+                "task-local",
+                "local task",
+                "local",
+                "ws",
+                "chat-a",
+                None,
+                false,
+                None,
+                false,
+            )
+            .await;
+        manager
+            .create_and_start_task(
+                "task-foreign",
+                "foreign task",
+                "foreign",
+                "ws",
+                "chat-b",
+                None,
+                false,
+                None,
+                false,
+            )
+            .await;
+        let mut ctx = CommandContext::test_context();
+        ctx.source = CommandSource::websocket("chat-a".to_string());
+        ctx.task_manager = Some(manager);
+
+        let result = TasksCommand.execute("", &ctx).await;
+        let CommandResult::Handled(response) = result else {
+            panic!("expected handled response");
+        };
+        assert!(response.content.contains("local task"));
+        assert!(!response.content.contains("foreign task"));
     }
 }
