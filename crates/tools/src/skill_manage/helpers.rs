@@ -63,6 +63,43 @@ pub(super) fn validate_skill_file_path(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ensure an existing or not-yet-created target remains below `root` after
+/// resolving every existing ancestor. This rejects directory symlinks before
+/// callers create, overwrite, or remove files through them.
+pub(super) fn ensure_confined_target(root: &Path, target: &Path) -> Result<()> {
+    let canonical_root = std::fs::canonicalize(root).map_err(blockcell_core::Error::Io)?;
+    let mut existing = target;
+    while !existing.exists() {
+        existing = existing.parent().ok_or_else(|| {
+            blockcell_core::Error::PermissionDenied(format!(
+                "Target '{}' has no existing confined ancestor",
+                target.display()
+            ))
+        })?;
+    }
+
+    let canonical_existing = std::fs::canonicalize(existing).map_err(blockcell_core::Error::Io)?;
+    if !canonical_existing.starts_with(&canonical_root) {
+        return Err(blockcell_core::Error::PermissionDenied(format!(
+            "Target '{}' resolves outside '{}'",
+            target.display(),
+            root.display()
+        )));
+    }
+
+    if target.exists() {
+        let canonical_target = std::fs::canonicalize(target).map_err(blockcell_core::Error::Io)?;
+        if !canonical_target.starts_with(&canonical_root) {
+            return Err(blockcell_core::Error::PermissionDenied(format!(
+                "Target '{}' resolves outside '{}'",
+                target.display(),
+                root.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// 查找 Skill 目录 (支持 category/name 和直接 name 两种路径, 支持跨目录搜索)
 ///
 /// 搜索顺序:
@@ -87,7 +124,11 @@ pub(super) fn find_skill_dir(
     for dir in &search_dirs {
         // 先尝试直接匹配 ({dir}/{name})
         let direct = dir.join(name);
-        if direct.is_dir() && direct.join("SKILL.md").exists() {
+        if direct.is_dir()
+            && !direct.is_symlink()
+            && direct.join("SKILL.md").exists()
+            && !direct.join("SKILL.md").is_symlink()
+        {
             return Ok(direct);
         }
 
@@ -95,9 +136,13 @@ pub(super) fn find_skill_dir(
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() {
+                if path.is_dir() && !path.is_symlink() {
                     let candidate = path.join(name);
-                    if candidate.is_dir() && candidate.join("SKILL.md").exists() {
+                    if candidate.is_dir()
+                        && !candidate.is_symlink()
+                        && candidate.join("SKILL.md").exists()
+                        && !candidate.join("SKILL.md").is_symlink()
+                    {
                         return Ok(candidate);
                     }
                 }

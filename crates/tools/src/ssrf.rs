@@ -1,5 +1,7 @@
 use blockcell_core::{Error, Result};
-use std::net::{IpAddr, ToSocketAddrs};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 
 /// Set this env var to `1`/`true` to allow requests to private/internal
 /// addresses (disables the SSRF guard). Off by default.
@@ -56,6 +58,63 @@ fn ssrf_denied(host: &str) -> Error {
     ))
 }
 
+#[derive(Debug)]
+pub(crate) struct SafeResolver;
+
+impl Resolve for SafeResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            if addrs.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("DNS resolution returned no addresses for {host}"),
+                )
+                .into());
+            }
+            if !private_network_allowed() && addrs.iter().any(|addr| is_blocked_ip(&addr.ip())) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("private/internal DNS result blocked for {host}"),
+                )
+                .into());
+            }
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+pub(crate) fn safe_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().dns_resolver(Arc::new(SafeResolver))
+}
+
+pub(crate) async fn resolve_url_addresses(url: &str) -> Result<Vec<SocketAddr>> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| Error::Validation(format!("Invalid URL: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| Error::Validation("URL has no host".to_string()))?;
+    let port = parsed.port().unwrap_or_else(|| match parsed.scheme() {
+        "https" | "wss" => 443,
+        _ => 80,
+    });
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| Error::Tool(format!("DNS resolution failed for {host}: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(Error::Tool(format!(
+            "DNS resolution returned no addresses for {host}"
+        )));
+    }
+    if !private_network_allowed() && addrs.iter().any(|addr| is_blocked_ip(&addr.ip())) {
+        return Err(ssrf_denied(host));
+    }
+    Ok(addrs)
+}
+
 pub(crate) async fn ensure_url_allowed(url: &str) -> Result<()> {
     if private_network_allowed() {
         return Ok(());
@@ -82,22 +141,7 @@ pub(crate) async fn ensure_url_allowed(url: &str) -> Result<()> {
         };
     }
 
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| Error::Tool(format!("DNS resolution failed for {host}: {e}")))?;
-    let mut any = false;
-    for addr in addrs {
-        any = true;
-        if is_blocked_ip(&addr.ip()) {
-            return Err(ssrf_denied(host));
-        }
-    }
-    if !any {
-        return Err(Error::Tool(format!(
-            "DNS resolution returned no addresses for {host}"
-        )));
-    }
+    resolve_url_addresses(url).await?;
     Ok(())
 }
 
@@ -125,6 +169,8 @@ pub(crate) fn redirect_policy(follow: bool) -> reqwest::redirect::Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::dns::Resolve;
+    use std::str::FromStr;
 
     #[test]
     fn ssrf_ip_classification_blocks_internal_ranges() {
@@ -148,5 +194,12 @@ mod tests {
             .await
             .expect_err("file URLs must be rejected");
         assert!(error.to_string().contains("http or https"));
+    }
+
+    #[tokio::test]
+    async fn safe_resolver_rejects_private_dns_results_at_connect_time() {
+        let resolver = SafeResolver;
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        assert!(resolver.resolve(name).await.is_err());
     }
 }

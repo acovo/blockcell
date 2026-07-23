@@ -680,6 +680,7 @@ dependencies = [
  "futures",
  "htmd",
  "lettre",
+ "libc",
  "once_cell",
  "pdf-extract",
  "quick-xml 0.37.5",

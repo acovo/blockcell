@@ -294,6 +294,10 @@ async fn create_skill(
     } else {
         skills_dir.join(name)
     };
+    tokio::fs::create_dir_all(skills_dir)
+        .await
+        .map_err(blockcell_core::Error::Io)?;
+    ensure_confined_target(skills_dir, &skill_dir)?;
 
     // 检查是否已存在
     if skill_dir.exists() {
@@ -399,6 +403,7 @@ async fn patch_skill(
     } else {
         skill_dir.join("SKILL.md")
     };
+    ensure_confined_target(skills_dir, &target_file)?;
 
     if !target_file.exists() {
         return Err(blockcell_core::Error::Skill(format!(
@@ -500,6 +505,7 @@ async fn view_skill(name: &str, skills_dir: &Path, external_dirs: &[PathBuf]) ->
 /// 删除 Skill (仅限用户目录, 禁止删除内置 Skill)
 async fn delete_skill(name: &str, skills_dir: &Path, external_dirs: &[PathBuf]) -> Result<Value> {
     let skill_dir = find_skill_dir(name, skills_dir, external_dirs)?;
+    ensure_confined_target(skills_dir, &skill_dir)?;
 
     // 安全检查: 禁止删除外部/内置目录中的 Skill
     let is_in_user_dir = skill_dir.starts_with(skills_dir);
@@ -564,6 +570,7 @@ async fn edit_skill(
 
     // 备份原内容
     let skill_md = skill_dir.join("SKILL.md");
+    ensure_confined_target(skills_dir, &skill_md)?;
     let original_content = if skill_md.exists() {
         tokio::fs::read_to_string(&skill_md)
             .await
@@ -636,6 +643,7 @@ async fn write_file_skill(
 
     let skill_dir = find_skill_dir(name, skills_dir, external_dirs)?;
     let target = skill_dir.join(file_path);
+    ensure_confined_target(skills_dir, &target)?;
 
     // 确保父目录存在
     if let Some(parent) = target.parent() {
@@ -699,6 +707,7 @@ async fn remove_file_skill(
 
     let skill_dir = find_skill_dir(name, skills_dir, external_dirs)?;
     let target = skill_dir.join(file_path);
+    ensure_confined_target(skills_dir, &target)?;
 
     if !target.exists() {
         return Err(blockcell_core::Error::Skill(format!(
@@ -758,8 +767,9 @@ pub async fn atomic_write_text(path: &Path, content: &str) -> Result<()> {
 mod helpers;
 pub use helpers::extract_frontmatter;
 use helpers::{
-    determine_trust_level, find_skill_dir, list_subdir_files, read_meta_json, validate_frontmatter,
-    validate_path_component, validate_skill_body, validate_skill_file_path,
+    determine_trust_level, ensure_confined_target, find_skill_dir, list_subdir_files,
+    read_meta_json, validate_frontmatter, validate_path_component, validate_skill_body,
+    validate_skill_file_path,
 };
 
 #[cfg(test)]
@@ -1228,6 +1238,57 @@ mod tests {
         assert_eq!(found, skill_dir);
 
         let _ = std::fs::remove_dir_all(&skills_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_file_rejects_symlinked_support_directory() {
+        use std::os::unix::fs::symlink;
+
+        let skills_dir = temp_skills_dir();
+        let outside = skills_dir.with_extension("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        create_skill(
+            "linked-skill",
+            None,
+            "---\nname: linked-skill\ndescription: Link test\n---\n# Test",
+            &skills_dir,
+        )
+        .await
+        .unwrap();
+        symlink(&outside, skills_dir.join("linked-skill").join("scripts")).unwrap();
+
+        let result = write_file_skill(
+            "linked-skill",
+            "scripts/escape.sh",
+            "echo escaped",
+            &skills_dir,
+            &[],
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!outside.join("escape.sh").exists());
+
+        let _ = std::fs::remove_dir_all(&skills_dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_skill_dir_rejects_symlinked_skill() {
+        use std::os::unix::fs::symlink;
+
+        let skills_dir = temp_skills_dir();
+        let outside = skills_dir.with_extension("outside-skill");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("SKILL.md"), "# Outside").unwrap();
+        symlink(&outside, skills_dir.join("linked-skill")).unwrap();
+
+        assert!(find_skill_dir("linked-skill", &skills_dir, &[]).is_err());
+
+        let _ = std::fs::remove_dir_all(&skills_dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

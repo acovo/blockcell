@@ -5,6 +5,35 @@ use std::path::{Path, PathBuf};
 
 use crate::{Tool, ToolContext, ToolSchema};
 
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_ARCHIVE_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ARCHIVE_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_COMPRESSION_RATIO: u64 = 1_000;
+
+fn check_archive_limits(entries: usize, entry_bytes: u64, total_bytes: u64) -> Result<()> {
+    if entries > MAX_ARCHIVE_ENTRIES {
+        return Err(Error::Tool("Archive contains too many entries".to_string()));
+    }
+    if entry_bytes > MAX_ARCHIVE_ENTRY_BYTES {
+        return Err(Error::Tool("Archive entry exceeds size limit".to_string()));
+    }
+    if total_bytes > MAX_ARCHIVE_TOTAL_BYTES {
+        return Err(Error::Tool(
+            "Archive exceeds total uncompressed size limit".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_compression_ratio(uncompressed: u64, compressed: u64) -> Result<()> {
+    if compressed > 0 && uncompressed / compressed > MAX_ARCHIVE_COMPRESSION_RATIO {
+        return Err(Error::Tool(
+            "Archive compression ratio exceeds safety limit".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn expand_path(path: &str, workspace: &std::path::Path) -> PathBuf {
     if path.starts_with("~/") {
         dirs::home_dir()
@@ -15,6 +44,22 @@ fn expand_path(path: &str, workspace: &std::path::Path) -> PathBuf {
     } else {
         workspace.join(path)
     }
+}
+
+fn target_is_within_source(source: &Path, target: &Path) -> bool {
+    let Ok(source) = std::fs::canonicalize(source) else {
+        return false;
+    };
+    let mut existing = target;
+    while !existing.exists() {
+        let Some(parent) = existing.parent() else {
+            return false;
+        };
+        existing = parent;
+    }
+    std::fs::canonicalize(existing)
+        .map(|path| path == source || path.starts_with(&source))
+        .unwrap_or(false)
 }
 
 pub struct FileOpsTool;
@@ -196,6 +241,12 @@ async fn action_move(workspace: &Path, params: &Value) -> Result<Value> {
             src.display()
         )));
     }
+    if std::fs::symlink_metadata(&src)?.file_type().is_symlink() {
+        return Err(Error::PermissionDenied(format!(
+            "Refusing to move symbolic link: {}",
+            src.display()
+        )));
+    }
 
     // Create parent directories for destination
     if let Some(parent) = dst.parent() {
@@ -233,6 +284,17 @@ async fn action_copy(workspace: &Path, params: &Value) -> Result<Value> {
             src.display()
         )));
     }
+    if std::fs::symlink_metadata(&src)?.file_type().is_symlink() {
+        return Err(Error::PermissionDenied(format!(
+            "Refusing to copy symbolic link: {}",
+            src.display()
+        )));
+    }
+    if target_is_within_source(&src, &dst) {
+        return Err(Error::Validation(
+            "Copy destination cannot be inside the source".to_string(),
+        ));
+    }
 
     if let Some(parent) = dst.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -241,7 +303,7 @@ async fn action_copy(workspace: &Path, params: &Value) -> Result<Value> {
     if src.is_dir() {
         copy_dir_recursive(&src, &dst)?;
         // Count files
-        let count = count_files_recursive(&dst);
+        let count = count_files_recursive(&dst)?;
         Ok(json!({
             "status": "copied",
             "from": src.display().to_string(),
@@ -267,6 +329,15 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<()> {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
+        if std::fs::symlink_metadata(&src_path)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(Error::PermissionDenied(format!(
+                "Refusing to copy symbolic link: {}",
+                src_path.display()
+            )));
+        }
         if src_path.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
@@ -276,19 +347,26 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn count_files_recursive(path: &PathBuf) -> usize {
+fn count_files_recursive(path: &PathBuf) -> Result<usize> {
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry?;
             let p = entry.path();
+            if std::fs::symlink_metadata(&p)?.file_type().is_symlink() {
+                return Err(Error::PermissionDenied(format!(
+                    "Refusing to traverse symbolic link: {}",
+                    p.display()
+                )));
+            }
             if p.is_dir() {
-                count += count_files_recursive(&p);
+                count += count_files_recursive(&p)?;
             } else {
                 count += 1;
             }
         }
     }
-    count
+    Ok(count)
 }
 
 fn action_compress(workspace: &Path, params: &Value) -> Result<Value> {
@@ -320,6 +398,17 @@ fn action_compress(workspace: &Path, params: &Value) -> Result<Value> {
                 src.display()
             )));
         }
+        if std::fs::symlink_metadata(src)?.file_type().is_symlink() {
+            return Err(Error::PermissionDenied(format!(
+                "Refusing to archive symbolic link: {}",
+                src.display()
+            )));
+        }
+        if target_is_within_source(src, &dst) {
+            return Err(Error::Validation(
+                "Archive destination cannot be inside a source directory".to_string(),
+            ));
+        }
     }
 
     if let Some(parent) = dst.parent() {
@@ -346,8 +435,8 @@ fn action_compress(workspace: &Path, params: &Value) -> Result<Value> {
                         .to_string();
                     zip.start_file(&name, options)
                         .map_err(|e| Error::Tool(format!("Zip error: {}", e)))?;
-                    let data = std::fs::read(src)?;
-                    std::io::Write::write_all(&mut zip, &data)?;
+                    let mut input = std::fs::File::open(src)?;
+                    std::io::copy(&mut input, &mut zip)?;
                     file_count += 1;
                 }
             }
@@ -362,6 +451,7 @@ fn action_compress(workspace: &Path, params: &Value) -> Result<Value> {
 
             for src in &sources {
                 if src.is_dir() {
+                    let source_file_count = count_files_recursive(src)? as u64;
                     let dir_name = src
                         .file_name()
                         .unwrap_or_default()
@@ -369,7 +459,7 @@ fn action_compress(workspace: &Path, params: &Value) -> Result<Value> {
                         .to_string();
                     tar.append_dir_all(&dir_name, src)
                         .map_err(|e| Error::Tool(format!("Tar error: {}", e)))?;
-                    file_count += count_files_recursive(src) as u64;
+                    file_count += source_file_count;
                 } else {
                     let name = src
                         .file_name()
@@ -414,6 +504,12 @@ fn zip_add_dir(
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(Error::PermissionDenied(format!(
+                "Refusing to archive symbolic link: {}",
+                path.display()
+            )));
+        }
         let relative = path
             .strip_prefix(base)
             .map_err(|e| Error::Tool(format!("Path strip error: {}", e)))?;
@@ -426,8 +522,8 @@ fn zip_add_dir(
         } else {
             zip.start_file(&archive_name, options)
                 .map_err(|e| Error::Tool(format!("Zip file error: {}", e)))?;
-            let data = std::fs::read(&path)?;
-            std::io::Write::write_all(zip, &data)?;
+            let mut input = std::fs::File::open(&path)?;
+            std::io::copy(&mut input, zip)?;
             count += 1;
         }
     }
@@ -473,10 +569,22 @@ fn action_decompress(workspace: &Path, params: &Value) -> Result<Value> {
         let mut archive = zip::ZipArchive::new(file)
             .map_err(|e| Error::Tool(format!("Failed to read zip: {}", e)))?;
 
+        let mut total_uncompressed = 0u64;
         for i in 0..archive.len() {
             let mut entry = archive
                 .by_index(i)
                 .map_err(|e| Error::Tool(format!("Zip entry error: {}", e)))?;
+            total_uncompressed = total_uncompressed.saturating_add(entry.size());
+            check_archive_limits(i + 1, entry.size(), total_uncompressed)?;
+            check_compression_ratio(entry.size(), entry.compressed_size())?;
+            if entry
+                .unix_mode()
+                .is_some_and(|mode| mode & 0o170000 == 0o120000)
+            {
+                return Err(Error::PermissionDenied(
+                    "Archive contains a symbolic link".to_string(),
+                ));
+            }
             let out_path = dst.join(entry.mangled_name());
 
             if entry.is_dir() {
@@ -496,11 +604,23 @@ fn action_decompress(workspace: &Path, params: &Value) -> Result<Value> {
         let dec = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(dec);
 
-        for entry in archive
+        let compressed_size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+        let mut total_uncompressed = 0u64;
+        for (index, entry) in archive
             .entries()
             .map_err(|e| Error::Tool(format!("Tar error: {}", e)))?
+            .enumerate()
         {
             let mut entry = entry.map_err(|e| Error::Tool(format!("Tar entry error: {}", e)))?;
+            let size = entry.size();
+            total_uncompressed = total_uncompressed.saturating_add(size);
+            check_archive_limits(index + 1, size, total_uncompressed)?;
+            check_compression_ratio(total_uncompressed, compressed_size)?;
+            if !entry.header().entry_type().is_file() && !entry.header().entry_type().is_dir() {
+                return Err(Error::PermissionDenied(
+                    "Archive contains a link or special file".to_string(),
+                ));
+            }
             entry
                 .unpack_in(&dst)
                 .map_err(|e| Error::Tool(format!("Tar unpack error: {}", e)))?;
@@ -511,11 +631,21 @@ fn action_decompress(workspace: &Path, params: &Value) -> Result<Value> {
             .map_err(|e| Error::Tool(format!("Failed to open archive: {}", e)))?;
         let mut archive = tar::Archive::new(file);
 
-        for entry in archive
+        let mut total_uncompressed = 0u64;
+        for (index, entry) in archive
             .entries()
             .map_err(|e| Error::Tool(format!("Tar error: {}", e)))?
+            .enumerate()
         {
             let mut entry = entry.map_err(|e| Error::Tool(format!("Tar entry error: {}", e)))?;
+            let size = entry.size();
+            total_uncompressed = total_uncompressed.saturating_add(size);
+            check_archive_limits(index + 1, size, total_uncompressed)?;
+            if !entry.header().entry_type().is_file() && !entry.header().entry_type().is_dir() {
+                return Err(Error::PermissionDenied(
+                    "Archive contains a link or special file".to_string(),
+                ));
+            }
             entry
                 .unpack_in(&dst)
                 .map_err(|e| Error::Tool(format!("Tar unpack error: {}", e)))?;
@@ -607,7 +737,7 @@ async fn action_file_info(workspace: &Path, params: &Value) -> Result<Value> {
     }
 
     if metadata.is_dir() {
-        let count = count_files_recursive(&path);
+        let count = count_files_recursive(&path)?;
         info["total_files"] = json!(count);
     }
 
@@ -672,5 +802,33 @@ mod tests {
                 "path": "/tmp/a"
             }))
             .is_err());
+    }
+
+    #[test]
+    fn test_archive_limits_reject_excessive_total_and_ratio() {
+        assert!(check_archive_limits(1, MAX_ARCHIVE_ENTRY_BYTES + 1, 1).is_err());
+        assert!(check_archive_limits(MAX_ARCHIVE_ENTRIES + 1, 1, 1).is_err());
+        assert!(check_archive_limits(1, MAX_ARCHIVE_TOTAL_BYTES + 1, 1).is_err());
+        assert!(check_compression_ratio(10_000_000, 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_recursive_copy_rejects_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("blockcell-copy-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        let outside = root.join("outside");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        symlink(&outside, source.join("linked")).unwrap();
+
+        assert!(copy_dir_recursive(&source, &destination).is_err());
+        assert!(!destination.join("linked").join("secret.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

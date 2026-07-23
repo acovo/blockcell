@@ -9,7 +9,7 @@
 //! - `content-signal`: content usage permissions (ai-train, search, ai-input)
 
 use blockcell_core::{Error, Result};
-use reqwest::{Client, Response};
+use reqwest::Response;
 use serde_json::{json, Value};
 
 /// Metadata extracted from a markdown-aware HTTP response.
@@ -56,7 +56,7 @@ impl MarkdownMeta {
 /// 4. Otherwise → return raw text
 pub async fn fetch_as_markdown(url: &str, max_chars: usize) -> Result<(String, MarkdownMeta)> {
     crate::ssrf::ensure_url_allowed(url).await?;
-    let client = Client::builder()
+    let client = crate::ssrf::safe_client_builder()
         .redirect(crate::ssrf::redirect_policy(true))
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -106,10 +106,9 @@ pub async fn process_response(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let body = response
-        .text()
-        .await
-        .map_err(|e| Error::Tool(format!("Failed to read response body: {}", e)))?;
+    let byte_limit = max_chars.saturating_mul(4).min(4_000_000);
+    let (body, _) = crate::bounded_io::read_response_limited(response, byte_limit).await?;
+    let body = String::from_utf8_lossy(&body).into_owned();
 
     let markdown = if meta.content_type.contains("text/markdown") {
         // Server returned native markdown — use as-is

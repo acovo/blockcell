@@ -6,7 +6,6 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::timeout;
 
 use crate::{Tool, ToolContext, ToolSchema};
 
@@ -524,22 +523,19 @@ impl ExecLocalTool {
     /// Run the command and process output.
     async fn run_command(
         &self,
-        mut command: Command,
+        command: Command,
         resolved_path: &Path,
         effective_runner: Option<&str>,
         args: &[String],
         timeout_secs: u64,
         max_output_chars: usize,
     ) -> Result<Value> {
-        let output = timeout(Duration::from_secs(timeout_secs), command.output())
-            .await
-            .map_err(|_| {
-                Error::Timeout(format!(
-                    "Local script timed out after {} seconds",
-                    timeout_secs
-                ))
-            })?
-            .map_err(|error| Error::Tool(format!("Failed to execute local script: {}", error)))?;
+        let output = crate::process::run_command_bounded(
+            command,
+            Duration::from_secs(timeout_secs),
+            max_output_chars.saturating_mul(4),
+        )
+        .await?;
 
         let stdout = truncate_output(
             String::from_utf8_lossy(&output.stdout).to_string(),
@@ -595,6 +591,7 @@ impl ExecLocalTool {
             "stderr": stderr,
             "command": command_parts.join(" "),
             "resolved_path": resolved_path.display().to_string(),
+            "truncated": output.truncated,
         }))
     }
 }

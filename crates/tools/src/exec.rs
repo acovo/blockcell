@@ -6,7 +6,6 @@ use serde_json::{json, Value};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::timeout;
 
 use crate::{Tool, ToolContext, ToolSchema};
 
@@ -181,15 +180,20 @@ impl Tool for ExecTool {
             // (e.g. on timeout), so timed-out commands don't leak as orphans.
             .kill_on_drop(true);
 
-        let result = timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
+        let result = crate::process::run_command_bounded(
+            cmd,
+            Duration::from_secs(timeout_secs),
+            max_output_chars * 4,
+        )
+        .await;
 
         match result {
-            Ok(Ok(output)) => {
+            Ok(output) => {
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
                 // Truncate if too long (use safe_truncate to avoid panic on multi-byte chars)
-                let mut truncated = false;
+                let mut truncated = output.truncated;
                 if stdout.len() > max_output_chars {
                     stdout = format!(
                         "{}\n... (output truncated)",
@@ -212,11 +216,7 @@ impl Tool for ExecTool {
                     "truncated": truncated
                 }))
             }
-            Ok(Err(e)) => Err(Error::Tool(format!("Failed to execute command: {}", e))),
-            Err(_) => Err(Error::Timeout(format!(
-                "Command timed out after {} seconds",
-                timeout_secs
-            ))),
+            Err(error) => Err(error),
         }
     }
 }

@@ -10,6 +10,42 @@ use crate::{Tool, ToolContext, ToolSchema};
 /// Used by Ghost Agent for social interactions and by users for skill discovery.
 pub struct CommunityHubTool;
 
+fn validate_skill_name(name: &str) -> Result<()> {
+    let mut components = std::path::Path::new(name).components();
+    let single_normal = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !single_normal || name == "." || name == ".." || name.contains('\0') {
+        return Err(blockcell_core::Error::Validation(format!(
+            "Invalid skill name '{name}': expected a single path component"
+        )));
+    }
+    Ok(())
+}
+
+fn confined_skill_dir(workspace: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
+    validate_skill_name(name)?;
+    let workspace = std::fs::canonicalize(workspace).map_err(blockcell_core::Error::Io)?;
+    let skills_dir = workspace.join("skills");
+    std::fs::create_dir_all(&skills_dir).map_err(blockcell_core::Error::Io)?;
+    let canonical_skills = std::fs::canonicalize(&skills_dir).map_err(blockcell_core::Error::Io)?;
+    if !canonical_skills.starts_with(&workspace) {
+        return Err(blockcell_core::Error::PermissionDenied(
+            "Skills directory resolves outside the workspace".to_string(),
+        ));
+    }
+
+    let target = canonical_skills.join(name);
+    if target.exists() {
+        let canonical_target = std::fs::canonicalize(&target).map_err(blockcell_core::Error::Io)?;
+        if !canonical_target.starts_with(&canonical_skills) {
+            return Err(blockcell_core::Error::PermissionDenied(format!(
+                "Skill '{name}' resolves outside the skills directory"
+            )));
+        }
+    }
+    Ok(target)
+}
+
 fn redact_hub_url(url: &str) -> String {
     // Avoid leaking internal endpoints or hostnames to logs/LLM.
     // We keep only scheme + host if possible.
@@ -97,7 +133,13 @@ async fn hub_get(client: &reqwest::Client, url: &str, api_key: &Option<String>) 
         .await
         .map_err(|e| blockcell_core::Error::Tool(format!("Hub request failed: {}", e)))?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let (body, truncated) = crate::bounded_io::read_response_limited(resp, 2 * 1024 * 1024).await?;
+    if truncated {
+        return Err(blockcell_core::Error::Tool(
+            "Hub response exceeded size limit".to_string(),
+        ));
+    }
+    let body = String::from_utf8_lossy(&body).into_owned();
     if !status.is_success() {
         return Err(blockcell_core::Error::Tool(format!(
             "Hub returned {}: {}",
@@ -123,7 +165,14 @@ async fn hub_post(
         .await
         .map_err(|e| blockcell_core::Error::Tool(format!("Hub request failed: {}", e)))?;
     let status = resp.status();
-    let resp_body = resp.text().await.unwrap_or_default();
+    let (resp_body, truncated) =
+        crate::bounded_io::read_response_limited(resp, 2 * 1024 * 1024).await?;
+    if truncated {
+        return Err(blockcell_core::Error::Tool(
+            "Hub response exceeded size limit".to_string(),
+        ));
+    }
+    let resp_body = String::from_utf8_lossy(&resp_body).into_owned();
     if !status.is_success() {
         return Err(blockcell_core::Error::Tool(format!(
             "Hub returned {}: {}",
@@ -206,18 +255,16 @@ impl Tool for CommunityHubTool {
                 }
             }
             "skill_info" | "install_skill" | "uninstall_skill" => {
-                if params
+                let name = params
                     .get("skill_name")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .is_empty()
-                {
-                    Err(blockcell_core::Error::Tool(
+                    .unwrap_or("");
+                if name.is_empty() {
+                    return Err(blockcell_core::Error::Tool(
                         "'skill_name' is required for this action".into(),
-                    ))
-                } else {
-                    Ok(())
+                    ));
                 }
+                validate_skill_name(name)
             }
             "list_installed" => Ok(()),
             "post" => {
@@ -328,7 +375,7 @@ impl Tool for CommunityHubTool {
                 .get("skill_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let skill_dir = ctx.workspace.join("skills").join(name);
+            let skill_dir = confined_skill_dir(&ctx.workspace, name)?;
             if !skill_dir.exists() {
                 return Err(blockcell_core::Error::Tool(format!(
                     "Skill '{}' is not installed",
@@ -350,10 +397,10 @@ impl Tool for CommunityHubTool {
             .ok_or_else(|| blockcell_core::Error::Tool("Community Hub 未启用或未配置。".into()))?;
         let api_key = resolve_api_key(&ctx, &params);
 
-        let client = reqwest::Client::builder()
+        let client = crate::ssrf::safe_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_default();
+            .map_err(|e| blockcell_core::Error::Tool(format!("Failed to build Hub client: {e}")))?;
 
         match action {
             "heartbeat" => {
@@ -471,9 +518,21 @@ impl Tool for CommunityHubTool {
                 let url = resolve_download_url(&hub_url, name, &info);
                 debug!(skill = %name, url = %url, "Community Hub: resolved download url");
 
+                crate::ssrf::ensure_url_allowed(&url).await?;
+
                 let mut req = client.get(&url);
-                if let Some(ref key) = api_key {
-                    req = req.header("Authorization", format!("Bearer {}", key));
+                let same_origin = reqwest::Url::parse(&url)
+                    .ok()
+                    .zip(reqwest::Url::parse(&hub_url).ok())
+                    .is_some_and(|(download, hub)| {
+                        download.scheme() == hub.scheme()
+                            && download.host_str() == hub.host_str()
+                            && download.port_or_known_default() == hub.port_or_known_default()
+                    });
+                if same_origin {
+                    if let Some(ref key) = api_key {
+                        req = req.header("Authorization", format!("Bearer {}", key));
+                    }
                 }
                 let resp = req
                     .send()
@@ -481,19 +540,24 @@ impl Tool for CommunityHubTool {
                     .map_err(|e| blockcell_core::Error::Tool(format!("Download failed: {}", e)))?;
                 if !resp.status().is_success() {
                     let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
+                    let (body, _) =
+                        crate::bounded_io::read_response_limited(resp, 64 * 1024).await?;
+                    let body = String::from_utf8_lossy(&body);
                     return Err(blockcell_core::Error::Tool(format!(
                         "Download failed ({}): {}",
                         status, body
                     )));
                 }
-                let zip_bytes = resp.bytes().await.map_err(|e| {
-                    blockcell_core::Error::Tool(format!("Failed to read response: {}", e))
-                })?;
+                let (zip_bytes, truncated) =
+                    crate::bounded_io::read_response_limited(resp, 20 * 1024 * 1024).await?;
+                if truncated {
+                    return Err(blockcell_core::Error::Tool(
+                        "Skill archive exceeded the 20 MiB download limit".to_string(),
+                    ));
+                }
 
                 // Extract to workspace/skills/{name}/
-                let skills_dir = ctx.workspace.join("skills");
-                let skill_dir = skills_dir.join(name);
+                let skill_dir = confined_skill_dir(&ctx.workspace, name)?;
                 if skill_dir.exists() {
                     std::fs::remove_dir_all(&skill_dir).map_err(|e| {
                         blockcell_core::Error::Tool(format!(
@@ -510,10 +574,26 @@ impl Tool for CommunityHubTool {
                 let cursor = std::io::Cursor::new(&zip_bytes);
                 let mut archive = zip::ZipArchive::new(cursor)
                     .map_err(|e| blockcell_core::Error::Tool(format!("Invalid zip: {}", e)))?;
+                if archive.len() > 2_000 {
+                    return Err(blockcell_core::Error::Tool(
+                        "Skill archive contains too many entries".to_string(),
+                    ));
+                }
+                let mut total_uncompressed = 0u64;
                 for i in 0..archive.len() {
                     let mut file = archive.by_index(i).map_err(|e| {
                         blockcell_core::Error::Tool(format!("Zip read error: {}", e))
                     })?;
+                    total_uncompressed = total_uncompressed.saturating_add(file.size());
+                    if file.size() > 20 * 1024 * 1024
+                        || total_uncompressed > 100 * 1024 * 1024
+                        || (file.compressed_size() > 0
+                            && file.size() / file.compressed_size() > 1_000)
+                    {
+                        return Err(blockcell_core::Error::Tool(
+                            "Skill archive exceeds extraction safety limits".to_string(),
+                        ));
+                    }
                     let out_path = if let Some(enclosed) = file.enclosed_name() {
                         // Strip the top-level directory if the zip contains one
                         let components: Vec<_> = enclosed.components().collect();
@@ -624,6 +704,26 @@ mod tests {
         assert!(tool.validate(&json!({"action": "like"})).is_err());
         assert!(tool
             .validate(&json!({"action": "like", "post_id": "abc123"}))
+            .is_ok());
+    }
+
+    #[test]
+    fn test_validate_skill_name_rejects_path_escape() {
+        let tool = CommunityHubTool;
+        for name in ["../outside", "nested/skill", "/tmp/skill", ".", ".."] {
+            assert!(
+                tool.validate(&json!({"action": "install_skill", "skill_name": name}))
+                    .is_err(),
+                "unsafe skill name should be rejected: {name}"
+            );
+            assert!(
+                tool.validate(&json!({"action": "uninstall_skill", "skill_name": name}))
+                    .is_err(),
+                "unsafe skill name should be rejected: {name}"
+            );
+        }
+        assert!(tool
+            .validate(&json!({"action": "install_skill", "skill_name": "safe-skill"}))
             .is_ok());
     }
 }

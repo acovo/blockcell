@@ -4,8 +4,8 @@ use futures::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -26,8 +26,12 @@ type WsWriteHandle = Arc<Mutex<Option<WsWriteHalf>>>;
 static STREAM_MANAGER: Lazy<Arc<Mutex<StreamManager>>> =
     Lazy::new(|| Arc::new(Mutex::new(StreamManager::new())));
 
-/// Whether we have already restored persisted subscriptions on this process run.
-static RESTORED: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
+/// Workspaces whose persisted subscriptions have already been restored.
+static RESTORED: Lazy<Arc<Mutex<HashSet<PathBuf>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(HashSet::new())));
+
+const MAX_STREAM_BUFFER_MESSAGES: usize = 10_000;
+const MAX_STREAM_MESSAGE_BYTES: usize = 1_048_576;
 
 /// Serializable subscription rule — persisted to disk for auto-restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +78,9 @@ struct StreamSubscription {
     reconnect_count: u32,
     /// Max reconnect attempts (0 = unlimited).
     max_reconnect: u32,
+    /// Workspace that owns this subscription.
+    #[serde(skip)]
+    owner_workspace: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,8 +93,6 @@ struct StreamManager {
     subscriptions: HashMap<String, StreamSubscription>,
     /// Handles to cancel running stream tasks.
     cancel_handles: HashMap<String, tokio::sync::watch::Sender<bool>>,
-    /// Workspace path for persistence (set on first tool execution).
-    workspace: Option<PathBuf>,
 }
 
 impl StreamManager {
@@ -95,26 +100,20 @@ impl StreamManager {
         Self {
             subscriptions: HashMap::new(),
             cancel_handles: HashMap::new(),
-            workspace: None,
         }
     }
 
-    fn persistence_path(&self) -> Option<PathBuf> {
-        self.workspace
-            .as_ref()
-            .map(|ws| ws.join("streams").join("subscriptions.json"))
+    fn persistence_path(workspace: &Path) -> PathBuf {
+        workspace.join("streams").join("subscriptions.json")
     }
 
     /// Save all auto_restore subscriptions to disk.
-    fn save_rules(&self) {
-        let path = match self.persistence_path() {
-            Some(p) => p,
-            None => return,
-        };
+    fn save_rules(&self, workspace: &Path) {
+        let path = Self::persistence_path(workspace);
         let rules: Vec<SubscriptionRule> = self
             .subscriptions
             .values()
-            .filter(|s| s.auto_restore)
+            .filter(|s| s.auto_restore && s.owner_workspace == workspace)
             .map(|s| SubscriptionRule {
                 id: s.id.clone(),
                 url: s.url.clone(),
@@ -144,11 +143,8 @@ impl StreamManager {
     }
 
     /// Load persisted subscription rules from disk.
-    fn load_rules(&self) -> Vec<SubscriptionRule> {
-        let path = match self.persistence_path() {
-            Some(p) => p,
-            None => return vec![],
-        };
+    fn load_rules(workspace: &Path) -> Vec<SubscriptionRule> {
+        let path = Self::persistence_path(workspace);
         match std::fs::read_to_string(&path) {
             Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
                 warn!(error = %e, "Failed to parse persisted subscriptions");
@@ -288,36 +284,63 @@ impl Tool for StreamSubscribeTool {
     }
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
-        // Set workspace path for persistence on first call
-        {
-            let mut mgr = STREAM_MANAGER.lock().await;
-            if mgr.workspace.is_none() {
-                mgr.workspace = Some(ctx.workspace.clone());
-            }
-        }
+        let workspace = normalized_workspace(&ctx.workspace);
 
-        // Auto-restore persisted subscriptions on first call in this process
+        // Auto-restore persisted subscriptions once per workspace.
         {
             let mut restored = RESTORED.lock().await;
-            if !*restored {
-                *restored = true;
+            if restored.insert(workspace.clone()) {
                 drop(restored);
-                let _ = restore_all_subscriptions().await;
+                let _ = restore_all_subscriptions(&workspace).await;
             }
         }
 
         let action = params["action"].as_str().unwrap();
         match action {
-            "subscribe" => action_subscribe(&params).await,
-            "unsubscribe" => action_unsubscribe(&params).await,
-            "read" => action_read(&params).await,
-            "send" => action_send(&params).await,
-            "list" => action_list().await,
-            "status" => action_status(&params).await,
-            "restore" => action_restore().await,
+            "subscribe" => action_subscribe(&workspace, &params).await,
+            "unsubscribe" => action_unsubscribe(&workspace, &params).await,
+            "read" => action_read(&workspace, &params).await,
+            "send" => action_send(&workspace, &params).await,
+            "list" => action_list_for_workspace(&workspace).await,
+            "status" => action_status(&workspace, &params).await,
+            "restore" => action_restore(&workspace).await,
             _ => Err(Error::Tool(format!("Unknown action: {}", action))),
         }
     }
+}
+
+fn normalized_workspace(workspace: &Path) -> PathBuf {
+    std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf())
+}
+
+fn bounded_buffer_size(value: Option<u64>) -> usize {
+    value
+        .unwrap_or(100)
+        .clamp(1, MAX_STREAM_BUFFER_MESSAGES as u64) as usize
+}
+
+async fn validate_stream_url(url: &str) -> Result<()> {
+    let mut parsed = reqwest::Url::parse(url)
+        .map_err(|e| Error::Validation(format!("Invalid stream URL: {e}")))?;
+    match parsed.scheme() {
+        "ws" => {
+            parsed
+                .set_scheme("http")
+                .map_err(|_| Error::Validation("Invalid WebSocket URL".to_string()))?;
+        }
+        "wss" => {
+            parsed
+                .set_scheme("https")
+                .map_err(|_| Error::Validation("Invalid WebSocket URL".to_string()))?;
+        }
+        "http" | "https" => {}
+        scheme => {
+            return Err(Error::Validation(format!(
+                "Unsupported stream URL scheme: {scheme}"
+            )))
+        }
+    }
+    crate::ssrf::ensure_url_allowed(parsed.as_str()).await
 }
 
 /// Resolve a CEX/blockchain stream preset into (url, init_message, filter).
@@ -470,7 +493,7 @@ fn resolve_preset(
     }
 }
 
-async fn action_subscribe(params: &Value) -> Result<Value> {
+async fn action_subscribe(workspace: &Path, params: &Value) -> Result<Value> {
     // Resolve preset if provided
     let (url, init_message, filter) = if let Some(preset) =
         params.get("preset").and_then(|v| v.as_str())
@@ -527,10 +550,7 @@ async fn action_subscribe(params: &Value) -> Result<Value> {
         .get("protocol")
         .and_then(|v| v.as_str())
         .unwrap_or("auto");
-    let buffer_size = params
-        .get("buffer_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(100) as usize;
+    let buffer_size = bounded_buffer_size(params.get("buffer_size").and_then(|v| v.as_u64()));
 
     let mut headers = HashMap::new();
     if let Some(h) = params.get("headers").and_then(|v| v.as_object()) {
@@ -551,6 +571,7 @@ async fn action_subscribe(params: &Value) -> Result<Value> {
     } else {
         protocol
     };
+    validate_stream_url(&url).await?;
 
     let stream_id = format!(
         "stream_{}",
@@ -565,11 +586,12 @@ async fn action_subscribe(params: &Value) -> Result<Value> {
     let auto_restore = params
         .get("auto_restore")
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
     let max_reconnect = params
         .get("max_reconnect")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+        .unwrap_or(10)
+        .min(100) as u32;
 
     let sub = StreamSubscription {
         id: stream_id.clone(),
@@ -588,6 +610,7 @@ async fn action_subscribe(params: &Value) -> Result<Value> {
         auto_restore,
         reconnect_count: 0,
         max_reconnect,
+        owner_workspace: workspace.to_path_buf(),
     };
 
     // Create cancel channel
@@ -597,7 +620,7 @@ async fn action_subscribe(params: &Value) -> Result<Value> {
         let mut mgr = STREAM_MANAGER.lock().await;
         mgr.subscriptions.insert(stream_id.clone(), sub);
         mgr.cancel_handles.insert(stream_id.clone(), cancel_tx);
-        mgr.save_rules();
+        mgr.save_rules(workspace);
     }
 
     // Spawn background task
@@ -679,7 +702,34 @@ async fn run_websocket_stream(
             }
         };
 
-        let ws_stream = match tokio_tungstenite::connect_async(request).await {
+        let addresses = match crate::ssrf::resolve_url_addresses(&url).await {
+            Ok(addresses) => addresses,
+            Err(e) => {
+                set_stream_error(&stream_id, &format!("Stream address rejected: {e}")).await;
+                return;
+            }
+        };
+        let socket = match tokio::net::TcpStream::connect(addresses.as_slice()).await {
+            Ok(socket) => socket,
+            Err(e) => {
+                set_stream_error(&stream_id, &format!("WebSocket TCP connect failed: {e}")).await;
+                return;
+            }
+        };
+        let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+            max_message_size: Some(MAX_STREAM_MESSAGE_BYTES),
+            max_frame_size: Some(MAX_STREAM_MESSAGE_BYTES),
+            max_write_buffer_size: 2 * MAX_STREAM_MESSAGE_BYTES,
+            ..Default::default()
+        };
+        let ws_stream = match tokio_tungstenite::client_async_tls_with_config(
+            request,
+            socket,
+            Some(ws_config),
+            None,
+        )
+        .await
+        {
             Ok((stream, _)) => stream,
             Err(e) => {
                 warn!(stream_id = %stream_id, error = %e, attempt = reconnect_attempt, "WebSocket connect failed");
@@ -817,7 +867,13 @@ async fn run_sse_stream(
     'reconnect: loop {
         info!(stream_id = %stream_id, url = %url, attempt = reconnect_attempt, "SSE stream connecting");
 
-        let client = reqwest::Client::new();
+        let client = match crate::ssrf::safe_client_builder().build() {
+            Ok(client) => client,
+            Err(error) => {
+                set_stream_error(&stream_id, &format!("Failed to build SSE client: {error}")).await;
+                return;
+            }
+        };
         let mut req = client
             .get(&url)
             .header("Accept", "text/event-stream")
@@ -901,6 +957,16 @@ async fn run_sse_stream(
                         Ok(Some(bytes)) => {
                             let text = String::from_utf8_lossy(&bytes);
                             partial_line.push_str(&text);
+                            if partial_line.len() > MAX_STREAM_MESSAGE_BYTES
+                                || event_data.len() > MAX_STREAM_MESSAGE_BYTES
+                            {
+                                set_stream_error(
+                                    &stream_id,
+                                    "SSE event exceeded the maximum message size",
+                                )
+                                .await;
+                                return;
+                            }
 
                             while let Some(pos) = partial_line.find('\n') {
                                 let line = partial_line[..pos].trim_end_matches('\r').to_string();
@@ -992,6 +1058,15 @@ async fn buffer_message(stream_id: &str, data: &str) {
         };
 
         if should_buffer {
+            let data = if data.len() > MAX_STREAM_MESSAGE_BYTES {
+                let mut end = MAX_STREAM_MESSAGE_BYTES;
+                while end > 0 && !data.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &data[..end]
+            } else {
+                data
+            };
             sub.message_count += 1;
             sub.last_message_at = Some(now);
             sub.buffer.push(StreamMessage {
@@ -1055,9 +1130,17 @@ async fn set_stream_error(stream_id: &str, error: &str) {
     error!(stream_id = %stream_id, error = %error, "Stream error");
 }
 
-async fn action_unsubscribe(params: &Value) -> Result<Value> {
+async fn action_unsubscribe(workspace: &Path, params: &Value) -> Result<Value> {
     let stream_id = params["stream_id"].as_str().unwrap();
     let mut mgr = STREAM_MANAGER.lock().await;
+
+    let owned = mgr
+        .subscriptions
+        .get(stream_id)
+        .is_some_and(|sub| sub.owner_workspace == workspace);
+    if !owned {
+        return Err(Error::Tool(format!("Stream '{}' not found", stream_id)));
+    }
 
     if let Some(cancel_tx) = mgr.cancel_handles.remove(stream_id) {
         let _ = cancel_tx.send(true);
@@ -1065,7 +1148,7 @@ async fn action_unsubscribe(params: &Value) -> Result<Value> {
 
     let removed = mgr.subscriptions.remove(stream_id).is_some();
     if removed {
-        mgr.save_rules();
+        mgr.save_rules(workspace);
     }
 
     // Also remove WS writer if any
@@ -1082,7 +1165,7 @@ async fn action_unsubscribe(params: &Value) -> Result<Value> {
     }))
 }
 
-async fn action_read(params: &Value) -> Result<Value> {
+async fn action_read(workspace: &Path, params: &Value) -> Result<Value> {
     let stream_id = params["stream_id"].as_str().unwrap();
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
     let since = params.get("since_timestamp").and_then(|v| v.as_i64());
@@ -1091,6 +1174,7 @@ async fn action_read(params: &Value) -> Result<Value> {
     let sub = mgr
         .subscriptions
         .get(stream_id)
+        .filter(|sub| sub.owner_workspace == workspace)
         .ok_or_else(|| Error::Tool(format!("Stream '{}' not found", stream_id)))?;
 
     // Collect filtered messages, then take last N
@@ -1124,7 +1208,7 @@ async fn action_read(params: &Value) -> Result<Value> {
     }))
 }
 
-async fn action_send(params: &Value) -> Result<Value> {
+async fn action_send(workspace: &Path, params: &Value) -> Result<Value> {
     let stream_id = params["stream_id"].as_str().unwrap();
     let message = params["message"].as_str().unwrap();
 
@@ -1134,6 +1218,7 @@ async fn action_send(params: &Value) -> Result<Value> {
         let sub = mgr
             .subscriptions
             .get(stream_id)
+            .filter(|sub| sub.owner_workspace == workspace)
             .ok_or_else(|| Error::Tool(format!("Stream '{}' not found", stream_id)))?;
         if sub.protocol != "websocket" {
             return Err(Error::Tool(
@@ -1171,11 +1256,12 @@ async fn action_send(params: &Value) -> Result<Value> {
     }
 }
 
-async fn action_list() -> Result<Value> {
+async fn action_list_for_workspace(workspace: &Path) -> Result<Value> {
     let mgr = STREAM_MANAGER.lock().await;
     let streams: Vec<Value> = mgr
         .subscriptions
         .values()
+        .filter(|sub| sub.owner_workspace == workspace)
         .map(|sub| {
             json!({
                 "stream_id": sub.id,
@@ -1199,12 +1285,13 @@ async fn action_list() -> Result<Value> {
     }))
 }
 
-async fn action_status(params: &Value) -> Result<Value> {
+async fn action_status(workspace: &Path, params: &Value) -> Result<Value> {
     let stream_id = params["stream_id"].as_str().unwrap();
     let mgr = STREAM_MANAGER.lock().await;
     let sub = mgr
         .subscriptions
         .get(stream_id)
+        .filter(|sub| sub.owner_workspace == workspace)
         .ok_or_else(|| Error::Tool(format!("Stream '{}' not found", stream_id)))?;
 
     Ok(json!({
@@ -1226,11 +1313,8 @@ async fn action_status(params: &Value) -> Result<Value> {
 }
 
 /// Restore all persisted subscriptions from disk.
-async fn restore_all_subscriptions() -> Result<Value> {
-    let rules = {
-        let mgr = STREAM_MANAGER.lock().await;
-        mgr.load_rules()
-    };
+async fn restore_all_subscriptions(workspace: &Path) -> Result<Value> {
+    let rules = StreamManager::load_rules(workspace);
 
     if rules.is_empty() {
         return Ok(json!({ "restored": 0, "note": "No persisted subscriptions found" }));
@@ -1254,7 +1338,7 @@ async fn restore_all_subscriptions() -> Result<Value> {
             status: "connecting".to_string(),
             message_count: 0,
             buffer: Vec::new(),
-            buffer_size: rule.buffer_size,
+            buffer_size: rule.buffer_size.clamp(1, MAX_STREAM_BUFFER_MESSAGES),
             filter: rule.filter.clone(),
             headers: rule.headers.clone(),
             init_message: rule.init_message.clone(),
@@ -1263,7 +1347,12 @@ async fn restore_all_subscriptions() -> Result<Value> {
             error: None,
             auto_restore: true,
             reconnect_count: 0,
-            max_reconnect: rule.max_reconnect,
+            max_reconnect: if rule.max_reconnect == 0 {
+                10
+            } else {
+                rule.max_reconnect.min(100)
+            },
+            owner_workspace: workspace.to_path_buf(),
         };
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -1309,8 +1398,8 @@ async fn restore_all_subscriptions() -> Result<Value> {
     }))
 }
 
-async fn action_restore() -> Result<Value> {
-    restore_all_subscriptions().await
+async fn action_restore(workspace: &Path) -> Result<Value> {
+    restore_all_subscriptions(workspace).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,20 +1408,67 @@ async fn action_restore() -> Result<Value> {
 
 /// List all active stream subscriptions (for gateway /v1/streams endpoint).
 pub async fn list_streams() -> Value {
-    action_list()
-        .await
-        .unwrap_or_else(|_| json!({"streams": [], "count": 0}))
+    let mgr = STREAM_MANAGER.lock().await;
+    let streams: Vec<Value> = mgr
+        .subscriptions
+        .values()
+        .map(|sub| {
+            json!({
+                "stream_id": sub.id,
+                "url": sub.url,
+                "protocol": sub.protocol,
+                "status": sub.status,
+                "message_count": sub.message_count,
+                "buffered": sub.buffer.len(),
+            })
+        })
+        .collect();
+    json!({"count": streams.len(), "streams": streams})
 }
 
 /// Get buffered data for a specific stream (for gateway /v1/streams/:id/data endpoint).
 pub async fn get_stream_data(stream_id: &str, limit: usize) -> Result<Value> {
-    let params = json!({"stream_id": stream_id, "limit": limit});
-    action_read(&params).await
+    let mgr = STREAM_MANAGER.lock().await;
+    let sub = mgr
+        .subscriptions
+        .get(stream_id)
+        .ok_or_else(|| Error::Tool(format!("Stream '{}' not found", stream_id)))?;
+    let messages: Vec<Value> = sub
+        .buffer
+        .iter()
+        .rev()
+        .take(limit)
+        .rev()
+        .map(|message| json!({"timestamp": message.timestamp, "data": message.data}))
+        .collect();
+    Ok(json!({"stream_id": stream_id, "messages": messages}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_subscription(id: &str, workspace: &std::path::Path) -> StreamSubscription {
+        StreamSubscription {
+            id: id.to_string(),
+            url: "wss://example.com/ws".to_string(),
+            protocol: "websocket".to_string(),
+            status: "connected".to_string(),
+            message_count: 0,
+            buffer: Vec::new(),
+            buffer_size: 100,
+            filter: None,
+            headers: HashMap::new(),
+            init_message: None,
+            created_at: 0,
+            last_message_at: None,
+            error: None,
+            auto_restore: false,
+            reconnect_count: 0,
+            max_reconnect: 1,
+            owner_workspace: workspace.to_path_buf(),
+        }
+    }
 
     #[test]
     fn test_schema() {
@@ -1378,7 +1514,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_empty() {
-        let result = action_list().await.unwrap();
+        let result = action_list_for_workspace(Path::new("/tmp/blockcell-empty-stream-test"))
+            .await
+            .unwrap();
         assert!(result.get("streams").is_some());
         assert!(result.get("count").is_some());
     }
@@ -1386,7 +1524,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_nonexistent() {
         let params = json!({"stream_id": "nonexistent_stream_xyz"});
-        let result = action_read(&params).await;
+        let result = action_read(Path::new("/tmp/blockcell-read-stream-test"), &params).await;
         assert!(result.is_err());
     }
 
@@ -1424,10 +1562,7 @@ mod tests {
 
     #[test]
     fn test_persistence_path() {
-        let mut mgr = StreamManager::new();
-        assert!(mgr.persistence_path().is_none());
-        mgr.workspace = Some(PathBuf::from("/tmp/test_workspace"));
-        let path = mgr.persistence_path().unwrap();
+        let path = StreamManager::persistence_path(Path::new("/tmp/test_workspace"));
         assert_eq!(
             path,
             PathBuf::from("/tmp/test_workspace/streams/subscriptions.json")
@@ -1443,6 +1578,47 @@ mod tests {
             .is_ok());
         // neither url nor preset should fail
         assert!(tool.validate(&json!({"action": "subscribe"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stream_url_rejects_private_targets() {
+        assert!(validate_stream_url("ws://127.0.0.1:9000/socket")
+            .await
+            .is_err());
+        assert!(validate_stream_url("http://169.254.169.254/events")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_action_list_is_scoped_to_workspace() {
+        let workspace_a = PathBuf::from("/tmp/blockcell-stream-a");
+        let workspace_b = PathBuf::from("/tmp/blockcell-stream-b");
+        {
+            let mut mgr = STREAM_MANAGER.lock().await;
+            mgr.subscriptions.insert(
+                "stream_workspace_a".to_string(),
+                test_subscription("stream_workspace_a", &workspace_a),
+            );
+        }
+
+        let result = action_list_for_workspace(&workspace_b).await.unwrap();
+        assert_eq!(result["count"], 0);
+
+        STREAM_MANAGER
+            .lock()
+            .await
+            .subscriptions
+            .remove("stream_workspace_a");
+    }
+
+    #[test]
+    fn test_stream_buffer_size_is_capped() {
+        assert_eq!(
+            bounded_buffer_size(Some(u64::MAX)),
+            MAX_STREAM_BUFFER_MESSAGES
+        );
+        assert_eq!(bounded_buffer_size(Some(0)), 1);
     }
 
     #[test]

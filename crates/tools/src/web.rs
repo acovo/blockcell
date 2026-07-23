@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use blockcell_core::{Error, Result};
-use reqwest::Client;
 use serde_json::{json, Value};
 
 use crate::{Tool, ToolContext, ToolSchema};
@@ -157,7 +156,7 @@ async fn brave_search(
     count: usize,
     freshness: Option<&str>,
 ) -> Result<Vec<Value>> {
-    let client = Client::builder()
+    let client = crate::ssrf::safe_client_builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| Error::Tool(format!("HTTP client error: {}", e)))?;
@@ -178,13 +177,19 @@ async fn brave_search(
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let (text, _) = crate::bounded_io::read_response_limited(response, 64 * 1024).await?;
+        let text = String::from_utf8_lossy(&text);
         return Err(Error::Tool(format!("Brave API error {}: {}", status, text)));
     }
 
-    let data: Value = response
-        .json()
-        .await
+    let (data, truncated) =
+        crate::bounded_io::read_response_limited(response, 2 * 1024 * 1024).await?;
+    if truncated {
+        return Err(Error::Tool(
+            "Brave response exceeded size limit".to_string(),
+        ));
+    }
+    let data: Value = serde_json::from_slice(&data)
         .map_err(|e| Error::Tool(format!("Failed to parse Brave response: {}", e)))?;
 
     let results: Vec<Value> = data["web"]["results"]
@@ -213,7 +218,7 @@ async fn baidu_search(
     count: usize,
     freshness: Option<&str>,
 ) -> Result<Vec<Value>> {
-    let client = Client::builder()
+    let client = crate::ssrf::safe_client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| Error::Tool(format!("HTTP client error: {}", e)))?;
@@ -251,13 +256,19 @@ async fn baidu_search(
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let (text, _) = crate::bounded_io::read_response_limited(response, 64 * 1024).await?;
+        let text = String::from_utf8_lossy(&text);
         return Err(Error::Tool(format!("Baidu API error {}: {}", status, text)));
     }
 
-    let data: Value = response
-        .json()
-        .await
+    let (data, truncated) =
+        crate::bounded_io::read_response_limited(response, 2 * 1024 * 1024).await?;
+    if truncated {
+        return Err(Error::Tool(
+            "Baidu response exceeded size limit".to_string(),
+        ));
+    }
+    let data: Value = serde_json::from_slice(&data)
         .map_err(|e| Error::Tool(format!("Failed to parse Baidu response: {}", e)))?;
 
     // Check for API-level error
@@ -527,7 +538,7 @@ async fn fetch_via_cdp(url: &str, max_chars: usize, workspace: &std::path::Path)
 
 /// Fetch and extract plain text (strip all formatting).
 async fn fetch_text(url: &str, max_chars: usize) -> Result<Value> {
-    let client = Client::builder()
+    let client = crate::ssrf::safe_client_builder()
         .redirect(crate::ssrf::redirect_policy(true))
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -551,10 +562,12 @@ async fn fetch_text(url: &str, max_chars: usize) -> Result<Value> {
         .unwrap_or("")
         .to_string();
 
-    let body = response
-        .text()
-        .await
-        .map_err(|e| Error::Tool(format!("Failed to read response body: {}", e)))?;
+    let (body, body_truncated) = crate::bounded_io::read_response_limited(
+        response,
+        max_chars.saturating_mul(4).min(4_000_000),
+    )
+    .await?;
+    let body = String::from_utf8_lossy(&body).into_owned();
 
     let text = if content_type.contains("text/html") {
         extract_text_from_html(&body)
@@ -562,7 +575,7 @@ async fn fetch_text(url: &str, max_chars: usize) -> Result<Value> {
         body
     };
 
-    let truncated = text.len() > max_chars;
+    let truncated = body_truncated || text.len() > max_chars;
     let text = if truncated {
         let mut end = max_chars;
         while end > 0 && !text.is_char_boundary(end) {
@@ -586,7 +599,7 @@ async fn fetch_text(url: &str, max_chars: usize) -> Result<Value> {
 
 /// Fetch raw response body without conversion.
 async fn fetch_raw(url: &str, max_chars: usize) -> Result<Value> {
-    let client = Client::builder()
+    let client = crate::ssrf::safe_client_builder()
         .redirect(crate::ssrf::redirect_policy(true))
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -610,12 +623,14 @@ async fn fetch_raw(url: &str, max_chars: usize) -> Result<Value> {
         .unwrap_or("")
         .to_string();
 
-    let body = response
-        .text()
-        .await
-        .map_err(|e| Error::Tool(format!("Failed to read response body: {}", e)))?;
+    let (body, body_truncated) = crate::bounded_io::read_response_limited(
+        response,
+        max_chars.saturating_mul(4).min(4_000_000),
+    )
+    .await?;
+    let body = String::from_utf8_lossy(&body).into_owned();
 
-    let truncated = body.len() > max_chars;
+    let truncated = body_truncated || body.len() > max_chars;
     let body = if truncated {
         let mut end = max_chars;
         while end > 0 && !body.is_char_boundary(end) {

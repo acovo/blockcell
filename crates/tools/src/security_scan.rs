@@ -733,16 +733,7 @@ fn scan_dir_recursive(
     total_size: &mut u64,
     trust_level: TrustLevel,
 ) {
-    if path.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                scan_dir_recursive(&entry.path(), issues, file_count, total_size, trust_level);
-            }
-        }
-        return;
-    }
-
-    // 检查符号链接逃逸 (必须在 is_file 之前，因为 symlink to file 也返回 is_file=true)
+    // Check link metadata before `is_dir`/`is_file`, both of which follow links.
     if path.is_symlink() {
         let rel = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         issues.push(SecurityIssue {
@@ -751,6 +742,15 @@ fn scan_dir_recursive(
             message: format!("Skill 包含符号链接 '{}' (可能逃逸目录)", rel),
             line: None,
         });
+        return;
+    }
+
+    if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                scan_dir_recursive(&entry.path(), issues, file_count, total_size, trust_level);
+            }
+        }
         return;
     }
 
@@ -929,5 +929,28 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.rule.contains("dangerous_command"))); // Critical 在 issues 中
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_directory_symlink_is_reported_without_recursing() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("blockcell-scan-{}", uuid::Uuid::new_v4()));
+        let outside = root.with_extension("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("payload.txt"), "safe text").unwrap();
+        symlink(&outside, root.join("linked-dir")).unwrap();
+
+        let report = scan_skill_dir_with_trust(&root, TrustLevel::Community);
+        assert!(!report.passed);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.rule == "structure:symlink_escape"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use blockcell_core::{Error, Result};
-use reqwest::Client;
 use serde_json::{json, Value};
 
 use crate::ssrf::{ensure_url_allowed, redirect_policy};
@@ -232,13 +231,14 @@ impl Tool for HttpRequestTool {
         let max_response_chars = params
             .get("max_response_chars")
             .and_then(|v| v.as_u64())
-            .unwrap_or(50000) as usize;
+            .unwrap_or(50000)
+            .min(1_000_000) as usize;
 
         // SSRF guard: refuse private/internal targets before connecting.
         ensure_url_allowed(url).await?;
 
         // Build client
-        let client = Client::builder()
+        let client = crate::ssrf::safe_client_builder()
             .redirect(redirect_policy(follow_redirects))
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
@@ -419,12 +419,17 @@ impl Tool for HttpRequestTool {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|e| Error::Tool(format!("Failed to read response body: {}", e)))?;
-            let size = bytes.len();
-            tokio::fs::write(&path, &bytes).await?;
+            const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
+            let (size, truncated) =
+                crate::bounded_io::stream_response_to_file(response, &path, MAX_DOWNLOAD_BYTES)
+                    .await?;
+            if truncated {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(Error::Tool(format!(
+                    "Download exceeded the {} byte safety limit",
+                    MAX_DOWNLOAD_BYTES
+                )));
+            }
 
             return Ok(json!({
                 "status": status,
@@ -437,10 +442,9 @@ impl Tool for HttpRequestTool {
         }
 
         // Read response body
-        let body_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Error::Tool(format!("Failed to read response body: {}", e)))?;
+        let byte_limit = max_response_chars.saturating_mul(4).min(4_000_000);
+        let (body_bytes, body_read_truncated) =
+            crate::bounded_io::read_response_limited(response, byte_limit).await?;
 
         let body_text = String::from_utf8_lossy(&body_bytes).to_string();
 
@@ -453,7 +457,7 @@ impl Tool for HttpRequestTool {
             };
 
         // Truncate if needed
-        let truncated = body_text.len() > max_response_chars;
+        let truncated = body_read_truncated || body_text.len() > max_response_chars;
         let body_display = if truncated {
             let mut end = max_response_chars;
             while end > 0 && !body_text.is_char_boundary(end) {
