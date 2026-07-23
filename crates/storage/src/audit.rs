@@ -435,6 +435,7 @@ impl AuditLogger {
                 Ok(record) => record,
                 Err(e) => {
                     skipped_records += 1;
+                    errors.push(format!("Line {line_no}: invalid audit record: {e}"));
                     error!(
                         error = %e,
                         line = %line,
@@ -864,6 +865,25 @@ mod tests {
             .errors
             .iter()
             .any(|err| err.contains("prev_hash mismatch")));
+    }
+
+    #[test]
+    fn verify_chain_rejects_malformed_nonempty_records() {
+        let temp_dir = TempDir::new().unwrap();
+        let paths = Paths::with_base(temp_dir.path().to_path_buf());
+        let mut logger = AuditLogger::new(paths.clone());
+        logger
+            .log_permission_decision("exec", "Allow".to_string(), None, None, false, "cli:test")
+            .unwrap();
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log_file = paths.audit_dir().join(format!("{today}.jsonl"));
+        let mut file = OpenOptions::new().append(true).open(&log_file).unwrap();
+        writeln!(file, "not-json").unwrap();
+
+        let result = AuditLogger::verify_chain(&log_file);
+        assert!(!result.valid);
+        assert_eq!(result.skipped_records, 1);
     }
 
     #[test]

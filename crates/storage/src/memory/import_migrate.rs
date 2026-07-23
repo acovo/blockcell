@@ -143,28 +143,19 @@ impl MemoryStore {
         // Import MEMORY.md
         let memory_md = memory_dir.join("MEMORY.md");
         if memory_md.exists() {
-            if let Ok(content) = std::fs::read_to_string(&memory_md) {
-                match self.import_long_term_md(&content) {
-                    Ok(n) => total += n,
-                    Err(e) => warn!(error = %e, "Failed to import MEMORY.md"),
-                }
-            }
+            let content = std::fs::read_to_string(&memory_md)?;
+            total += self.import_long_term_md(&content)?;
         }
 
         // Import daily notes
-        if let Ok(entries) = std::fs::read_dir(memory_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                // Match YYYY-MM-DD.md pattern
-                if name.len() == 13 && name.ends_with(".md") && name != "MEMORY.md" {
-                    let date = &name[..10];
-                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                        match self.import_daily_md(date, &content) {
-                            Ok(n) => total += n,
-                            Err(e) => warn!(date, error = %e, "Failed to import daily note"),
-                        }
-                    }
-                }
+        for entry in std::fs::read_dir(memory_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Match YYYY-MM-DD.md pattern
+            if name.len() == 13 && name.ends_with(".md") && name != "MEMORY.md" {
+                let date = &name[..10];
+                let content = std::fs::read_to_string(entry.path())?;
+                total += self.import_daily_md(date, &content)?;
             }
         }
 

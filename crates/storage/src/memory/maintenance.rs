@@ -4,17 +4,32 @@ impl MemoryStore {
     /// Soft-delete a memory item.
     pub fn soft_delete(&self, id: &str) -> Result<bool> {
         let deleted = {
-            let conn = self
+            let mut conn = self
                 .inner
                 .lock()
                 .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
+            let tx = conn.transaction().map_err(|e| {
+                blockcell_core::Error::Storage(format!(
+                    "Begin soft-delete transaction error: {}",
+                    e
+                ))
+            })?;
             let now = Utc::now().to_rfc3339();
-            let affected = conn
+            let affected = tx
                 .execute(
                     "UPDATE memory_items SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
                     params![now, id],
                 )
                 .map_err(|e| blockcell_core::Error::Storage(format!("Soft delete error: {}", e)))?;
+            if affected > 0 && self.vector.is_some() {
+                Self::enqueue_vector_sync_on_conn(&tx, id, VECTOR_SYNC_OP_DELETE, 0, None)?;
+            }
+            tx.commit().map_err(|e| {
+                blockcell_core::Error::Storage(format!(
+                    "Commit soft-delete transaction error: {}",
+                    e
+                ))
+            })?;
             affected > 0
         };
 
@@ -34,10 +49,16 @@ impl MemoryStore {
         time_before: Option<&str>,
     ) -> Result<usize> {
         let ids = {
-            let conn = self
+            let mut conn = self
                 .inner
                 .lock()
                 .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
+            let tx = conn.transaction().map_err(|e| {
+                blockcell_core::Error::Storage(format!(
+                    "Begin batch-delete transaction error: {}",
+                    e
+                ))
+            })?;
 
             let mut sql = "SELECT id FROM memory_items WHERE deleted_at IS NULL".to_string();
             let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -71,7 +92,7 @@ impl MemoryStore {
 
             let bind_refs: Vec<&dyn rusqlite::types::ToSql> =
                 bind_values.iter().map(|b| b.as_ref()).collect();
-            let mut stmt = conn.prepare(&sql).map_err(|e| {
+            let mut stmt = tx.prepare(&sql).map_err(|e| {
                 blockcell_core::Error::Storage(format!("Batch delete prepare error: {}", e))
             })?;
             let rows = stmt
@@ -88,8 +109,17 @@ impl MemoryStore {
             }
 
             if ids.is_empty() {
+                drop(stmt);
+                tx.commit().map_err(|e| {
+                    blockcell_core::Error::Storage(format!(
+                        "Commit batch-delete transaction error: {}",
+                        e
+                    ))
+                })?;
                 return Ok(0);
             }
+
+            drop(stmt);
 
             let now = Utc::now().to_rfc3339();
             let placeholders = (0..ids.len())
@@ -110,10 +140,22 @@ impl MemoryStore {
             let update_refs: Vec<&dyn rusqlite::types::ToSql> =
                 update_values.iter().map(|value| value.as_ref()).collect();
 
-            conn.execute(&update_sql, update_refs.as_slice())
+            tx.execute(&update_sql, update_refs.as_slice())
                 .map_err(|e| {
                     blockcell_core::Error::Storage(format!("Batch delete update error: {}", e))
                 })?;
+
+            if self.vector.is_some() {
+                for id in &ids {
+                    Self::enqueue_vector_sync_on_conn(&tx, id, VECTOR_SYNC_OP_DELETE, 0, None)?;
+                }
+            }
+            tx.commit().map_err(|e| {
+                blockcell_core::Error::Storage(format!(
+                    "Commit batch-delete transaction error: {}",
+                    e
+                ))
+            })?;
 
             ids
         };
@@ -126,11 +168,14 @@ impl MemoryStore {
     /// Restore a soft-deleted item.
     pub fn restore(&self, id: &str) -> Result<bool> {
         let restored_item = {
-            let conn = self
+            let mut conn = self
                 .inner
                 .lock()
                 .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
-            let affected = conn
+            let tx = conn.transaction().map_err(|e| {
+                blockcell_core::Error::Storage(format!("Begin restore transaction error: {}", e))
+            })?;
+            let affected = tx
                 .execute(
                     "UPDATE memory_items SET deleted_at = NULL WHERE id = ?1 AND deleted_at IS NOT NULL",
                     params![id],
@@ -138,9 +183,25 @@ impl MemoryStore {
                 .map_err(|e| blockcell_core::Error::Storage(format!("Restore error: {}", e)))?;
 
             if affected == 0 {
+                tx.commit().map_err(|e| {
+                    blockcell_core::Error::Storage(format!(
+                        "Commit restore transaction error: {}",
+                        e
+                    ))
+                })?;
                 None
             } else {
-                Some(self.get_by_id_inner(&conn, id)?)
+                let item = self.get_by_id_inner(&tx, id)?;
+                if self.vector.is_some() {
+                    Self::enqueue_vector_sync_on_conn(&tx, id, VECTOR_SYNC_OP_UPSERT, 0, None)?;
+                }
+                tx.commit().map_err(|e| {
+                    blockcell_core::Error::Storage(format!(
+                        "Commit restore transaction error: {}",
+                        e
+                    ))
+                })?;
+                Some(item)
             }
         };
 
@@ -156,16 +217,22 @@ impl MemoryStore {
     /// soft-deleted for more than `recycle_days` days.
     pub fn maintenance(&self, recycle_days: i64) -> Result<(usize, usize)> {
         let (expired_ids, purged_ids) = {
-            let conn = self
+            let mut conn = self
                 .inner
                 .lock()
                 .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
+            let tx = conn.transaction().map_err(|e| {
+                blockcell_core::Error::Storage(format!(
+                    "Begin maintenance transaction error: {}",
+                    e
+                ))
+            })?;
 
             let now = Utc::now().to_rfc3339();
             let cutoff = (Utc::now() - chrono::Duration::days(recycle_days)).to_rfc3339();
 
             let expired_ids = {
-                let mut stmt = conn
+                let mut stmt = tx
                     .prepare(
                         "SELECT id FROM memory_items
                          WHERE expires_at IS NOT NULL
@@ -190,7 +257,7 @@ impl MemoryStore {
             };
 
             let purged_ids = {
-                let mut stmt = conn
+                let mut stmt = tx
                     .prepare(
                         "SELECT id FROM memory_items
                          WHERE deleted_at IS NOT NULL
@@ -230,7 +297,7 @@ impl MemoryStore {
                 }
                 let refs: Vec<&dyn rusqlite::types::ToSql> =
                     values.iter().map(|value| value.as_ref()).collect();
-                conn.execute(&sql, refs.as_slice()).map_err(|e| {
+                tx.execute(&sql, refs.as_slice()).map_err(|e| {
                     blockcell_core::Error::Storage(format!("TTL cleanup update error: {}", e))
                 })?;
             }
@@ -245,10 +312,22 @@ impl MemoryStore {
                     .iter()
                     .map(|id| id as &dyn rusqlite::types::ToSql)
                     .collect();
-                conn.execute(&sql, values.as_slice()).map_err(|e| {
+                tx.execute(&sql, values.as_slice()).map_err(|e| {
                     blockcell_core::Error::Storage(format!("Purge delete error: {}", e))
                 })?;
             }
+
+            if self.vector.is_some() {
+                for id in expired_ids.iter().chain(purged_ids.iter()) {
+                    Self::enqueue_vector_sync_on_conn(&tx, id, VECTOR_SYNC_OP_DELETE, 0, None)?;
+                }
+            }
+            tx.commit().map_err(|e| {
+                blockcell_core::Error::Storage(format!(
+                    "Commit maintenance transaction error: {}",
+                    e
+                ))
+            })?;
 
             (expired_ids, purged_ids)
         };

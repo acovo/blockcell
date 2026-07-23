@@ -82,8 +82,10 @@ impl EvolutionWorkflowStore {
 
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path).map_err(map_sqlite_error)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-            .map_err(map_sqlite_error)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )
+        .map_err(map_sqlite_error)?;
         let store = Self {
             inner: Arc::new(Mutex::new(conn)),
             db_path: db_path.to_path_buf(),
@@ -303,17 +305,14 @@ impl EvolutionWorkflowStore {
     /// Resets Claimed workflows with expired leases back to Requested,
     /// and also recovers RetryScheduled workflows whose backoff has elapsed.
     pub fn recover_expired_leases(&self) -> Result<Vec<WorkflowRecord>> {
-        let conn = self.lock_conn()?;
+        let mut conn = self.lock_conn()?;
         let now_str = now_rfc3339();
-
-        // Wrap recovery in a transaction for atomicity.
-        // If the process crashes between the two UPDATEs, partial recovery
-        // won't happen — the transaction will be rolled back.
-        conn.execute_batch("BEGIN IMMEDIATE")
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
 
         // 1. Reset expired leases back to Requested
-        conn.execute(
+        tx.execute(
             "UPDATE evo_workflows
              SET status = 'Requested', lease_owner = NULL, lease_until = NULL, updated_at = ?1
              WHERE status = 'Claimed'
@@ -324,7 +323,7 @@ impl EvolutionWorkflowStore {
         .map_err(map_sqlite_error)?;
 
         // 2. Recover RetryScheduled workflows whose backoff has elapsed
-        conn.execute(
+        tx.execute(
             "UPDATE evo_workflows
              SET lease_owner = NULL, lease_until = NULL, updated_at = ?1
              WHERE status = 'RetryScheduled'
@@ -334,7 +333,7 @@ impl EvolutionWorkflowStore {
         .map_err(map_sqlite_error)?;
 
         // Return recoverable workflows
-        let mut stmt = conn
+        let mut stmt = tx
             .prepare(
                 "SELECT id, capability_id, description, provider_kind, status, attempt, max_attempts,
                         priority, created_at, updated_at, lease_owner, lease_until, last_error
@@ -345,7 +344,7 @@ impl EvolutionWorkflowStore {
             )
             .map_err(map_sqlite_error)?;
 
-        let records = stmt
+        let rows = stmt
             .query_map(params![now_str], |row| {
                 Ok(WorkflowRecord {
                     id: row.get(0)?,
@@ -363,11 +362,13 @@ impl EvolutionWorkflowStore {
                     last_error: row.get(12)?,
                 })
             })
-            .map_err(map_sqlite_error)?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        conn.execute_batch("COMMIT").map_err(map_sqlite_error)?;
+            .map_err(map_sqlite_error)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(map_sqlite_error)?);
+        }
+        drop(stmt);
+        tx.commit().map_err(map_sqlite_error)?;
 
         Ok(records)
     }
@@ -1077,5 +1078,13 @@ mod tests {
             .expect("claimed workflow");
         assert_eq!(skill_claimed.id, skill_id);
         assert_eq!(skill_claimed.provider_kind, "skill");
+    }
+
+    #[test]
+    fn workflow_children_require_an_existing_workflow() {
+        let (_dir, store) = open_temp_store();
+
+        assert!(store.insert_step("missing", "BuildPrompt", None).is_err());
+        assert!(store.append_event("missing", "cancel", None).is_err());
     }
 }

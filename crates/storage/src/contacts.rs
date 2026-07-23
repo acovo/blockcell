@@ -1,4 +1,5 @@
-use blockcell_core::Paths;
+use crate::file_lock::{lock_exclusive, write_atomically};
+use blockcell_core::{Paths, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::debug;
@@ -35,29 +36,35 @@ impl ChannelContacts {
 
     /// Load all contacts from disk.
     pub fn load(&self) -> Vec<ChannelContact> {
+        self.try_load().unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "Failed to load channel contacts");
+            Vec::new()
+        })
+    }
+
+    fn try_load(&self) -> Result<Vec<ChannelContact>> {
         let path = self.file_path();
         if !path.exists() {
-            return vec![];
+            return Ok(vec![]);
         }
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let content = std::fs::read_to_string(&path)?;
+        Ok(serde_json::from_str(&content)?)
     }
 
     /// Save all contacts to disk.
-    fn save(&self, contacts: &[ChannelContact]) {
+    fn save(&self, contacts: &[ChannelContact]) -> Result<()> {
         let path = self.file_path();
-        let _ = std::fs::write(
-            &path,
-            serde_json::to_string_pretty(contacts).unwrap_or_default(),
-        );
+        let content = serde_json::to_vec_pretty(contacts)?;
+        write_atomically(&path, &content)?;
+        Ok(())
     }
 
     /// Upsert a contact: if a matching (channel, chat_id) entry exists, update it;
     /// otherwise insert a new entry.
-    pub fn upsert(&self, contact: ChannelContact) {
-        let mut contacts = self.load();
+    pub fn upsert(&self, contact: ChannelContact) -> Result<()> {
+        let path = self.file_path();
+        let _lock = lock_exclusive(&path)?;
+        let mut contacts = self.try_load()?;
         let existing = contacts
             .iter_mut()
             .find(|c| c.channel == contact.channel && c.chat_id == contact.chat_id);
@@ -84,7 +91,7 @@ impl ChannelContacts {
             );
             contacts.push(contact);
         }
-        self.save(&contacts);
+        self.save(&contacts)
     }
 
     /// Look up contacts by channel and name (case-insensitive substring match).
@@ -141,14 +148,16 @@ mod tests {
         let (store, _dir) = test_contacts();
         assert!(store.load().is_empty());
 
-        store.upsert(ChannelContact {
-            channel: "dingtalk".into(),
-            chat_id: "user123".into(),
-            sender_id: "user123".into(),
-            name: "张三".into(),
-            chat_type: "private".into(),
-            last_active: "2025-01-01T00:00:00Z".into(),
-        });
+        store
+            .upsert(ChannelContact {
+                channel: "dingtalk".into(),
+                chat_id: "user123".into(),
+                sender_id: "user123".into(),
+                name: "张三".into(),
+                chat_type: "private".into(),
+                last_active: "2025-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
 
         let all = store.load();
         assert_eq!(all.len(), 1);
@@ -159,22 +168,26 @@ mod tests {
     #[test]
     fn test_upsert_updates_existing() {
         let (store, _dir) = test_contacts();
-        store.upsert(ChannelContact {
-            channel: "dingtalk".into(),
-            chat_id: "user123".into(),
-            sender_id: "user123".into(),
-            name: "张三".into(),
-            chat_type: "private".into(),
-            last_active: "2025-01-01T00:00:00Z".into(),
-        });
-        store.upsert(ChannelContact {
-            channel: "dingtalk".into(),
-            chat_id: "user123".into(),
-            sender_id: "user123".into(),
-            name: "张三丰".into(),
-            chat_type: "private".into(),
-            last_active: "2025-01-02T00:00:00Z".into(),
-        });
+        store
+            .upsert(ChannelContact {
+                channel: "dingtalk".into(),
+                chat_id: "user123".into(),
+                sender_id: "user123".into(),
+                name: "张三".into(),
+                chat_type: "private".into(),
+                last_active: "2025-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        store
+            .upsert(ChannelContact {
+                channel: "dingtalk".into(),
+                chat_id: "user123".into(),
+                sender_id: "user123".into(),
+                name: "张三丰".into(),
+                chat_type: "private".into(),
+                last_active: "2025-01-02T00:00:00Z".into(),
+            })
+            .unwrap();
 
         let all = store.load();
         assert_eq!(all.len(), 1);
@@ -185,30 +198,36 @@ mod tests {
     #[test]
     fn test_lookup_by_name() {
         let (store, _dir) = test_contacts();
-        store.upsert(ChannelContact {
-            channel: "dingtalk".into(),
-            chat_id: "u1".into(),
-            sender_id: "u1".into(),
-            name: "Alice".into(),
-            chat_type: "private".into(),
-            last_active: "2025-01-01T00:00:00Z".into(),
-        });
-        store.upsert(ChannelContact {
-            channel: "dingtalk".into(),
-            chat_id: "u2".into(),
-            sender_id: "u2".into(),
-            name: "Bob".into(),
-            chat_type: "private".into(),
-            last_active: "2025-01-02T00:00:00Z".into(),
-        });
-        store.upsert(ChannelContact {
-            channel: "telegram".into(),
-            chat_id: "t1".into(),
-            sender_id: "t1".into(),
-            name: "Alice T".into(),
-            chat_type: "private".into(),
-            last_active: "2025-01-03T00:00:00Z".into(),
-        });
+        store
+            .upsert(ChannelContact {
+                channel: "dingtalk".into(),
+                chat_id: "u1".into(),
+                sender_id: "u1".into(),
+                name: "Alice".into(),
+                chat_type: "private".into(),
+                last_active: "2025-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        store
+            .upsert(ChannelContact {
+                channel: "dingtalk".into(),
+                chat_id: "u2".into(),
+                sender_id: "u2".into(),
+                name: "Bob".into(),
+                chat_type: "private".into(),
+                last_active: "2025-01-02T00:00:00Z".into(),
+            })
+            .unwrap();
+        store
+            .upsert(ChannelContact {
+                channel: "telegram".into(),
+                chat_id: "t1".into(),
+                sender_id: "t1".into(),
+                name: "Alice T".into(),
+                chat_type: "private".into(),
+                last_active: "2025-01-03T00:00:00Z".into(),
+            })
+            .unwrap();
 
         let results = store.lookup("dingtalk", "alice");
         assert_eq!(results.len(), 1);
@@ -228,22 +247,26 @@ mod tests {
     #[test]
     fn test_list_by_channel() {
         let (store, _dir) = test_contacts();
-        store.upsert(ChannelContact {
-            channel: "dingtalk".into(),
-            chat_id: "u1".into(),
-            sender_id: "u1".into(),
-            name: "A".into(),
-            chat_type: "private".into(),
-            last_active: "2025-01-01T00:00:00Z".into(),
-        });
-        store.upsert(ChannelContact {
-            channel: "telegram".into(),
-            chat_id: "t1".into(),
-            sender_id: "t1".into(),
-            name: "B".into(),
-            chat_type: "private".into(),
-            last_active: "2025-01-01T00:00:00Z".into(),
-        });
+        store
+            .upsert(ChannelContact {
+                channel: "dingtalk".into(),
+                chat_id: "u1".into(),
+                sender_id: "u1".into(),
+                name: "A".into(),
+                chat_type: "private".into(),
+                last_active: "2025-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        store
+            .upsert(ChannelContact {
+                channel: "telegram".into(),
+                chat_id: "t1".into(),
+                sender_id: "t1".into(),
+                name: "B".into(),
+                chat_type: "private".into(),
+                last_active: "2025-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
 
         assert_eq!(store.list_by_channel("dingtalk").len(), 1);
         assert_eq!(store.list_by_channel("telegram").len(), 1);
@@ -253,18 +276,39 @@ mod tests {
     #[test]
     fn test_summary() {
         let (store, _dir) = test_contacts();
-        store.upsert(ChannelContact {
-            channel: "dingtalk".into(),
-            chat_id: "u1".into(),
-            sender_id: "u1".into(),
-            name: "张三".into(),
-            chat_type: "private".into(),
-            last_active: "2025-01-01T00:00:00Z".into(),
-        });
+        store
+            .upsert(ChannelContact {
+                channel: "dingtalk".into(),
+                chat_id: "u1".into(),
+                sender_id: "u1".into(),
+                name: "张三".into(),
+                chat_type: "private".into(),
+                last_active: "2025-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
 
         let summary = store.summary();
         assert!(summary.contains_key("dingtalk"));
         assert_eq!(summary["dingtalk"].len(), 1);
         assert!(summary["dingtalk"][0].contains("张三"));
+    }
+
+    #[test]
+    fn upsert_does_not_overwrite_corrupt_contacts_file() {
+        let (store, _dir) = test_contacts();
+        let path = store.file_path();
+        std::fs::write(&path, "{not valid json").unwrap();
+
+        let result = store.upsert(ChannelContact {
+            channel: "telegram".into(),
+            chat_id: "u1".into(),
+            sender_id: "u1".into(),
+            name: "Alice".into(),
+            chat_type: "private".into(),
+            last_active: "2026-07-23T00:00:00Z".into(),
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{not valid json");
     }
 }

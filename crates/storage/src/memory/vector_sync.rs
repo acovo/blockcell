@@ -1,6 +1,33 @@
 use super::*;
 
 impl MemoryStore {
+    pub(crate) fn enqueue_vector_sync_on_conn(
+        conn: &Connection,
+        id: &str,
+        operation: &str,
+        attempts: i64,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_vector_queue (id, operation, attempts, last_error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                operation = excluded.operation,
+                attempts = excluded.attempts,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at",
+            params![id, operation, attempts, error, now],
+        )
+        .map_err(|db_error| {
+            blockcell_core::Error::Storage(format!(
+                "Failed to persist vector sync intent: {}",
+                db_error
+            ))
+        })?;
+        Ok(())
+    }
+
     pub(crate) fn enqueue_vector_sync(&self, id: &str, operation: &str, error: &str) {
         let now = Utc::now().to_rfc3339();
         let result = self

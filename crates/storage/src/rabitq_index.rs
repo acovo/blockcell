@@ -51,7 +51,11 @@ impl RabitqIndex {
         if vector_count == 0 && layout.index_path.exists() {
             std::fs::remove_file(&layout.index_path).map_err(map_io_error)?;
         }
-        let dirty = vector_count > 0 && !layout.index_path.exists();
+        // The SQLite rows are the source of truth. A previous process may have
+        // committed row changes and exited before rebuilding index.bin, so the
+        // mere presence of that file is not proof that it matches the rows.
+        // Rebuild lazily on the first search after every non-empty reopen.
+        let dirty = vector_count > 0;
 
         Ok(Self {
             db: Mutex::new(conn),
@@ -610,5 +614,41 @@ mod tests {
         index.reset().unwrap();
         let hits = index.search(&[1.0, 1.1, 1.2], 5).unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn rabitq_rebuilds_after_reopen_when_rows_changed() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("vectors.rabitq");
+        let meta = VectorMeta {
+            scope: "long_term".to_string(),
+            item_type: "fact".to_string(),
+            tags: vec!["vector".to_string()],
+        };
+
+        {
+            let index =
+                RabitqIndex::open_or_create(uri.to_str().unwrap(), "memory_vectors").unwrap();
+            for i in 0..48 {
+                let value = i as f32;
+                index
+                    .upsert(
+                        &format!("memory-{i}"),
+                        &[value, value + 0.1, value + 0.2],
+                        &meta,
+                    )
+                    .unwrap();
+            }
+
+            index.search(&[1.0, 1.1, 1.2], 5).unwrap();
+            index
+                .upsert("memory-0", &[1000.0, 1000.1, 1000.2], &meta)
+                .unwrap();
+        }
+
+        let reopened =
+            RabitqIndex::open_or_create(uri.to_str().unwrap(), "memory_vectors").unwrap();
+        let hits = reopened.search(&[1000.0, 1000.1, 1000.2], 1).unwrap();
+        assert_eq!(hits.first().map(|hit| hit.id.as_str()), Some("memory-0"));
     }
 }

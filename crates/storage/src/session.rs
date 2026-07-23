@@ -1,3 +1,4 @@
+use crate::file_lock::lock_exclusive;
 use blockcell_core::types::ChatMessage;
 use blockcell_core::{session_file_stem, session_id_from_file_stem, Paths, Result};
 use serde::{Deserialize, Serialize};
@@ -194,6 +195,7 @@ impl SessionStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let _lock = lock_exclusive(&path)?;
 
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -219,6 +221,7 @@ impl SessionStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let _lock = lock_exclusive(&path)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let created_at = if path.exists() {
@@ -259,6 +262,7 @@ impl SessionStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let _lock = lock_exclusive(&path)?;
 
         // 使用 create_new 原子性地判断文件是否为首次创建，消除 TOCTOU 竞态
         let is_new = OpenOptions::new()
@@ -319,6 +323,7 @@ impl SessionStore {
     /// 同时删除关联的 sidecar marker 文件（如 .dream_counted），保持生命周期一致。
     pub fn clear(&self, session_key: &str) -> Result<bool> {
         let path = self.paths.session_file(session_key);
+        let _lock = lock_exclusive(&path)?;
 
         // 同步删除 sidecar marker 文件，避免会话清理后同 key 复用时 marker 残留
         let marker_path = path.with_extension("dream_counted");
@@ -401,6 +406,7 @@ impl SessionStore {
     /// `content` is the user's first message; we take the first ~30 chars as the name.
     pub fn set_session_name_if_new(&self, session_key: &str, content: &str) -> Option<String> {
         let meta_path = self.paths.sessions_dir().join("_meta.json");
+        let _lock = lock_exclusive(&meta_path).ok()?;
         let full = session_file_stem(session_key);
         let file_key = session_id_from_file_stem(&full);
 
@@ -451,13 +457,49 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
     use serde_json::json;
+    use std::sync::mpsc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn test_store() -> (SessionStore, TempDir) {
         let dir = TempDir::new().expect("temp dir");
         let paths = Paths::with_base(dir.path().to_path_buf());
         (SessionStore::new(paths), dir)
+    }
+
+    #[test]
+    fn append_waits_for_the_session_file_lock() {
+        let (store, _dir) = test_store();
+        let session_key = "ws:locked-chat";
+        let path = store.paths.session_file(session_key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lock_path = path.with_file_name(format!(
+            ".{}.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock_file.lock_exclusive().unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = store.append(session_key, &ChatMessage::user("serialized"));
+            done_tx.send(result).unwrap();
+        });
+
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        lock_file.unlock().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
     }
 
     #[test]

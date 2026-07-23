@@ -72,7 +72,8 @@ impl AgentRuntime {
                     }
                 }
             };
-            self.channel_contacts
+            if let Err(error) = self
+                .channel_contacts
                 .upsert(blockcell_storage::ChannelContact {
                     channel: msg.channel.clone(),
                     chat_id: msg.chat_id.clone(),
@@ -80,7 +81,10 @@ impl AgentRuntime {
                     name: sender_name,
                     chat_type: chat_type.to_string(),
                     last_active: chrono::Utc::now().to_rfc3339(),
-                });
+                })
+            {
+                tracing::warn!(error = %error, "Failed to persist channel contact");
+            }
         }
 
         // ── Cron reminder fast path: deliver directly without LLM ──

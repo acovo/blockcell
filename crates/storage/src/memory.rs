@@ -2,7 +2,7 @@ use blockcell_core::Result;
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

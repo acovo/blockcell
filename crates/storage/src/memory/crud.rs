@@ -5,17 +5,22 @@ impl MemoryStore {
     /// update it instead of inserting a new one.
     pub fn upsert(&self, params: UpsertParams) -> Result<MemoryItem> {
         let item = {
-            let conn = self
+            let mut conn = self
                 .inner
                 .lock()
                 .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| {
+                    blockcell_core::Error::Storage(format!("Begin upsert transaction error: {}", e))
+                })?;
 
             let now = Utc::now().to_rfc3339();
             let tags_str = params.tags.join(",");
 
-            if let Some(ref dk) = params.dedup_key {
+            let item = if let Some(ref dk) = params.dedup_key {
                 if !dk.is_empty() {
-                    let existing_id: Option<String> = conn
+                    let existing_id: Option<String> = tx
                         .query_row(
                             "SELECT id FROM memory_items WHERE dedup_key = ?1 AND deleted_at IS NULL LIMIT 1",
                             params![dk],
@@ -27,7 +32,7 @@ impl MemoryStore {
                         })?;
 
                     if let Some(id) = existing_id {
-                        conn.execute(
+                        tx.execute(
                             "UPDATE memory_items SET
                                 content = ?1, summary = ?2, title = ?3, tags = ?4,
                                 importance = ?5, updated_at = ?6, scope = ?7, type = ?8,
@@ -51,10 +56,10 @@ impl MemoryStore {
                         })?;
 
                         debug!(id = %id, dedup_key = %dk, "Memory item updated via dedup_key");
-                        self.get_by_id_inner(&conn, &id)?
+                        self.get_by_id_inner(&tx, &id)?
                     } else {
                         let id = uuid::Uuid::new_v4().to_string();
-                        conn.execute(
+                        tx.execute(
                             "INSERT INTO memory_items (id, scope, type, title, content, summary, tags, source,
                                 channel, session_key, importance, created_at, updated_at, expires_at, dedup_key)
                              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
@@ -81,11 +86,11 @@ impl MemoryStore {
                         })?;
 
                         debug!(id = %id, scope = %params.scope, "Memory item inserted");
-                        self.get_by_id_inner(&conn, &id)?
+                        self.get_by_id_inner(&tx, &id)?
                     }
                 } else {
                     let id = uuid::Uuid::new_v4().to_string();
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO memory_items (id, scope, type, title, content, summary, tags, source,
                             channel, session_key, importance, created_at, updated_at, expires_at, dedup_key)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
@@ -110,11 +115,11 @@ impl MemoryStore {
                     .map_err(|e| blockcell_core::Error::Storage(format!("Insert error: {}", e)))?;
 
                     debug!(id = %id, scope = %params.scope, "Memory item inserted");
-                    self.get_by_id_inner(&conn, &id)?
+                    self.get_by_id_inner(&tx, &id)?
                 }
             } else {
                 let id = uuid::Uuid::new_v4().to_string();
-                conn.execute(
+                tx.execute(
                     "INSERT INTO memory_items (id, scope, type, title, content, summary, tags, source,
                         channel, session_key, importance, created_at, updated_at, expires_at, dedup_key)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
@@ -139,8 +144,16 @@ impl MemoryStore {
                 .map_err(|e| blockcell_core::Error::Storage(format!("Insert error: {}", e)))?;
 
                 debug!(id = %id, scope = %params.scope, "Memory item inserted");
-                self.get_by_id_inner(&conn, &id)?
+                self.get_by_id_inner(&tx, &id)?
+            };
+
+            if self.vector.is_some() {
+                Self::enqueue_vector_sync_on_conn(&tx, &item.id, VECTOR_SYNC_OP_UPSERT, 0, None)?;
             }
+            tx.commit().map_err(|e| {
+                blockcell_core::Error::Storage(format!("Commit upsert transaction error: {}", e))
+            })?;
+            item
         };
 
         self.sync_vector_upsert(&item);

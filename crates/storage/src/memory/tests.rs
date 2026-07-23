@@ -1,6 +1,7 @@
 use super::*;
 use crate::vector::{Embedder, VectorHit, VectorIndex, VectorMeta, VectorRuntime};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
@@ -190,6 +191,108 @@ fn fake_vector_runtime(embedder: FakeEmbedder, index: FakeVectorIndex) -> Arc<Ve
     })
 }
 
+#[derive(Clone)]
+struct QueueObservingVectorIndex {
+    db_path: std::path::PathBuf,
+    saw_upsert_intent: Arc<AtomicBool>,
+    saw_delete_intent: Arc<AtomicBool>,
+}
+
+impl QueueObservingVectorIndex {
+    fn new(db_path: std::path::PathBuf) -> Self {
+        Self {
+            db_path,
+            saw_upsert_intent: Arc::new(AtomicBool::new(false)),
+            saw_delete_intent: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn queue_contains(&self, id: &str, operation: &str) -> bool {
+        let conn = Connection::open(&self.db_path).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM memory_vector_queue WHERE id = ?1 AND operation = ?2",
+            params![id, operation],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+}
+
+impl VectorIndex for QueueObservingVectorIndex {
+    fn upsert(&self, id: &str, _vector: &[f32], _meta: &VectorMeta) -> Result<()> {
+        self.saw_upsert_intent.store(
+            self.queue_contains(id, VECTOR_SYNC_OP_UPSERT),
+            Ordering::SeqCst,
+        );
+        Ok(())
+    }
+
+    fn delete_ids(&self, ids: &[String]) -> Result<()> {
+        self.saw_delete_intent.store(
+            ids.iter()
+                .all(|id| self.queue_contains(id, VECTOR_SYNC_OP_DELETE)),
+            Ordering::SeqCst,
+        );
+        Ok(())
+    }
+
+    fn search(&self, _vector: &[f32], _top_k: usize) -> Result<Vec<VectorHit>> {
+        Ok(Vec::new())
+    }
+
+    fn health(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn stats(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({}))
+    }
+
+    fn reset(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn vector_intent_is_committed_before_external_index_mutation() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("memory.db");
+    let index = QueueObservingVectorIndex::new(db_path.clone());
+    let runtime = Arc::new(VectorRuntime {
+        embedder: Arc::new(FakeEmbedder::new(3)),
+        index: Arc::new(index.clone()),
+    });
+    let store = MemoryStore::open_with_options(
+        &db_path,
+        MemoryStoreOptions {
+            vector: Some(runtime),
+        },
+    )
+    .unwrap();
+
+    let item = store
+        .upsert(UpsertParams {
+            scope: "long_term".to_string(),
+            item_type: "fact".to_string(),
+            title: Some("transactional outbox".to_string()),
+            content: "intent must exist before vector upsert".to_string(),
+            summary: None,
+            tags: vec![],
+            source: "user".to_string(),
+            channel: None,
+            session_key: None,
+            importance: 0.8,
+            dedup_key: None,
+            expires_at: None,
+        })
+        .unwrap();
+    assert!(index.saw_upsert_intent.load(Ordering::SeqCst));
+
+    assert!(store.soft_delete(&item.id).unwrap());
+    assert!(index.saw_delete_intent.load(Ordering::SeqCst));
+}
+
 #[test]
 fn test_upsert_and_query() {
     let (store, _dir) = test_store();
@@ -278,6 +381,71 @@ fn test_dedup_key_update() {
     // Same ID, updated content
     assert_eq!(item1.id, item2.id);
     assert_eq!(item2.content, "User prefers Chinese");
+}
+
+#[test]
+fn database_rejects_duplicate_active_dedup_keys() {
+    let (store, _dir) = test_store();
+    let conn = store.inner.lock().unwrap();
+    let insert = |id: &str| {
+        conn.execute(
+            "INSERT INTO memory_items (
+                id, scope, type, content, tags, source, importance,
+                created_at, updated_at, dedup_key
+             ) VALUES (?1, 'long_term', 'fact', 'value', '', 'test', 0.5, ?2, ?2, 'unique-key')",
+            params![id, Utc::now().to_rfc3339()],
+        )
+    };
+
+    insert("first").unwrap();
+    assert!(insert("second").is_err());
+}
+
+#[test]
+fn concurrent_store_handles_upsert_one_deduplicated_row() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("memory.db");
+    let first = MemoryStore::open(&db_path).unwrap();
+    let second = MemoryStore::open(&db_path).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let run = |store: MemoryStore, barrier: Arc<std::sync::Barrier>| {
+        std::thread::spawn(move || {
+            barrier.wait();
+            store.upsert(UpsertParams {
+                scope: "long_term".to_string(),
+                item_type: "fact".to_string(),
+                title: None,
+                content: "concurrent value".to_string(),
+                summary: None,
+                tags: vec![],
+                source: "test".to_string(),
+                channel: None,
+                session_key: None,
+                importance: 0.5,
+                dedup_key: Some("shared-key".to_string()),
+                expires_at: None,
+            })
+        })
+    };
+
+    let first_handle = run(first, barrier.clone());
+    let second_handle = run(second, barrier);
+    let first_result = first_handle.join().unwrap();
+    let second_result = second_handle.join().unwrap();
+    let first_item = first_result.unwrap();
+    let second_item = second_result.unwrap();
+    assert_eq!(first_item.id, second_item.id);
+
+    let conn = Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_items WHERE dedup_key = 'shared-key' AND deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[test]
@@ -400,6 +568,15 @@ Language: Chinese
         })
         .unwrap();
     assert_eq!(results.len(), 1);
+}
+
+#[test]
+fn file_migration_does_not_mark_complete_after_read_failure() {
+    let (store, dir) = test_store();
+    std::fs::write(dir.path().join("2026-07-23.md"), [0xff, 0xfe, 0xfd]).unwrap();
+
+    assert!(store.migrate_from_files(dir.path()).is_err());
+    assert!(!store.is_migrated());
 }
 
 #[test]

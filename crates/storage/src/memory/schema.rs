@@ -17,8 +17,12 @@ impl MemoryStore {
             blockcell_core::Error::Storage(format!("Failed to open memory db: {}", e))
         })?;
 
-        // Enable WAL mode for better concurrent read performance
-        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+        // Enable WAL mode and wait briefly for other store handles instead of
+        // immediately failing ordinary concurrent writes.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .map_err(|e| {
+                blockcell_core::Error::Storage(format!("Failed to configure memory db: {}", e))
+            })?;
 
         let store = Self {
             inner: Arc::new(Mutex::new(conn)),
@@ -64,6 +68,25 @@ impl MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_memory_expires ON memory_items(expires_at);
             CREATE INDEX IF NOT EXISTS idx_memory_dedup ON memory_items(dedup_key);
             CREATE INDEX IF NOT EXISTS idx_memory_importance ON memory_items(importance);
+
+            -- Preserve legacy duplicate rows but remove their conflicting key,
+            -- then enforce one active row for every non-empty dedup key.
+            UPDATE memory_items
+            SET dedup_key = NULL
+            WHERE dedup_key IS NOT NULL
+              AND dedup_key != ''
+              AND deleted_at IS NULL
+              AND rowid NOT IN (
+                  SELECT MAX(rowid)
+                  FROM memory_items
+                  WHERE dedup_key IS NOT NULL
+                    AND dedup_key != ''
+                    AND deleted_at IS NULL
+                  GROUP BY dedup_key
+              );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_active_dedup_unique
+            ON memory_items(dedup_key)
+            WHERE dedup_key IS NOT NULL AND dedup_key != '' AND deleted_at IS NULL;
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
                 title,

@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod contacts;
 pub mod evolution_workflow;
+mod file_lock;
 pub mod ghost_ledger;
 pub mod memory;
 pub mod memory_contract;
