@@ -33,7 +33,7 @@
 
 - [x] Trace runtime construction and ownership of providers, registries, stores, channels, cancellation handles, and background services.
 - [x] Trace one inbound message through dispatch, context building, LLM/tool iterations, persistence, outbound delivery, and cleanup.
-- [ ] Check every early return and error branch for missing cleanup, stale state, lost replies, or duplicate persistence.
+- [x] Check every early return and error branch for missing cleanup, stale state, lost replies, or duplicate persistence.
 - [x] Record the lifecycle map and supported findings in the review output.
 
 ### Task 2: Review tool execution, permissions, and cancellation

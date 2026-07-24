@@ -207,8 +207,7 @@ pub(crate) async fn run_message_task(
     runtime.init_runtime_handle();
     runtime.wire_evolution_deploy_callback();
 
-    let error_channel = msg.channel.clone();
-    let error_chat_id = msg.chat_id.clone();
+    let error_msg = msg.clone();
 
     match runtime.process_message(msg).await {
         Ok(response) => {
@@ -232,24 +231,52 @@ pub(crate) async fn run_message_task(
         Err(e) => {
             let err_msg = format!("{}", e);
             error!(task_id = %task_id, error = %e, "Message task failed");
-            if let Some(ref event_tx) = event_tx {
-                let _ = event_tx.send(
-                    serde_json::json!({
-                        "type": "error",
-                        "channel": error_channel,
-                        "agent_id": agent_id.clone().unwrap_or_else(|| "default".to_string()),
-                        "chat_id": error_chat_id,
-                        "task_id": task_id.clone(),
-                        "message": err_msg,
-                    })
-                    .to_string(),
-                );
-            }
+            deliver_message_task_failure(
+                &error_msg,
+                &task_id,
+                agent_id.as_deref(),
+                &err_msg,
+                event_tx.as_ref(),
+                outbound_tx.as_ref(),
+            )
+            .await;
             // Keep failed tasks briefly for visibility, then let tick cleanup handle them
             task_manager.set_failed(&task_id, &err_msg).await;
             if let Some(receipt_id) = completion_receipt_id.as_deref() {
                 blockcell_core::message_receipt::complete_message_receipt(receipt_id, Err(err_msg));
             }
+        }
+    }
+}
+
+pub(super) async fn deliver_message_task_failure(
+    msg: &InboundMessage,
+    task_id: &str,
+    agent_id: Option<&str>,
+    err_msg: &str,
+    event_tx: Option<&broadcast::Sender<String>>,
+    outbound_tx: Option<&mpsc::Sender<OutboundMessage>>,
+) {
+    if let Some(event_tx) = event_tx {
+        let _ = event_tx.send(
+            serde_json::json!({
+                "type": "error",
+                "channel": msg.channel,
+                "agent_id": agent_id.unwrap_or("default"),
+                "chat_id": msg.chat_id,
+                "task_id": task_id,
+                "message": err_msg,
+            })
+            .to_string(),
+        );
+    }
+
+    if !matches!(msg.channel.as_str(), "ws" | "cli" | "http" | "ghost") {
+        if let Some(outbound_tx) = outbound_tx {
+            let mut outbound =
+                OutboundMessage::new(&msg.channel, &msg.chat_id, &format!("❌ {}", err_msg));
+            outbound.account_id = msg.account_id.clone();
+            let _ = outbound_tx.send(outbound).await;
         }
     }
 }

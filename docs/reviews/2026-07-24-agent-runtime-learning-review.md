@@ -1,15 +1,18 @@
 # Agent Runtime and Learning Systems Review
 
 **Date:** 2026-07-24
-**Status:** Findings remediated
+**Status:** Runtime findings remediated; review in progress
 **Plan:** `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review.md`
 
 ## Verification baseline
 
 - `cargo test -p blockcell-storage -- --nocapture`: 59 passed, 0 failed.
-- `cargo test -p blockcell-agent runtime -- --nocapture`: 117 passed, 0 failed; 485 filtered out.
+- `cargo test -p blockcell-agent runtime -- --nocapture`: 121 passed, 0 failed; 491 filtered out.
 
-Passing tests establish the current baseline but do not cover the cross-channel/account routing, message-task panic, or deferred-review cleanup cases below.
+Passing tests establish the current baseline. The remediated cross-channel/account routing,
+message-task panic, and deferred-review cleanup cases now have regression coverage. The
+non-WebSocket error-delivery and streamed-provider success-accounting cases now also have
+regression coverage.
 
 Final remediation verification:
 
@@ -96,6 +99,45 @@ Shared objects passed into the per-message runtime include the provider pool, to
 
 **Resolution:** Fixed. `LearningReviewReservationGuard` cancels an unspawned reservation without cooldown and converts to a completion guard only after the review task starts. This covers empty responses, `?` returns, and dropped futures. Regression test: `pending_review_reservation_releases_slot_when_dropped_before_spawn`.
 
+### R4 — Medium: Runtime errors are not delivered to non-WebSocket external channels
+
+**Locations:**
+
+- `crates/agent/src/runtime/message_task.rs:154-170`
+- `crates/agent/src/runtime/message_task.rs:213-253`
+- `bin/blockcell/src/commands/gateway/outbound.rs:6-27`
+- Representative error exits: `crates/agent/src/runtime/process_message_inner.rs:109-110`, `crates/agent/src/runtime/process_message_inner.rs:240-248`, `crates/agent/src/runtime/process_message_inner.rs:804-849`, and `crates/agent/src/runtime/process_message_inner.rs:2031-2041`
+
+**Trigger:** A Telegram, Slack, Discord, or other non-WebSocket message reaches a fallible runtime branch after `AgentRuntime` construction, such as session loading, forced-skill resolution, model-selected skill execution, or final session persistence, and `process_message` returns `Err`.
+
+**Control flow:** `run_message_task` broadcasts a JSON `error` event, marks the task failed, and completes an optional receipt, but it does not send an `OutboundMessage`. Gateway external-channel delivery consumes `outbound_tx` and calls `ChannelManager::dispatch_outbound_msg`; runtime `event_tx` is the WebSocket event path and is intentionally not bridged to external channels. The earlier `AgentRuntime::new` failure branch demonstrates the expected behavior by sending `❌ {error}` through `outbound_tx`.
+
+**Impact:** The task is internally recorded as failed, but an external-channel user receives no terminal reply and experiences a silent timeout. Operational logs and WebSocket observers may see the error while the originating Telegram/Slack/Discord conversation does not.
+
+**Repair direction:** In the `process_message` error branch, send an account-aware error `OutboundMessage` for channels whose terminal response is delivered through `outbound_tx`, while retaining the filtered WebSocket error event. Centralize terminal failure delivery so runtime-construction failures, processing failures, panics, and cancellations follow one idempotent channel-routing contract. Add a message-task regression test that injects a deterministic `process_message` error and asserts one external outbound error, plus a WebSocket test that asserts no duplicate terminal event.
+
+**Resolution:** Fixed. Message-task failures now retain the WebSocket error event and send one account-aware `❌` outbound reply only for external channels. Regression tests: `message_task_failure_delivers_error_to_external_channel` and `message_task_failure_uses_event_only_for_websocket`.
+
+### R5 — Medium: Explicit stream completion skips provider success accounting
+
+**Locations:**
+
+- `crates/agent/src/runtime/message_dispatch.rs:68-168`
+- `crates/agent/src/runtime/message_dispatch.rs:193-220`
+- `crates/providers/src/pool.rs:25-44`
+- `crates/providers/src/pool.rs:339-355`
+- `crates/providers/src/pool.rs:477-519`
+
+**Trigger:** A provider has one or more recorded transient/server failures, then completes a normal streaming call using the standard `StreamChunk::Done` event, and later encounters another transient/server failure.
+
+**Control flow:** The `StreamChunk::Done` arm constructs the response and immediately returns `Ok` without calling `provider_pool.report(pool_idx, CallResult::Success)`. The fallback path for providers that close cleanly without `Done` does report success. Provider-pool success reporting both increments the routing success count and resets `transient_fail_count`; omitting it means failures separated by successful streamed calls are still accumulated as if consecutive.
+
+**Impact:** A healthy provider can enter cooldown after non-consecutive failures, reducing availability or causing a single-provider deployment to report no healthy provider. Success-based routing statistics also undercount the dominant normal streaming path, weakening `LatencyFirst` selection behavior (currently implemented using success count).
+
+**Repair direction:** Report `CallResult::Success` exactly once immediately before returning from every successful streaming completion path. Add a provider-pool-visible regression test covering failure, `Done` success, then additional failures, and assert that the success resets the failure sequence and increments success statistics.
+
+**Resolution:** Fixed. The explicit `StreamChunk::Done` path now reports `CallResult::Success` before returning, resetting the transient failure sequence and incrementing success statistics. Regression test: `explicit_stream_done_reports_provider_success`.
+
 ### M1 — High in multi-conversation deployments: Structured memory is automatically recalled across session boundaries
 
 **Locations:**
@@ -165,6 +207,8 @@ Shared objects passed into the per-message runtime include the provider pool, to
 
 ## Review progress
 
-- Module 2 runtime lifecycle findings R1-R3: reviewed, fixed, and regression-tested.
+- Module 2 Task 1 lifecycle and early-return/error audit: complete.
+- Runtime lifecycle findings R1-R3: fixed and regression-tested.
+- Runtime lifecycle findings R4-R5: fixed and regression-tested after the completed early-return/error audit.
 - Module 5 structured-memory and learning-lock findings M1-M3: reviewed, fixed, and regression-tested.
 - The implementation and verification record is in `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review-fixes.md`.

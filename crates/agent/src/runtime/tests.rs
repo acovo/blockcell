@@ -2549,6 +2549,53 @@ async fn connection_phase_failure_falls_back_to_next_provider_without_retry_budg
     assert_eq!(response.content.as_deref(), Some("fallback answer"));
 }
 
+#[tokio::test]
+async fn explicit_stream_done_reports_provider_success() {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+    config.agents.defaults.llm_max_retries = 0;
+
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-stream-success-runtime-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp stream success runtime dir");
+    let paths = Paths::with_base(base);
+    let provider_pool = ProviderPool::from_single_provider(
+        "test/mock",
+        "test",
+        Arc::new(SuccessfulFallbackProvider),
+    );
+    provider_pool.report(0, CallResult::Transient);
+    let mut runtime = AgentRuntime::new(
+        config,
+        paths,
+        provider_pool.clone(),
+        blockcell_tools::ToolRegistry::new(),
+    )
+    .expect("create runtime");
+    runtime.set_agent_id(Some("default".to_string()));
+    let msg = test_main_session_inbound("ws", "stream-success-chat");
+    let mut saw_rate_limit = false;
+
+    runtime
+        .call_llm_with_retry(
+            &[ChatMessage::user("hello")],
+            &[],
+            &msg,
+            None,
+            &HashMap::new(),
+            &mut saw_rate_limit,
+        )
+        .await
+        .expect("explicit stream completion should succeed");
+
+    let status = provider_pool.status_summary();
+    assert_eq!(status[0].success_count, 1);
+    assert_eq!(status[0].fail_count, 0);
+}
+
 fn test_runtime() -> AgentRuntime {
     let mut config = Config::default();
     config.agents.defaults.model = "test/mock".to_string();
@@ -2725,6 +2772,65 @@ fn test_main_session_inbound(channel: &str, chat_id: &str) -> InboundMessage {
         metadata: serde_json::Value::Null,
         timestamp_ms: chrono::Utc::now().timestamp_millis(),
     }
+}
+
+#[tokio::test]
+async fn message_task_failure_delivers_error_to_external_channel() {
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+    let (event_tx, _event_rx) = broadcast::channel(1);
+    let mut msg = test_main_session_inbound("telegram", "chat-external");
+    msg.account_id = Some("bot-account".to_string());
+
+    deliver_message_task_failure(
+        &msg,
+        "task-external",
+        Some("default"),
+        "session load failed",
+        Some(&event_tx),
+        Some(&outbound_tx),
+    )
+    .await;
+
+    let outbound = outbound_rx
+        .try_recv()
+        .expect("external channel should receive terminal error");
+    assert_eq!(outbound.channel, "telegram");
+    assert_eq!(outbound.chat_id, "chat-external");
+    assert_eq!(outbound.account_id.as_deref(), Some("bot-account"));
+    assert_eq!(outbound.content, "❌ session load failed");
+}
+
+#[tokio::test]
+async fn message_task_failure_uses_event_only_for_websocket() {
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+    let (event_tx, mut event_rx) = broadcast::channel(1);
+    let msg = test_main_session_inbound("ws", "chat-ws");
+
+    deliver_message_task_failure(
+        &msg,
+        "task-ws",
+        Some("default"),
+        "provider unavailable",
+        Some(&event_tx),
+        Some(&outbound_tx),
+    )
+    .await;
+
+    assert!(matches!(
+        outbound_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    let event: serde_json::Value = serde_json::from_str(
+        &event_rx
+            .try_recv()
+            .expect("websocket should receive terminal error event"),
+    )
+    .expect("parse error event");
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["channel"], "ws");
+    assert_eq!(event["chat_id"], "chat-ws");
+    assert_eq!(event["task_id"], "task-ws");
+    assert_eq!(event["message"], "provider unavailable");
 }
 
 #[tokio::test]

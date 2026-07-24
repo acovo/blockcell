@@ -158,6 +158,7 @@ impl AgentRuntime {
                                             response.reasoning_content.clone()
                                         };
 
+                                        self.provider_pool.report(pool_idx, CallResult::Success);
                                         return Ok(LLMResponse {
                                             content: final_content,
                                             reasoning_content: final_reasoning,
