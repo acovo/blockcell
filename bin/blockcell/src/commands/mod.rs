@@ -10,6 +10,7 @@ pub mod embedded_skills;
 pub mod env_file;
 pub mod evolve;
 pub mod gateway;
+pub(crate) mod json_store;
 pub mod knowledge_cmd;
 pub mod logs_cmd;
 pub mod mcp;

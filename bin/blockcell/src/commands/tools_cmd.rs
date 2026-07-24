@@ -6,6 +6,8 @@ use blockcell_tools::mcp::manager::McpManager;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+use super::json_store::update_json;
+
 fn schema_function(schema: &Value) -> &Value {
     schema.get("function").unwrap_or(schema)
 }
@@ -147,9 +149,6 @@ pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
     let mcp_manager = Arc::new(McpManager::load(&paths).await?);
     let registry = build_tool_registry_with_all_mcp(Some(&mcp_manager)).await?;
     let paths = Paths::new_configured();
-    paths.ensure_dirs()?;
-    let memory_file_store = Arc::new(blockcell_agent::MemoryFileStore::open(&paths)?);
-    let skill_file_store = Arc::new(blockcell_agent::SkillFileStore::open(&paths)?);
 
     let tool = registry
         .get(tool_name)
@@ -164,7 +163,33 @@ pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    let ctx = blockcell_tools::ToolContext {
+    let ctx = build_cli_tool_context(&paths)?;
+
+    println!("⏳ Executing {} ...", tool_name);
+    let result = tool.execute(ctx, params).await;
+
+    match result {
+        Ok(value) => {
+            println!("✅ Result:");
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        Err(e) => {
+            eprintln!("❌ Execution failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn build_cli_tool_context(
+    paths: &Paths,
+) -> anyhow::Result<blockcell_tools::ToolContext> {
+    paths.ensure_dirs()?;
+    let memory_file_store = Arc::new(blockcell_agent::MemoryFileStore::open(paths)?);
+    let skill_file_store = Arc::new(blockcell_agent::SkillFileStore::open(paths)?);
+
+    Ok(blockcell_tools::ToolContext {
         workspace: paths.workspace(),
         base: paths.base.clone(),
         builtin_skills_dir: Some(paths.builtin_skills_dir()),
@@ -194,36 +219,13 @@ pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
         skill_mutex: None,
         agent_type_registry: None,
         evolution_workflow_store: None,
-    };
-
-    println!("⏳ Executing {} ...", tool_name);
-    let result = tool.execute(ctx, params).await;
-
-    match result {
-        Ok(value) => {
-            println!("✅ Result:");
-            println!("{}", serde_json::to_string_pretty(&value)?);
-        }
-        Err(e) => {
-            eprintln!("❌ Execution failed: {}", e);
-            std::process::exit(1);
-        }
-    }
-
-    Ok(())
+    })
 }
 
 /// Toggle a tool on/off.
 pub async fn toggle(tool_name: &str, enable: bool) -> anyhow::Result<()> {
     let paths = Paths::new_configured();
     let toggles_path = paths.workspace().join("toggles.json");
-
-    let mut store: Value = if toggles_path.exists() {
-        let content = std::fs::read_to_string(&toggles_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({"skills": {}, "tools": {}}))
-    } else {
-        serde_json::json!({"skills": {}, "tools": {}})
-    };
 
     // Verify tool exists
     let paths = Paths::new_configured();
@@ -236,23 +238,33 @@ pub async fn toggle(tool_name: &str, enable: bool) -> anyhow::Result<()> {
         );
     }
 
-    if store.get("tools").is_none() {
-        store["tools"] = serde_json::json!({});
-    }
+    update_json(
+        &toggles_path,
+        || serde_json::json!({"skills": {}, "tools": {}}),
+        |store: &mut Value| {
+            if !store.is_object() {
+                anyhow::bail!("Toggle store root must be a JSON object");
+            }
+            if store.get("tools").is_none() {
+                store["tools"] = serde_json::json!({});
+            }
+            let tools = store["tools"]
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("Toggle store 'tools' must be an object"))?;
+            if enable {
+                tools.remove(tool_name);
+            } else {
+                tools.insert(tool_name.to_string(), serde_json::json!(false));
+            }
+            Ok(())
+        },
+    )?;
 
-    if enable {
-        if let Some(obj) = store["tools"].as_object_mut() {
-            obj.remove(tool_name);
-        }
-        println!("✓ Tool '{}' enabled", tool_name);
-    } else {
-        store["tools"][tool_name] = serde_json::json!(false);
-        println!("✓ Tool '{}' disabled", tool_name);
-    }
-
-    let content = serde_json::to_string_pretty(&store)?;
-    std::fs::create_dir_all(toggles_path.parent().unwrap())?;
-    std::fs::write(&toggles_path, content)?;
+    println!(
+        "✓ Tool '{}' {}",
+        tool_name,
+        if enable { "enabled" } else { "disabled" }
+    );
 
     Ok(())
 }

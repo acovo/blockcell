@@ -160,8 +160,26 @@ fn build_template(
     }
 }
 
-fn server_file_path(paths: &Paths, name: &str) -> PathBuf {
-    paths.mcp_dir().join(format!("{}.json", name))
+fn validate_server_name(name: &str) -> anyhow::Result<&str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed != name || matches!(trimmed, "." | "..") {
+        bail!("Invalid MCP server name '{}'", name);
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch == '/' || ch == '\\' || ch.is_control())
+    {
+        bail!(
+            "Invalid MCP server name '{}': use a single file-safe name",
+            name
+        );
+    }
+    Ok(trimmed)
+}
+
+fn server_file_path(paths: &Paths, name: &str) -> anyhow::Result<PathBuf> {
+    let name = validate_server_name(name)?;
+    Ok(paths.mcp_dir().join(format!("{}.json", name)))
 }
 
 fn load_root_or_default(paths: &Paths) -> anyhow::Result<McpRootConfig> {
@@ -182,10 +200,12 @@ fn save_server_file(path: &Path, cfg: &McpFileServerConfig) -> anyhow::Result<()
 }
 
 fn source_for_server(paths: &Paths, name: &str) -> Option<String> {
-    let file_path = server_file_path(paths, name);
-    if file_path.exists() {
-        Some(file_path.display().to_string())
-    } else if load_root_or_default(paths)
+    if let Ok(file_path) = server_file_path(paths, name) {
+        if file_path.exists() {
+            return Some(file_path.display().to_string());
+        }
+    }
+    if load_root_or_default(paths)
         .ok()
         .and_then(|root| root.servers.get(name).cloned())
         .is_some()
@@ -309,7 +329,7 @@ pub async fn add(
         cfg
     };
 
-    let path = server_file_path(&paths, &cfg.name);
+    let path = server_file_path(&paths, &cfg.name)?;
     if path.exists() && !force {
         bail!(
             "MCP server '{}' already exists at {}. Use --force to overwrite.",
@@ -326,7 +346,7 @@ pub async fn add(
 
 pub async fn remove(name: &str) -> anyhow::Result<()> {
     let paths = Paths::new();
-    let file_path = server_file_path(&paths, name);
+    let file_path = server_file_path(&paths, name)?;
     if file_path.exists() {
         std::fs::remove_file(&file_path)?;
         println!("✓ Removed MCP server '{}' ({})", name, file_path.display());
@@ -370,7 +390,7 @@ fn update_file_enabled(path: &Path, enabled: bool) -> anyhow::Result<bool> {
 
 pub async fn set_enabled(name: &str, enabled: bool) -> anyhow::Result<()> {
     let paths = Paths::new();
-    let file_path = server_file_path(&paths, name);
+    let file_path = server_file_path(&paths, name)?;
     if update_file_enabled(&file_path, enabled)? {
         println!(
             "✓ MCP server '{}' {}",
@@ -400,7 +420,7 @@ pub async fn edit(name: Option<&str>) -> anyhow::Result<()> {
     let paths = Paths::new();
     paths.ensure_dirs()?;
     let target = match name {
-        Some(name) => server_file_path(&paths, name),
+        Some(name) => server_file_path(&paths, name)?,
         None => paths.mcp_config_file(),
     };
 
@@ -475,5 +495,13 @@ mod tests {
         assert_eq!(cfg.command, "uvx");
         assert!(cfg.args.iter().any(|arg| arg == "/tmp/test.db"));
         assert_eq!(cfg.auto_start, Some(false));
+    }
+
+    #[test]
+    fn mcp_server_names_must_be_single_safe_components() {
+        for invalid in ["", ".", "..", "../escape", "nested/name", r"nested\name"] {
+            assert!(validate_server_name(invalid).is_err(), "{invalid}");
+        }
+        assert!(validate_server_name("github-main_1").is_ok());
     }
 }

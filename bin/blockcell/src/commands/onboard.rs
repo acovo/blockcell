@@ -1,5 +1,7 @@
 use blockcell_core::{
-    config::{parse_json5_value, stringify_json5_pretty, write_raw_validated_config_json5},
+    config::{
+        parse_json5_value_preserving_env, stringify_json5_pretty, write_raw_validated_config_json5,
+    },
     Paths,
 };
 use std::io::{self, Write};
@@ -278,53 +280,24 @@ pub async fn run(
             EXAMPLE_CONFIG.to_string()
         };
 
-        let mut json: serde_json::Value = parse_json5_value(&config_str).unwrap_or_else(|_| {
-            parse_json5_value(EXAMPLE_CONFIG).expect("parse bundled example config")
-        });
-
-        ensure_auto_upgrade_defaults(&mut json);
-
-        // Set api_key in providers.<provider>
-        if let Some(ref key) = api_key {
-            json["providers"][prov]["apiKey"] = serde_json::json!(key);
-        }
-
         let selected_model = if let Some(ref m) = model {
             m.clone()
         } else {
             default_model_for_provider(prov).to_string()
         };
-
-        json["agents"]["defaults"]["modelPool"] = serde_json::json!([
-            {
-                "provider": prov,
-                "model": selected_model,
-                "weight": 1,
-                "priority": 1
-            }
-        ]);
-        json["agents"]["defaults"]["maxContextTokens"] =
-            serde_json::json!(default_max_context_tokens_for_provider(prov));
-        if let Some(defaults) = json["agents"]["defaults"].as_object_mut() {
-            defaults.remove("model");
-            defaults.remove("provider");
-        }
+        let patched =
+            patch_provider_config(&config_str, prov, api_key.as_deref(), Some(&selected_model))?;
 
         if let Some(parent) = paths.config_file().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(paths.config_file(), stringify_json5_pretty(&json)?)?;
+        write_raw_validated_config_json5(&paths.config_file(), &patched)?;
 
         println!("✓ Provider configured: {}", prov);
         if api_key.is_some() {
             println!("  ✓ API key set");
         }
-        println!(
-            "  ✓ Model: {}",
-            json["agents"]["defaults"]["modelPool"][0]["model"]
-                .as_str()
-                .unwrap_or("?")
-        );
+        println!("  ✓ Model: {}", selected_model);
         println!("✓ Config: {}", paths.config_file().display());
         println!();
         println!("Run `blockcell agent` to start chatting.");
@@ -404,6 +377,40 @@ pub async fn run(
     Ok(())
 }
 
+fn patch_provider_config(
+    config_str: &str,
+    provider: &str,
+    api_key: Option<&str>,
+    model: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut json: serde_json::Value = parse_json5_value_preserving_env(config_str)?;
+    ensure_auto_upgrade_defaults(&mut json);
+
+    if let Some(key) = api_key {
+        json["providers"][provider]["apiKey"] = serde_json::json!(key);
+    }
+
+    let selected_model = model
+        .map(str::to_string)
+        .unwrap_or_else(|| default_model_for_provider(provider).to_string());
+    json["agents"]["defaults"]["modelPool"] = serde_json::json!([
+        {
+            "provider": provider,
+            "model": selected_model,
+            "weight": 1,
+            "priority": 1
+        }
+    ]);
+    json["agents"]["defaults"]["maxContextTokens"] =
+        serde_json::json!(default_max_context_tokens_for_provider(provider));
+    if let Some(defaults) = json["agents"]["defaults"].as_object_mut() {
+        defaults.remove("model");
+        defaults.remove("provider");
+    }
+
+    Ok(stringify_json5_pretty(&json)?)
+}
+
 fn ensure_auto_upgrade_defaults(json: &mut serde_json::Value) {
     let defaults = blockcell_core::config::AutoUpgradeConfig::default();
     if json.get("autoUpgrade").is_none() || json["autoUpgrade"].is_null() {
@@ -443,7 +450,8 @@ mod auto_upgrade_tests {
 
     #[test]
     fn example_config_does_not_require_an_unconfigured_signature_key() {
-        let config = parse_json5_value(EXAMPLE_CONFIG).expect("example config should parse");
+        let config = blockcell_core::config::parse_json5_value(EXAMPLE_CONFIG)
+            .expect("example config should parse");
 
         assert_eq!(config["autoUpgrade"]["requireSignature"], false);
     }
@@ -469,6 +477,25 @@ mod auto_upgrade_tests {
         if config["autoUpgrade"]["publicKey"].is_null() {
             assert_eq!(config["autoUpgrade"]["requireSignature"], false);
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_patch_tests {
+    use super::*;
+
+    #[test]
+    fn provider_patch_rejects_malformed_existing_config() {
+        assert!(patch_provider_config("{ broken", "openai", None, None).is_err());
+    }
+
+    #[test]
+    fn provider_patch_preserves_environment_placeholders() {
+        let patched =
+            patch_provider_config(EXAMPLE_CONFIG, "openai", Some("${OPENAI_API_KEY}"), None)
+                .expect("patch provider config");
+
+        assert!(patched.contains("${OPENAI_API_KEY}"));
     }
 }
 

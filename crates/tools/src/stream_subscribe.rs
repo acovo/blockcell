@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use blockcell_core::{Error, Result};
+use blockcell_core::{file_store::atomic_write, Error, Result};
 use futures::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -108,7 +108,7 @@ impl StreamManager {
     }
 
     /// Save all auto_restore subscriptions to disk.
-    fn save_rules(&self, workspace: &Path) {
+    fn save_rules(&self, workspace: &Path) -> Result<()> {
         let path = Self::persistence_path(workspace);
         let rules: Vec<SubscriptionRule> = self
             .subscriptions
@@ -127,31 +127,20 @@ impl StreamManager {
                 max_reconnect: s.max_reconnect,
             })
             .collect();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match serde_json::to_string_pretty(&rules) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    warn!(error = %e, "Failed to persist stream subscriptions");
-                } else {
-                    debug!(count = rules.len(), path = %path.display(), "Persisted stream subscriptions");
-                }
-            }
-            Err(e) => warn!(error = %e, "Failed to serialize stream subscriptions"),
-        }
+        let json = serde_json::to_vec_pretty(&rules)?;
+        atomic_write(&path, &json)?;
+        debug!(count = rules.len(), path = %path.display(), "Persisted stream subscriptions");
+        Ok(())
     }
 
     /// Load persisted subscription rules from disk.
-    fn load_rules(workspace: &Path) -> Vec<SubscriptionRule> {
+    fn load_rules(workspace: &Path) -> Result<Vec<SubscriptionRule>> {
         let path = Self::persistence_path(workspace);
-        match std::fs::read_to_string(&path) {
-            Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
-                warn!(error = %e, "Failed to parse persisted subscriptions");
-                vec![]
-            }),
-            Err(_) => vec![], // File doesn't exist yet
+        if !path.exists() {
+            return Ok(Vec::new());
         }
+        let json = std::fs::read_to_string(&path)?;
+        Ok(serde_json::from_str(&json)?)
     }
 }
 
@@ -285,15 +274,7 @@ impl Tool for StreamSubscribeTool {
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let workspace = normalized_workspace(&ctx.workspace);
-
-        // Auto-restore persisted subscriptions once per workspace.
-        {
-            let mut restored = RESTORED.lock().await;
-            if restored.insert(workspace.clone()) {
-                drop(restored);
-                let _ = restore_all_subscriptions(&workspace).await;
-            }
-        }
+        ensure_workspace_restored(&workspace).await?;
 
         let action = params["action"].as_str().unwrap();
         match action {
@@ -307,6 +288,18 @@ impl Tool for StreamSubscribeTool {
             _ => Err(Error::Tool(format!("Unknown action: {}", action))),
         }
     }
+}
+
+async fn ensure_workspace_restored(workspace: &Path) -> Result<()> {
+    let should_restore = RESTORED.lock().await.insert(workspace.to_path_buf());
+    if !should_restore {
+        return Ok(());
+    }
+    if let Err(error) = restore_all_subscriptions(workspace).await {
+        RESTORED.lock().await.remove(workspace);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn normalized_workspace(workspace: &Path) -> PathBuf {
@@ -620,7 +613,7 @@ async fn action_subscribe(workspace: &Path, params: &Value) -> Result<Value> {
         let mut mgr = STREAM_MANAGER.lock().await;
         mgr.subscriptions.insert(stream_id.clone(), sub);
         mgr.cancel_handles.insert(stream_id.clone(), cancel_tx);
-        mgr.save_rules(workspace);
+        mgr.save_rules(workspace)?;
     }
 
     // Spawn background task
@@ -1148,7 +1141,7 @@ async fn action_unsubscribe(workspace: &Path, params: &Value) -> Result<Value> {
 
     let removed = mgr.subscriptions.remove(stream_id).is_some();
     if removed {
-        mgr.save_rules(workspace);
+        mgr.save_rules(workspace)?;
     }
 
     // Also remove WS writer if any
@@ -1314,7 +1307,7 @@ async fn action_status(workspace: &Path, params: &Value) -> Result<Value> {
 
 /// Restore all persisted subscriptions from disk.
 async fn restore_all_subscriptions(workspace: &Path) -> Result<Value> {
-    let rules = StreamManager::load_rules(workspace);
+    let rules = StreamManager::load_rules(workspace)?;
 
     if rules.is_empty() {
         return Ok(json!({ "restored": 0, "note": "No persisted subscriptions found" }));
@@ -1405,6 +1398,20 @@ async fn action_restore(workspace: &Path) -> Result<Value> {
 // ---------------------------------------------------------------------------
 // Public accessors for gateway API
 // ---------------------------------------------------------------------------
+
+/// Restore persisted subscriptions into the running process for one workspace.
+pub async fn restore_streams(workspace: &Path) -> Result<Value> {
+    restore_all_subscriptions(&normalized_workspace(workspace)).await
+}
+
+/// Stop an active subscription owned by one workspace and update persistence.
+pub async fn unsubscribe_stream(workspace: &Path, stream_id: &str) -> Result<Value> {
+    action_unsubscribe(
+        &normalized_workspace(workspace),
+        &json!({"stream_id": stream_id}),
+    )
+    .await
+}
 
 /// List all active stream subscriptions (for gateway /v1/streams endpoint).
 pub async fn list_streams() -> Value {
@@ -1610,6 +1617,76 @@ mod tests {
             .await
             .subscriptions
             .remove("stream_workspace_a");
+    }
+
+    #[tokio::test]
+    async fn public_stream_unsubscribe_stops_owned_subscription() {
+        let workspace = PathBuf::from(format!(
+            "/tmp/blockcell-stream-public-unsubscribe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let mut mgr = STREAM_MANAGER.lock().await;
+            mgr.subscriptions.insert(
+                "stream_public_stop".to_string(),
+                test_subscription("stream_public_stop", &workspace),
+            );
+        }
+
+        let result = unsubscribe_stream(&workspace, "stream_public_stop")
+            .await
+            .expect("unsubscribe stream");
+
+        assert_eq!(result["removed"], true);
+        assert!(!STREAM_MANAGER
+            .lock()
+            .await
+            .subscriptions
+            .contains_key("stream_public_stop"));
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn public_stream_restore_reports_empty_store() {
+        let workspace = PathBuf::from(format!(
+            "/tmp/blockcell-stream-public-restore-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let result = restore_streams(&workspace).await.expect("restore streams");
+
+        assert_eq!(result["restored"], 0);
+    }
+
+    #[tokio::test]
+    async fn public_stream_restore_rejects_corrupt_persistence() {
+        let workspace = PathBuf::from(format!(
+            "/tmp/blockcell-stream-public-corrupt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = StreamManager::persistence_path(&workspace);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{broken").unwrap();
+
+        assert!(restore_streams(&workspace).await.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn automatic_restore_propagates_corrupt_persistence_and_remains_retryable() {
+        let workspace = PathBuf::from(format!(
+            "/tmp/blockcell-stream-auto-corrupt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = StreamManager::persistence_path(&workspace);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{broken").unwrap();
+
+        assert!(ensure_workspace_restored(&workspace).await.is_err());
+        assert!(!RESTORED.lock().await.contains(&workspace));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]

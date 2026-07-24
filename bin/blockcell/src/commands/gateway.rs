@@ -1877,6 +1877,8 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         )
         // P2: Streams
         .route("/v1/streams", get(handle_streams_list))
+        .route("/v1/streams/restore", post(handle_streams_restore))
+        .route("/v1/streams/:id", delete(handle_stream_delete))
         .route("/v1/streams/:id/data", get(handle_stream_data))
         // Persona files (AGENTS.md, SOUL.md, USER.md, etc.)
         .route("/v1/persona/files", get(handle_persona_list))

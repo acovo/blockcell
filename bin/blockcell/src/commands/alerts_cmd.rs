@@ -1,5 +1,72 @@
 use blockcell_core::Paths;
+use blockcell_tools::{alert_rule::AlertRuleTool, Tool};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use super::json_store::{read_json, update_json};
+use super::tools_cmd::build_cli_tool_context;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AlertStore {
+    #[serde(default = "default_store_version")]
+    version: u32,
+    #[serde(default)]
+    rules: Vec<Value>,
+}
+
+impl Default for AlertStore {
+    fn default() -> Self {
+        Self {
+            version: default_store_version(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+fn default_store_version() -> u32 {
+    1
+}
+
+fn read_alert_store(path: &std::path::Path) -> anyhow::Result<AlertStore> {
+    parse_alert_store_value(read_json(path)?)
+}
+
+fn parse_alert_store_value(value: Value) -> anyhow::Result<AlertStore> {
+    if !value.is_object() {
+        anyhow::bail!("Alert store root must be a JSON object");
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
+fn update_alert_store<R, F>(path: &std::path::Path, mutate: F) -> anyhow::Result<R>
+where
+    F: FnOnce(&mut AlertStore) -> anyhow::Result<R>,
+{
+    update_json(
+        path,
+        || serde_json::to_value(AlertStore::default()).expect("serialize default alert store"),
+        |raw: &mut Value| {
+            let mut store = parse_alert_store_value(std::mem::take(raw))?;
+            let result = mutate(&mut store)?;
+            *raw = serde_json::to_value(store)?;
+            Ok(result)
+        },
+    )
+}
+
+fn enabled_rule_ids(store: &AlertStore) -> anyhow::Result<Vec<&str>> {
+    store
+        .rules
+        .iter()
+        .filter(|rule| rule.get("enabled").and_then(Value::as_bool).unwrap_or(true))
+        .map(|rule| {
+            rule.get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Alert rule is missing a non-empty id"))
+        })
+        .collect()
+}
 
 /// List all alert rules.
 pub async fn list() -> anyhow::Result<()> {
@@ -11,8 +78,8 @@ pub async fn list() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&rules_file)?;
-    let rules: Vec<Value> = serde_json::from_str(&content).unwrap_or_default();
+    let store = read_alert_store(&rules_file)?;
+    let rules = &store.rules;
 
     if rules.is_empty() {
         println!("(No alert rules)");
@@ -28,7 +95,7 @@ pub async fn list() -> anyhow::Result<()> {
     );
     println!("  {}", "-".repeat(70));
 
-    for rule in &rules {
+    for rule in rules {
         let id = rule["id"].as_str().unwrap_or("?");
         let name = rule["name"].as_str().unwrap_or("?");
         let enabled = rule["enabled"].as_bool().unwrap_or(true);
@@ -62,8 +129,7 @@ pub async fn history(limit: usize) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&history_file)?;
-    let entries: Vec<Value> = serde_json::from_str(&content).unwrap_or_default();
+    let entries: Vec<Value> = read_json(&history_file)?;
 
     if entries.is_empty() {
         println!("(No alert trigger history)");
@@ -113,30 +179,48 @@ pub async fn evaluate() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&rules_file)?;
-    let rules: Vec<Value> = serde_json::from_str(&content).unwrap_or_default();
+    let store = read_alert_store(&rules_file)?;
+    let rule_ids = enabled_rule_ids(&store)?;
+    if rule_ids.is_empty() {
+        println!("(No enabled alert rules)");
+        return Ok(());
+    }
 
-    let enabled_count = rules
-        .iter()
-        .filter(|r| r["enabled"].as_bool().unwrap_or(true))
-        .count();
-    println!("⏳ Evaluating {} enabled alert rules...", enabled_count);
-    println!();
-    println!("Note: Real-time data sources are not available in CLI mode.");
-    println!("Full alert evaluation requires a running agent (via cron or agent chat).");
-    println!();
-    println!("Current rules overview:");
-    for rule in &rules {
-        let name = rule["name"].as_str().unwrap_or("?");
-        let enabled = rule["enabled"].as_bool().unwrap_or(true);
-        let source = rule["source"].as_str().unwrap_or("?");
-        if enabled {
-            println!("  📊 {} — source: {}", name, source);
+    let ctx = build_cli_tool_context(&paths)?;
+    let tool = AlertRuleTool;
+    let mut failures = Vec::new();
+    println!("⏳ Evaluating {} enabled alert rules...", rule_ids.len());
+    for rule_id in rule_ids {
+        let params = serde_json::json!({"action": "evaluate", "rule_id": rule_id});
+        tool.validate(&params)?;
+        match tool.execute(ctx.clone(), params).await {
+            Ok(result) if result.get("error").is_none() => {
+                println!(
+                    "  ✓ {} value={} triggered={}",
+                    rule_id,
+                    result.get("current_value").unwrap_or(&Value::Null),
+                    result.get("triggered").unwrap_or(&Value::Bool(false))
+                );
+            }
+            Ok(result) => {
+                let error = result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("evaluation failed");
+                println!("  ✗ {} {}", rule_id, error);
+                failures.push(format!("{}: {}", rule_id, error));
+            }
+            Err(error) => {
+                println!("  ✗ {} {}", rule_id, error);
+                failures.push(format!("{}: {}", rule_id, error));
+            }
         }
     }
-    println!();
-
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{} alert evaluation(s) failed", failures.len())
+    }
 }
 
 /// Add a new alert rule.
@@ -152,33 +236,45 @@ pub async fn add(
     std::fs::create_dir_all(&alerts_dir)?;
     let rules_file = alerts_dir.join("rules.json");
 
-    let mut rules: Vec<Value> = if rules_file.exists() {
-        let content = std::fs::read_to_string(&rules_file)?;
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    // Parse threshold as number or string
-    let threshold_val: Value =
-        serde_json::from_str(threshold).unwrap_or_else(|_| Value::String(threshold.to_string()));
+    let source: Value = serde_json::from_str(source)
+        .map_err(|error| anyhow::anyhow!("--source must be a JSON tool call object: {error}"))?;
+    if source.get("tool").and_then(Value::as_str).is_none() {
+        anyhow::bail!("--source must contain a string 'tool' field");
+    }
+    let threshold = threshold
+        .parse::<f64>()
+        .map_err(|error| anyhow::anyhow!("--threshold must be numeric: {error}"))?;
 
     let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp_millis();
     let rule = serde_json::json!({
         "id": id,
         "name": name,
         "enabled": true,
         "source": source,
-        "field": field,
+        "metric_path": field,
         "operator": operator,
-        "threshold": threshold_val,
-        "created_at": chrono::Utc::now().to_rfc3339(),
+        "threshold": threshold,
+        "threshold2": null,
+        "cooldown_secs": 3600,
+        "check_interval_secs": 300,
+        "notify": {"channel": "desktop", "template": null, "params": null},
         "on_trigger": [],
+        "state": {
+            "last_value": null,
+            "prev_value": null,
+            "last_check_at": null,
+            "last_triggered_at": null,
+            "trigger_count": 0,
+            "last_error": null
+        },
+        "created_at": now,
+        "updated_at": now,
     });
-
-    rules.push(rule);
-    let content = serde_json::to_string_pretty(&rules)?;
-    std::fs::write(&rules_file, content)?;
+    update_alert_store(&rules_file, |store| {
+        store.rules.push(rule);
+        Ok(())
+    })?;
 
     println!(
         "✓ Alert rule created: {} ({})",
@@ -198,24 +294,63 @@ pub async fn remove(rule_id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&rules_file)?;
-    let mut rules: Vec<Value> = serde_json::from_str(&content).unwrap_or_default();
+    let removed_id = update_alert_store(&rules_file, |store| {
+        let matches = store
+            .rules
+            .iter()
+            .filter_map(|rule| rule.get("id").and_then(Value::as_str))
+            .filter(|id| id.starts_with(rule_id))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => anyhow::bail!("No matching rule found: {}", rule_id),
+            [id] => {
+                let id = id.clone();
+                store
+                    .rules
+                    .retain(|rule| rule.get("id").and_then(Value::as_str) != Some(id.as_str()));
+                Ok(id)
+            }
+            _ => anyhow::bail!("Rule ID prefix '{}' is ambiguous", rule_id),
+        }
+    })?;
 
-    let before = rules.len();
-    rules.retain(|r| {
-        let id = r["id"].as_str().unwrap_or("");
-        !id.starts_with(rule_id)
-    });
+    println!("✓ Removed alert rule {}", removed_id);
+    Ok(())
+}
 
-    if rules.len() == before {
-        println!("No matching rule found: {}", rule_id);
-        return Ok(());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enabled_rule_ids_excludes_disabled_rules() {
+        let store = AlertStore {
+            version: 1,
+            rules: vec![
+                serde_json::json!({"id": "enabled", "enabled": true}),
+                serde_json::json!({"id": "disabled", "enabled": false}),
+            ],
+        };
+
+        assert_eq!(enabled_rule_ids(&store).unwrap(), vec!["enabled"]);
     }
 
-    let removed = before - rules.len();
-    let content = serde_json::to_string_pretty(&rules)?;
-    std::fs::write(&rules_file, content)?;
+    #[test]
+    fn alert_store_rejects_legacy_array_shape() {
+        assert!(parse_alert_store_value(serde_json::json!([])).is_err());
+    }
 
-    println!("✓ Removed {} alert rule(s)", removed);
-    Ok(())
+    #[test]
+    fn alert_store_update_does_not_replace_legacy_array() {
+        let path = std::env::temp_dir().join(format!(
+            "blockcell-alert-store-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "[]").unwrap();
+
+        assert!(update_alert_store(&path, |_store| Ok(())).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+        let _ = std::fs::remove_file(&path);
+    }
 }

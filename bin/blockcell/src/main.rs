@@ -405,7 +405,7 @@ enum AlertsCommands {
         /// Rule name
         #[arg(long)]
         name: String,
-        /// Data source (e.g. "stream_subscribe:ticker:BTCUSDT")
+        /// Data source tool call JSON (e.g. {"tool":"system_info","params":{"category":"hardware"}})
         #[arg(long)]
         source: String,
         /// Field to monitor (e.g. "price", "change_pct")
@@ -446,7 +446,7 @@ enum StreamsCommands {
         /// Subscription ID (prefix match)
         sub_id: String,
     },
-    /// Show restorable subscriptions
+    /// Restore persisted subscriptions in the running Gateway
     Restore,
 }
 
