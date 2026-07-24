@@ -129,7 +129,13 @@ pub(crate) async fn run_subagent_task(
             biased;
             _ = token.cancelled() => {
                 info!(task_id = %task_id, "Subagent stopped after cancellation");
-                task_manager.unregister_abort_token(&task_id);
+                // 父任务取消也必须写入终态，不能只注销 token 后留下 Running 记录。
+                if let Err(e) = task_manager
+                    .set_cancelled(&task_id, "父任务已取消")
+                    .await
+                {
+                    warn!(task_id = %task_id, error = %e, "Failed to finalize cancelled subagent task");
+                }
                 return;
             }
             result = sub_runtime.process_message(inbound) => result,

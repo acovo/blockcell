@@ -16,6 +16,40 @@ use tokio::task::JoinHandle;
 /// 后台任务句柄类型
 pub type BackgroundTaskHandle = JoinHandle<()>;
 
+/// 后台记忆提取占用标记的生命周期守卫。
+///
+/// Tokio 任务发生 panic 时会执行栈展开，因此用 Drop 清理可以避免同一进程内
+/// 遗留 marker/journal，导致后续提取被永久误判为仍在运行。
+pub(crate) struct ExtractionMarkerGuard {
+    marker_path: PathBuf,
+    journal_path: PathBuf,
+    cleanup_on_drop: bool,
+}
+
+impl ExtractionMarkerGuard {
+    pub(crate) fn new(marker_path: PathBuf, journal_path: PathBuf) -> Self {
+        Self {
+            marker_path,
+            journal_path,
+            cleanup_on_drop: true,
+        }
+    }
+
+    /// 保留占用标记，供需要在下一轮重试的持久化失败路径使用。
+    pub(crate) fn preserve(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+}
+
+impl Drop for ExtractionMarkerGuard {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = std::fs::remove_file(&self.marker_path);
+            let _ = std::fs::remove_file(&self.journal_path);
+        }
+    }
+}
+
 // Re-export MemorySystemConfig from core crate
 pub use blockcell_core::config::MemorySystemConfig;
 
@@ -1232,6 +1266,40 @@ pub fn default_memory_dir() -> PathBuf {
 mod tests {
     use super::*;
     use blockcell_core::config::Layer4Config;
+
+    #[test]
+    fn extraction_marker_guard_cleans_files_during_panic_unwind() {
+        let temp = tempfile::tempdir().expect("创建临时目录");
+        let marker = temp.path().join(".extraction_pending");
+        let journal = temp.path().join(".extraction_journal");
+        std::fs::write(&marker, b"").expect("创建 marker");
+        std::fs::write(&journal, b"{}").expect("创建 journal");
+
+        let result = std::panic::catch_unwind(|| {
+            let _guard = ExtractionMarkerGuard::new(marker.clone(), journal.clone());
+            panic!("模拟后台提取 panic");
+        });
+
+        assert!(result.is_err());
+        assert!(!marker.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn extraction_marker_guard_preserve_keeps_files() {
+        let temp = tempfile::tempdir().expect("创建临时目录");
+        let marker = temp.path().join(".extraction_pending.preference");
+        let journal = temp.path().join(".extraction_journal.preference");
+        std::fs::write(&marker, b"").expect("创建 marker");
+        std::fs::write(&journal, b"{}").expect("创建 journal");
+
+        let mut guard = ExtractionMarkerGuard::new(marker.clone(), journal.clone());
+        guard.preserve();
+        drop(guard);
+
+        assert!(marker.exists());
+        assert!(journal.exists());
+    }
 
     #[test]
     fn test_memory_system_config_default() {

@@ -760,6 +760,14 @@ impl TaskManager {
     /// 取消运行中的任务。
     /// 将任务状态设为 Cancelled，并触发已注册的 AbortToken。
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), Error> {
+        self.set_cancelled(task_id, "Cancelled by user").await
+    }
+
+    /// 使用明确原因将运行中或排队中的任务置为已取消。
+    ///
+    /// 用户主动取消和父任务链式取消都走同一个终态入口，确保状态、
+    /// AbortToken、生命周期事件和持久化记录保持一致。
+    pub async fn set_cancelled(&self, task_id: &str, reason: &str) -> Result<(), Error> {
         let updated = {
             let mut tasks = self.tasks.lock().await;
             if let Some(task) = tasks.get_mut(task_id) {
@@ -767,7 +775,7 @@ impl TaskManager {
                     TaskStatus::Running | TaskStatus::Queued => {
                         task.status = TaskStatus::Cancelled;
                         task.completed_at = Some(Utc::now());
-                        task.error = Some("Cancelled by user".to_string());
+                        task.error = Some(reason.to_string());
                         Some(task.clone())
                     }
                     _ => None, // 已完成/已失败/已取消的任务不能再取消
@@ -1647,6 +1655,39 @@ mod tests {
 
         manager.cancel_task("task-cancel-token").await.unwrap();
 
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn set_cancelled_records_reason_and_cancels_token() {
+        let manager = TaskManager::new();
+        let token = AbortToken::new();
+        manager
+            .create_and_start_task(
+                "task-parent-cancelled",
+                "demo",
+                "parent cancellation test",
+                "cli",
+                "chat-1",
+                None,
+                false,
+                Some("explore"),
+                true,
+            )
+            .await;
+        manager.register_abort_token("task-parent-cancelled", token.clone());
+
+        manager
+            .set_cancelled("task-parent-cancelled", "父任务已取消")
+            .await
+            .unwrap();
+
+        let task = manager
+            .get_task("task-parent-cancelled")
+            .await
+            .expect("cancelled task should remain queryable");
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.error.as_deref(), Some("父任务已取消"));
         assert!(token.is_cancelled());
     }
 

@@ -8,6 +8,11 @@
 
 - `cargo test -p blockcell-storage -- --nocapture`: 59 passed, 0 failed.
 - `cargo test -p blockcell-agent runtime -- --nocapture`: 122 passed, 0 failed; 492 filtered out.
+- `cargo test -p blockcell-agent subagent -- --nocapture`: 5 passed, 0 failed; parent-cancellation terminal state is covered separately by the TaskManager regression test below.
+- `cargo test -p blockcell-agent memory_system -- --nocapture`: 21 passed across unit and integration targets, 0 failed after adding panic-cleanup coverage.
+- `cargo test -p blockcell-agent response_cache -- --nocapture`: 22 passed, 0 failed after adding the zero-capacity contract test.
+- `cargo test -p blockcell-agent --all-targets`: 630 unit tests plus 56 integration tests passed, 0 failed after the R17-R19 fixes.
+- `cargo fmt --all -- --check`: passed after the R17-R19 fixes.
 
 Passing tests establish the current baseline. The remediated cross-channel/account routing,
 message-task panic, and deferred-review cleanup cases now have regression coverage. The
@@ -397,6 +402,69 @@ tools receive the current runtime abort token and origin session through `Runtim
 
 **Resolution:** Fixed. Startup scanning deletes valid terminal task records immediately and counts only unfinished tasks against the 1,000-task recovery limit, while continuing to process entries one at a time. Regression test: `restore_deletes_terminal_files_without_consuming_limit`.
 
+### R17 — Medium: Parent cancellation leaves ordinary subagents permanently Running
+
+**Locations:**
+
+- `crates/agent/src/runtime.rs:248-284`
+- `crates/agent/src/runtime/subagent.rs:42-45`
+- `crates/agent/src/runtime/subagent.rs:124-136`
+- `crates/agent/src/task_manager.rs:608-702`
+
+**Trigger:** An ordinary background subagent is running when its parent message token is cancelled because the parent message is replaced, explicitly stopped, or the runtime shuts down.
+
+**Control flow:** `RuntimeSpawnHandle::spawn` creates a child token and supervises only JoinHandle failure. `run_subagent_task` creates the task in `Running`, registers that token, and races `token.cancelled()` against `process_message`. The cancellation branch unregisters the token and returns `()`, but does not call `cancel_task`, `set_failed`, or another terminal transition. The outer JoinHandle therefore completes successfully, so its panic-only supervisor also performs no fallback transition.
+
+**Impact:** The task remains `Running` in TaskManager for the rest of the process, continues to appear unfinished in task listings and prompts, and emits no terminal lifecycle event. It is corrected only by restart recovery, which later rewrites it as interrupted/failed.
+
+**Repair direction:** Make cancellation an explicit terminal path before returning, preferably through one idempotent TaskManager method that records `Cancelled`, unregisters the token, persists state, and emits the origin-scoped lifecycle event. The JoinHandle supervisor should also treat unexpected task cancellation/abort as terminal. Add a test that cancels the parent token rather than calling `TaskManager::cancel_task` and asserts the ordinary subagent reaches `Cancelled` exactly once.
+
+**Evidence:** Deterministic control-flow proof. `cargo test -p blockcell-agent subagent -- --nocapture` passed 5 tests, but its abort-token test checks context propagation only and never observes TaskManager state after parent cancellation.
+
+**Resolution:** Fixed. TaskManager now exposes one reason-aware cancellation terminal transition used by both user cancellation and parent-chain cancellation. Ordinary subagents record `Cancelled`, cancel/unregister their token, emit the lifecycle event, and persist the terminal state before returning. Regression test: `set_cancelled_records_reason_and_cancels_token`.
+
+### R18 — Medium: A panicking detached memory extraction can suppress future extraction until process restart
+
+**Locations:**
+
+- `crates/agent/src/runtime/process_message_inner.rs:1664-1786`
+- `crates/agent/src/runtime/process_message_inner.rs:1828-1967`
+- `crates/agent/src/memory_system/mod.rs:362-466`
+- `crates/agent/src/memory_system/mod.rs:545-602`
+- `crates/agent/src/memory_system/mod.rs:885-945`
+
+**Trigger:** A detached Session Memory or Auto Memory extraction task panics after its pending marker and journal are created but before the task reaches its tail cleanup.
+
+**Control flow:** Both extraction paths discard their JoinHandle and remove marker/journal files only in normal task control flow. A panic skips that cleanup. The journal records only `owner_pid`; stale detection returns `false` unconditionally when that PID equals the current process, even after the configured stale threshold. Subsequent runtimes in the same long-lived Gateway process therefore interpret the orphaned marker as belonging to a still-running extraction and keep skipping that session or memory type.
+
+**Impact:** Session-memory or one Auto Memory category can stop updating indefinitely in a live process after a single task panic. There is no task failure signal or self-recovery until the whole process exits and later stale-PID recovery becomes possible.
+
+**Repair direction:** Give each extraction a unique owner token plus an in-process liveness registry, or supervise the JoinHandle and perform cleanup on panic. Put marker/journal cleanup in an RAII guard whose ownership token must match before deletion. Stale detection should distinguish a live process from a live extraction task. Add deterministic panic tests for both extraction paths and assert the next evaluation can schedule extraction again.
+
+**Evidence:** Deterministic panic-path proof. `cargo test -p blockcell-agent memory_system -- --nocapture` passed 19 relevant tests, but none panics a detached extraction or tests same-process orphan recovery.
+
+**Resolution:** Fixed. Detached Session Memory and Auto Memory extraction tasks now own an `ExtractionMarkerGuard` that removes marker/journal files during normal return, errors, and panic unwind. The existing Auto Memory cursor-save-failure path explicitly preserves both files for retry. Regression tests: `extraction_marker_guard_cleans_files_during_panic_unwind` and `extraction_marker_guard_preserve_keeps_files`.
+
+### R19 — Low: ResponseCache capacity zero still stores one entry
+
+**Locations:**
+
+- `crates/agent/src/response_cache.rs:205-227`
+- `crates/core/src/config/memory.rs:49-54`
+- `crates/core/src/config/memory.rs:571-588`
+
+**Trigger:** An operator configures `memorySystem.layer1.cacheMaxPerSession` to `0`, a value accepted without validation, and a cacheable tool result is processed.
+
+**Control flow:** With `max_per_session == 0`, the capacity check is always true, but an empty session map has no oldest entry to remove. The code then unconditionally inserts the new entry and returns a cache stub. Later insertions evict the existing entry and insert another, so the effective capacity is one rather than zero.
+
+**Impact:** The documented/configured attempt to disable per-session response caching does not work, and large content is replaced with a cache reference despite a zero-entry limit. Memory use remains bounded to one entry per active session, so severity is low.
+
+**Repair direction:** Treat zero as disabled and return `None` before generating/inserting a cache entry, or reject/clamp zero during configuration validation with an explicit contract. Add a zero-capacity unit test.
+
+**Evidence:** Direct boundary proof. `cargo test -p blockcell-agent response_cache -- --nocapture` passed 21 tests, with no zero-capacity case.
+
+**Resolution:** Fixed. `maybe_cache_and_stub` now treats a zero per-session capacity as disabled before creating a cache reference or entry. Regression test: `zero_capacity_disables_response_cache`.
+
 ### M1 — High in multi-conversation deployments: Structured memory is automatically recalled across session boundaries
 
 **Locations:**
@@ -471,6 +539,7 @@ tools receive the current runtime abort token and origin session through `Runtim
 ## Open architecture risks and missing coverage
 
 - `DeliveryPolicy.persist` and `max_delay_seconds` remain unenforced by the in-memory event store. Pending events and summary items can still disappear on process restart even though the default policy requests persistence.
+- `CapabilityRegistryHandle` is an outer `Arc<tokio::Mutex<dyn CapabilityRegistryOps>>`. Callers hold that mutex while awaiting `execute_capability`, and the adapter then awaits an external capability executor after releasing only its inner concrete-registry lock. This serializes all capability-registry operations behind the full duration of one capability execution. No lock cycle was found, so this is recorded as a head-of-line blocking risk rather than a confirmed deadlock.
 
 ## Review progress
 
@@ -480,6 +549,6 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Module 2 Task 2 authorization, path, confirmation, inheritance, subagent restriction, and policy-reload review: complete; R6-R7 fixed and regression-tested.
 - Module 2 Task 2 cancellation, steering, forked-agent work, and cleanup review: complete; R8-R9 fixed and regression-tested.
 - Module 2 Task 3 context ordering, truncation, compact recovery budgets, summaries, and file/skill tracking review: complete; R10-R12 fixed and regression-tested.
-- Module 2 Task 3 task state, restart recovery, event emission, and notification routing review: complete; R13-R16 fixed and regression-tested. Shared-state/concurrency review remains pending.
+- Module 2 Task 3 task state, restart recovery, event emission, notification routing, shared state, spawned-task ownership, shutdown, and cache-key review: complete. R13-R19 are fixed and regression-tested.
 - Module 5 structured-memory and learning-lock findings M1-M3: reviewed, fixed, and regression-tested.
 - The implementation and verification record is in `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review-fixes.md`.

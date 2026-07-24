@@ -1708,6 +1708,10 @@ impl AgentRuntime {
                     // 进程退出时正在运行的任务会丢失，只能通过 stale 机制清理。
                     // 原子 pending marker 防止并发重复提取。
                     let _handle = tokio::spawn(async move {
+                        let _marker_guard = crate::memory_system::ExtractionMarkerGuard::new(
+                            session_marker_path,
+                            session_journal_path,
+                        );
                         let system_prompt = Arc::new(
                             "你是一个会话记忆提取助手。请从对话中提取关键信息并更新 Session Memory 文件。"
                                 .to_string(),
@@ -1776,9 +1780,6 @@ impl AgentRuntime {
                                 }
                             }
                         }
-                        // 始终清理 extraction pending 标记和 journal（无论成功或失败）
-                        let _ = std::fs::remove_file(&session_marker_path);
-                        let _ = std::fs::remove_file(&session_journal_path);
                     });
 
                     // 注意：不将提取句柄加入 background_tasks，避免 runtime drop 时 abort
@@ -1875,7 +1876,11 @@ impl AgentRuntime {
                     }
 
                     let _handle = tokio::spawn(async move {
-                        // marker 已在 spawn 前原子创建，无需在任务内创建
+                        // marker 已在 spawn 前原子创建；守卫确保错误和 panic 路径也会清理。
+                        let mut marker_guard = crate::memory_system::ExtractionMarkerGuard::new(
+                            auto_marker_path,
+                            auto_journal_path,
+                        );
 
                         // 创建提取器（会加载持久化的游标状态）
                         let extractor_config =
@@ -1890,9 +1895,6 @@ impl AgentRuntime {
                                 Ok(e) => e,
                                 Err(e) => {
                                     warn!(error = %e, "[layer5] Failed to create AutoMemoryExtractor");
-                                    // 清理 pending 标记和 journal
-                                    let _ = std::fs::remove_file(&auto_marker_path);
-                                    let _ = std::fs::remove_file(&auto_journal_path);
                                     return;
                                 }
                             };
@@ -1916,13 +1918,10 @@ impl AgentRuntime {
 
                         let result = extractor.extract(params).await;
 
-                        // 清理 pending 标记
-                        // 如果 cursor_save_failed，保留 marker 以便下次重试，
-                        // 避免游标未推进时重复触发提取但 marker 被清除导致无法防重
-                        if !result.success || !result.cursor_save_failed {
-                            let _ = std::fs::remove_file(&auto_marker_path);
-                            let _ = std::fs::remove_file(&auto_journal_path);
-                        } else {
+                        // 游标保存失败时保留 marker/journal，避免游标未推进导致重复写入；
+                        // 其余路径由守卫统一清理，包括 panic unwind。
+                        if result.success && result.cursor_save_failed {
+                            marker_guard.preserve();
                             warn!(
                                 memory_type = result.memory_type.name(),
                                 "[layer5] 游标保存失败，保留 pending marker 以便重试"

@@ -172,6 +172,12 @@ impl ResponseCache {
         // Previously, is_cacheable() acquired its own lock, then the insertion
         // acquired a second lock — this was a double-lock pattern that could
         // observe inconsistent config between the two calls.
+        let mut inner = self.get_lock();
+        // 容量为 0 明确表示禁用会话响应缓存，不能生成无法保存的引用。
+        if inner.config.cache_max_per_session == 0 {
+            return None;
+        }
+
         let items = Self::extract_list_items(content);
         if items.len() < 5 {
             return None;
@@ -203,7 +209,6 @@ impl ResponseCache {
             created_at: chrono::Utc::now().timestamp(),
         };
 
-        let mut inner = self.get_lock();
         // Check cacheability inside the lock (min_chars from config)
         let min_chars = inner.config.cacheable_min_chars;
         if content.chars().count() <= min_chars {
@@ -936,6 +941,24 @@ pub async fn cleanup_tool_results(
 #[allow(clippy::items_after_test_module)]
 mod layer1_tests {
     use super::*;
+
+    #[test]
+    fn zero_capacity_disables_response_cache() {
+        let cache = ResponseCache::with_config(ResponseCacheConfig {
+            cache_max_per_session: 0,
+            cacheable_min_chars: 0,
+            ..ResponseCacheConfig::default()
+        });
+        let content = (1..=6)
+            .map(|index| format!("{}. 第 {} 条缓存测试内容", index, index))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let stub = cache.maybe_cache_and_stub("ws:test", &content, true);
+
+        assert!(stub.is_none());
+        assert!(cache.get_lock().data.get("ws:test").is_none());
+    }
 
     #[test]
     fn test_generate_preview_short() {

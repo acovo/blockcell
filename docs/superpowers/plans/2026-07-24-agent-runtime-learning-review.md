@@ -67,8 +67,8 @@
 
 - [x] Check context ordering, truncation, recovery budgets, compact summaries, and file/skill tracking for information loss or prompt corruption.
 - [x] Check task state transitions, restart recovery, event emission, and notification routing for races or inconsistent state.
-- [ ] Check mutex/RwLock usage, spawned-task ownership, shutdown handling, and cache keys for deadlocks, leaks, or cross-session contamination.
-- [ ] Record confirmed defects, architectural risks, and missing tests separately.
+- [x] Check mutex/RwLock usage, spawned-task ownership, shutdown handling, and cache keys for deadlocks, leaks, or cross-session contamination.
+- [x] Record confirmed defects, architectural risks, and missing tests separately.
 
 ## Part 2: Module 5 — Memory, self-learning, and self-evolution
 
