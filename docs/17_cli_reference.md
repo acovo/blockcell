@@ -187,7 +187,7 @@ blockcell gateway [OPTIONS]
 | 选项 | 短写 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--port <PORT>` | `-p` | 18790 | API 监听端口（覆盖配置中的 `gateway.port`） |
-| `--host <HOST>` | — | `0.0.0.0` | 绑定地址（覆盖配置中的 `gateway.host`） |
+| `--host <HOST>` | — | `localhost` | 绑定地址（覆盖配置中的 `gateway.host`） |
 
 **示例：**
 ```bash

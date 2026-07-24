@@ -146,7 +146,7 @@ Starts the HTTP / WebSocket gateway and connects all configured channels.
 | Option | Short | Default | Description |
 |------|------|--------|------|
 | `--port <PORT>` | `-p` | `18790` | Override `gateway.port` |
-| `--host <HOST>` | — | `0.0.0.0` | Override `gateway.host` |
+| `--host <HOST>` | — | `localhost` | Override `gateway.host` |
 
 **Examples:**
 
