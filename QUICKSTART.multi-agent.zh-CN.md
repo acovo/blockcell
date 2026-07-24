@@ -113,7 +113,7 @@ blockcell setup
 - CLI / WebUI / WebSocket 请求默认进入 `default`，除非你显式指定别的 agent。
 - 外部渠道先检查 `channelAccountOwners.<channel>.<accountId>`。
 - 若没有账号级命中，则回退到 `channelOwners.<channel>`。
-- 若渠道映射也不存在，则继续留在 `default`。
+- 每个已启用的外部渠道必须配置渠道级 owner，或为所有已启用账号配置完整的账号级 owner；否则 Gateway 会在启动时拒绝该配置。
 
 ## 4）关于 tools 隔离
 

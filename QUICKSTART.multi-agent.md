@@ -113,7 +113,7 @@ Routing order:
 - CLI / WebUI / WebSocket requests go to `default` unless you explicitly choose another agent.
 - External channels first check `channelAccountOwners.<channel>.<accountId>`.
 - If no account-level match exists, they fall back to `channelOwners.<channel>`.
-- If no channel mapping exists, the request stays on `default`.
+- Every enabled external channel must have either a channel-level owner or owner mappings for all enabled accounts. Otherwise, the Gateway rejects the configuration at startup.
 
 ## 4) About tool separation
 
