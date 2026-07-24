@@ -245,10 +245,16 @@ pub async fn run_forked_agent(
         }
 
         // 调用 LLM（传入过滤后的工具 schema，让 LLM 知道可以调用哪些工具）
-        let response = match provider
-            .chat(&current_messages, &filtered_tool_schemas)
-            .await
-        {
+        let provider_result = tokio::select! {
+            biased;
+            _ = context.abort_token.cancelled() => {
+                return Err(ForkedAgentError::Aborted(
+                    "Cancelled while waiting for provider".to_string(),
+                ));
+            }
+            result = provider.chat(&current_messages, &filtered_tool_schemas) => result,
+        };
+        let response = match provider_result {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
@@ -404,20 +410,27 @@ pub async fn run_forked_agent(
                 }
 
                 // 执行工具
-                let tool_result = execute_forked_tool(
-                    tool_name,
-                    tool_input,
-                    &params.can_use_tool,
-                    &params.disallowed_tools,
-                    &params.memory_store,
-                    &params.memory_file_store,
-                    &params.skill_file_store,
-                    &params.skills_dir,
-                    &params.external_skills_dirs,
-                    &params.skill_mutex,
-                    &params.working_dir,
-                )
-                .await;
+                let tool_result = tokio::select! {
+                    biased;
+                    _ = context.abort_token.cancelled() => {
+                        return Err(ForkedAgentError::Aborted(
+                            format!("Cancelled while executing tool '{}'", tool_name),
+                        ));
+                    }
+                    result = execute_forked_tool(
+                        tool_name,
+                        tool_input,
+                        &params.can_use_tool,
+                        &params.disallowed_tools,
+                        &params.memory_store,
+                        &params.memory_file_store,
+                        &params.skill_file_store,
+                        &params.skills_dir,
+                        &params.external_skills_dirs,
+                        &params.skill_mutex,
+                        &params.working_dir,
+                    ) => result,
+                };
 
                 // 跟踪修改的文件
                 if tool_result.is_ok() {

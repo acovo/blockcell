@@ -46,6 +46,13 @@ pub struct SteeringSender {
     tx: mpsc::Sender<SteeringMessage>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SteeringRouteOutcome {
+    Enqueued,
+    Full,
+    Closed,
+}
+
 impl SteeringChannel {
     pub fn new(buffer_size: usize) -> (Self, SteeringSender) {
         let (tx, rx) = mpsc::channel(buffer_size);
@@ -70,6 +77,16 @@ impl SteeringChannel {
 }
 
 impl SteeringSender {
+    /// Route without waiting for capacity so a busy conversation cannot block
+    /// the runtime's global inbound dispatcher.
+    pub fn try_route(&self, message: SteeringMessage) -> SteeringRouteOutcome {
+        match self.tx.try_send(message) {
+            Ok(()) => SteeringRouteOutcome::Enqueued,
+            Err(mpsc::error::TrySendError::Full(_)) => SteeringRouteOutcome::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => SteeringRouteOutcome::Closed,
+        }
+    }
+
     pub async fn send(
         &self,
         message: SteeringMessage,
@@ -164,5 +181,20 @@ mod tests {
         let result = sender.send(message("closed")).await;
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn steering_queue_full_rejects_newest_without_waiting() {
+        let (mut channel, sender) = SteeringChannel::new(1);
+        assert_eq!(
+            sender.try_route(message("first")),
+            SteeringRouteOutcome::Enqueued
+        );
+
+        assert_eq!(
+            sender.try_route(message("second")),
+            SteeringRouteOutcome::Full
+        );
+        assert_eq!(channel.drain(), vec![message("first")]);
     }
 }

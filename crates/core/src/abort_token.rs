@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::Notify;
 
 /// Agent级别的取消信号
 /// 参考: Claude Code AbortController 链
@@ -12,6 +13,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 pub struct AbortToken {
     /// 是否已取消（所有 clone 的 token 共享此状态）
     cancelled: Arc<AtomicBool>,
+    /// Wakes async operations waiting for cancellation.
+    notify: Arc<Notify>,
     /// 父级取消信号（形成链）
     /// Arc 是必要的，用于打破递归类型
     parent: Option<Arc<AbortToken>>,
@@ -29,6 +32,7 @@ impl AbortToken {
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
             parent: None,
         }
     }
@@ -40,6 +44,7 @@ impl AbortToken {
     pub fn child(&self) -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
             parent: Some(Arc::new(self.clone())),
         }
     }
@@ -68,14 +73,37 @@ impl AbortToken {
         Ok(())
     }
 
+    /// Wait until this token or any parent token is cancelled.
+    pub async fn cancelled(&self) {
+        let local_wait = self.notify.notified();
+        tokio::pin!(local_wait);
+
+        // Register the notification future before checking the atomic flag so
+        // cancellation cannot race between the check and waiter registration.
+        if self.is_cancelled() {
+            return;
+        }
+
+        if let Some(parent) = &self.parent {
+            let mut parent_wait = Box::pin(parent.cancelled());
+            tokio::select! {
+                _ = &mut local_wait => {}
+                _ = parent_wait.as_mut() => {}
+            }
+        } else {
+            local_wait.await;
+        }
+    }
+
     /// 触发取消
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
     /// 取消并附带原因
     pub fn cancel_with_reason(&self, reason: String) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancel();
         tracing::info!(reason = %reason, "AbortToken cancelled");
     }
 }
@@ -212,6 +240,34 @@ mod tests {
 
         token.cancel();
         assert!(token.check().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_completes_after_local_cancel() {
+        let token = AbortToken::new();
+        let waiter_token = token.clone();
+        let waiter = tokio::spawn(async move { waiter_token.cancelled().await });
+
+        token.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), waiter)
+            .await
+            .expect("local cancellation should wake waiter")
+            .expect("waiter task should complete");
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_completes_after_parent_cancel() {
+        let parent = AbortToken::new();
+        let child = parent.child();
+        let waiter = tokio::spawn(async move { child.cancelled().await });
+
+        parent.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), waiter)
+            .await
+            .expect("parent cancellation should wake child waiter")
+            .expect("waiter task should complete");
     }
 
     #[test]

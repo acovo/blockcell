@@ -200,6 +200,54 @@ tools receive the current runtime abort token and origin session through `Runtim
 
 **Resolution:** Fixed. Default fork mode now uses one canonical runtime-enforced disallow list covering spawn, shell execution, file editing, and file writing; the same list filters advertised schemas and rejects forged/undeclared calls in the fork dispatcher. Typed agents retain their explicit configured capabilities. Regression test: `default_fork_capabilities_are_structurally_read_only`.
 
+### R8 — Medium: Background-agent cancellation changes task state but does not stop active provider or tool work
+
+**Locations:**
+
+- `crates/agent/src/task_manager.rs:700-745`
+- `crates/agent/src/runtime/subagent.rs:76-82`
+- `crates/agent/src/runtime/subagent.rs:116-165`
+- `crates/agent/src/runtime/fork_spawn.rs:276-279`
+- `crates/agent/src/runtime/fork_spawn.rs:389-443`
+- `crates/agent/src/forked/agent/run.rs:197-225`
+- `crates/agent/src/forked/agent/run.rs:247-264`
+- `crates/agent/src/forked/agent/run.rs:406-420`
+- `crates/agent/src/forked/agent/tool_exec.rs:187-215`
+
+**Trigger:** A user cancels a running ordinary subagent or typed agent while it is awaiting a provider response or executing a long-running forked tool, including an allowed `exec` command.
+
+**Control flow:** `TaskManager::cancel_task` immediately marks the task `Cancelled` and cancels its registered `AbortToken`, but it does not own or abort the background task's `JoinHandle`. Ordinary subagent execution installs the token on a nested `AgentRuntime`, whose message/provider/tool loop never checks it. Forked/typed execution checks the token only before each turn and during provider-acquisition retry; both `provider.chat(...).await` and `execute_forked_tool(...).await` are uninterruptible by that token. The shell path wraps `Command::output()` in a timeout without `kill_on_drop`, so cancellation is not observed during the command and the timeout can drop the wait future without guaranteeing termination of the spawned process. Ordinary subagents subsequently call `set_completed`/`set_failed`; those state updates correctly preserve `Cancelled`, but the code still records delegation learning and persists/delivers the late result or failure. Typed agents suppress late result delivery after re-reading task state, but any tool side effects have already happened.
+
+**Impact:** The UI/task API can report successful cancellation while provider usage and filesystem/shell side effects continue. A cancelled ordinary subagent can later send a contradictory completion/failure message and persist it into the parent session. Long-running child processes may outlive both cancellation and the nominal tool timeout.
+
+**Repair direction:** Give each background agent a cancellation supervisor that owns its `JoinHandle`, and make provider/tool waits cancellation-aware with `tokio::select!`. Pass the token into `execute_forked_tool`; for subprocesses use an owned `Child`, `kill_on_drop(true)` or explicit process-group termination, and await cleanup. Before all ordinary-subagent learning, persistence, and delivery, re-check terminal task state and suppress work after cancellation. Add deterministic tests for cancellation during a pending provider, during a shell command, and before late result delivery.
+
+**Evidence:** Control-flow proof above. Existing cancellation tests verify only token propagation and task-state protection; `cargo test -p blockcell-agent cancel -- --nocapture` passed 7 tests but contains no pending-provider/tool cancellation test.
+
+**Resolution:** Fixed. `AbortToken` now provides a race-safe async cancellation wait. Ordinary subagents race cancellation against their message future and return before learning, persistence, or delivery. Forked/typed agents race cancellation against provider and tool futures, and forked shell commands use `kill_on_drop(true)` so dropping a cancelled or timed-out command future terminates its child. Regression tests: `forked_agent_cancels_pending_provider`, `forked_agent_cancellation_kills_running_shell_tool`, `cancelled_wait_completes_after_local_cancel`, and `cancelled_wait_completes_after_parent_cancel`.
+
+### R9 — Medium: A full steering queue blocks the global inbound loop and prevents cancellation
+
+**Locations:**
+
+- `crates/agent/src/runtime/run_loop.rs:275-334`
+- `crates/agent/src/runtime/run_loop.rs:416-425`
+- `crates/agent/src/runtime/process_message_inner.rs:672-705`
+- `crates/agent/src/runtime/message_dispatch.rs:299-332`
+- `crates/agent/src/steering.rs:49-85`
+
+**Trigger:** An active conversation remains inside provider streaming, retry sleep, or tool execution long enough to receive more than the steering channel's capacity of 16 additional messages.
+
+**Control flow:** Steering is drained only immediately before the next LLM call. The single runtime inbound loop routes messages with `try_send`; when the queue is full, it awaits `sender.send(...)` inline. Until the active message task reaches the next steering drain, that await cannot complete. Because the same loop processes every conversation and the `/stop` and `/cancel-task` directives, no later inbound message or cancellation command can be handled during this interval.
+
+**Impact:** One busy conversation can stall inbound processing for all conversations served by the runtime. The exact condition that most needs cancellation also prevents cancellation from being consumed, potentially extending the stall to the 300-second stream timeout, a long tool call, or indefinitely for an unbounded provider/tool future.
+
+**Repair direction:** Never await steering backpressure in the global dispatcher. Use a documented bounded policy such as rejecting the newest message with an immediate busy response, coalescing pending steering, or moving per-conversation enqueueing to an isolated task. Process cancellation out of band from steering capacity, and make long provider/tool waits observe steering or cancellation where supported. Add a test that fills one conversation's steering queue and proves another conversation plus a cancellation directive remain responsive.
+
+**Evidence:** Control-flow proof above. `cargo test -p blockcell-agent steering -- --nocapture` passed 7 tests, but the tests cover ordering, identity separation, and closed channels only; none exercises a full queue through the runtime loop.
+
+**Resolution:** Fixed. Steering routing now uses a synchronous bounded outcome and rejects the newest message when the queue is full; the global inbound loop never awaits steering capacity and remains available for other conversations and cancellation directives. Regression test: `steering_queue_full_rejects_newest_without_waiting`.
+
 ### M1 — High in multi-conversation deployments: Structured memory is automatically recalled across session boundaries
 
 **Locations:**
@@ -272,6 +320,7 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Module 2 Task 1 lifecycle and early-return/error audit: complete.
 - Runtime lifecycle findings R1-R3: fixed and regression-tested.
 - Runtime lifecycle findings R4-R5: fixed and regression-tested after the completed early-return/error audit.
-- Module 2 Task 2 authorization, path, confirmation, inheritance, subagent restriction, and policy-reload review: complete; R6-R7 fixed and regression-tested. Cancellation and steering review is in progress.
+- Module 2 Task 2 authorization, path, confirmation, inheritance, subagent restriction, and policy-reload review: complete; R6-R7 fixed and regression-tested.
+- Module 2 Task 2 cancellation, steering, forked-agent work, and cleanup review: complete; R8-R9 fixed and regression-tested.
 - Module 5 structured-memory and learning-lock findings M1-M3: reviewed, fixed, and regression-tested.
 - The implementation and verification record is in `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review-fixes.md`.

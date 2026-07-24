@@ -49,7 +49,8 @@ use crate::skill_executor::{determine_manual_load_mode, SkillExecutionResult};
 use crate::skill_file_store::SkillFileStore;
 use crate::skill_kernel::SkillRunMode;
 use crate::steering::{
-    ActiveConversationKey, SteeringChannel, SteeringMessage, SteeringRegistry, SteeringSender,
+    ActiveConversationKey, SteeringChannel, SteeringMessage, SteeringRegistry,
+    SteeringRouteOutcome, SteeringSender,
 };
 use crate::summary_queue::MainSessionSummaryQueue;
 use crate::system_event_orchestrator::{

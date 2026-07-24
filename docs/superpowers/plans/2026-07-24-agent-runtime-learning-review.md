@@ -51,8 +51,8 @@
 
 - [x] Trace authorization from model-selected tool name and arguments to the final tool invocation.
 - [x] Verify path checks, user confirmation, permission inheritance, subagent restrictions, and policy reload behavior.
-- [ ] Trace cancellation and steering during provider streaming, tool execution, forked-agent work, and cleanup.
-- [ ] Run `cargo test -p blockcell-agent runtime -- --nocapture` and focused tests for any candidate defect.
+- [x] Trace cancellation and steering during provider streaming, tool execution, forked-agent work, and cleanup.
+- [x] Run `cargo test -p blockcell-agent runtime -- --nocapture` and focused tests for any candidate defect.
 
 ### Task 3: Review context, compaction, tasks, and shared state
 

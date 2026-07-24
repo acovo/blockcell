@@ -73,6 +73,7 @@ pub(crate) async fn run_subagent_task(
     if let Some(tx) = outbound_tx.clone() {
         sub_runtime.outbound_tx = Some(tx);
     }
+    let cancellation_token = abort_token.clone();
     if let Some(at) = abort_token {
         sub_runtime.abort_token = at.clone();
         // Register the AbortToken with the task manager so that /tasks cancel
@@ -120,7 +121,19 @@ pub(crate) async fn run_subagent_task(
         &subagent_metadata,
         &session_key,
     );
-    let result = sub_runtime.process_message(inbound).await;
+    let result = if let Some(token) = cancellation_token {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                info!(task_id = %task_id, "Subagent stopped after cancellation");
+                task_manager.unregister_abort_token(&task_id);
+                return;
+            }
+            result = sub_runtime.process_message(inbound) => result,
+        }
+    } else {
+        sub_runtime.process_message(inbound).await
+    };
 
     match result {
         Ok(result) => {

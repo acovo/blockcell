@@ -207,6 +207,7 @@ pub(crate) async fn execute_shell_command(
     if let Some(dir) = command_working_dir {
         cmd.current_dir(dir);
     }
+    cmd.kill_on_drop(true);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())

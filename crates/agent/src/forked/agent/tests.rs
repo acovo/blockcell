@@ -1,5 +1,132 @@
 use super::*;
 
+struct PendingForkProvider {
+    started: Arc<tokio::sync::Notify>,
+}
+
+struct ShellToolProvider;
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for ShellToolProvider {
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<blockcell_core::types::LLMResponse> {
+        Ok(blockcell_core::types::LLMResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![blockcell_core::types::ToolCallRequest {
+                id: "shell-1".to_string(),
+                name: "exec".to_string(),
+                arguments: json!({"command": "sleep 1; touch cancelled-marker"}),
+                thought_signature: None,
+            }],
+            finish_reason: "tool_calls".to_string(),
+            usage: serde_json::Value::Null,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for PendingForkProvider {
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<blockcell_core::types::LLMResponse> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn forked_agent_cancels_pending_provider() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let provider_pool = blockcell_providers::ProviderPool::from_single_provider(
+        "test-model",
+        "pending-provider",
+        Arc::new(PendingForkProvider {
+            started: Arc::clone(&started),
+        }),
+    );
+    let params = ForkedAgentParams::builder()
+        .provider_pool(provider_pool)
+        .prompt_messages(vec![ChatMessage::user("wait")])
+        .cache_safe_params(CacheSafeParams::default())
+        .fork_label("cancel_test")
+        .max_turns(1)
+        .build()
+        .expect("params should build");
+    let abort_token = blockcell_core::AbortToken::new();
+    let task_token = abort_token.clone();
+    let task = tokio::spawn(async move {
+        blockcell_core::scope_abort_token(task_token, run_forked_agent(params)).await
+    });
+
+    tokio::time::timeout(Duration::from_millis(200), started.notified())
+        .await
+        .expect("provider call should start");
+    abort_token.cancel();
+
+    let result = tokio::time::timeout(Duration::from_millis(200), task)
+        .await
+        .expect("cancellation should interrupt pending provider")
+        .expect("forked task should join");
+    assert!(matches!(result, Err(ForkedAgentError::Aborted(_))));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn forked_agent_cancellation_kills_running_shell_tool() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider_pool = blockcell_providers::ProviderPool::from_single_provider(
+        "test-model",
+        "shell-provider",
+        Arc::new(ShellToolProvider),
+    );
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let params = ForkedAgentParams::builder()
+        .provider_pool(provider_pool)
+        .prompt_messages(vec![ChatMessage::user("run shell")])
+        .cache_safe_params(CacheSafeParams::default())
+        .fork_label("shell_cancel_test")
+        .working_dir(temp.path().to_path_buf())
+        .event_tx(event_tx)
+        .max_turns(1)
+        .build()
+        .expect("params should build");
+    let abort_token = blockcell_core::AbortToken::new();
+    let task_token = abort_token.clone();
+    let task = tokio::spawn(async move {
+        blockcell_core::scope_abort_token(task_token, run_forked_agent(params)).await
+    });
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let event = event_rx.recv().await.expect("progress event");
+            if event.contains("tool_call_start") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("shell tool should start");
+    abort_token.cancel();
+
+    let result = tokio::time::timeout(Duration::from_millis(200), task)
+        .await
+        .expect("cancellation should interrupt shell tool")
+        .expect("forked task should join");
+    assert!(matches!(result, Err(ForkedAgentError::Aborted(_))));
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        !temp.path().join("cancelled-marker").exists(),
+        "cancelled shell process must not outlive its tool future"
+    );
+}
+
 #[test]
 fn test_normalize_path_preserves_leading_parent_dir() {
     // "../secret" → pop() on empty fails → push ".." back → "../secret"

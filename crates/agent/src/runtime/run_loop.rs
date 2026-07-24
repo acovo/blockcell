@@ -288,8 +288,8 @@ impl AgentRuntime {
                                         channel: msg.channel.clone(),
                                         chat_id: msg.chat_id.clone(),
                                     };
-                                    match sender.try_send(steering_message) {
-                                        Ok(()) => {
+                                    match sender.try_route(steering_message) {
+                                        SteeringRouteOutcome::Enqueued => {
                                             info!(
                                                 channel = %msg.channel,
                                                 chat_id = %msg.chat_id,
@@ -297,30 +297,15 @@ impl AgentRuntime {
                                             );
                                             continue;
                                         }
-                                        Err(tokio::sync::mpsc::error::TrySendError::Full(steering_message)) => {
-                                            match sender.send(steering_message).await {
-                                                Ok(()) => {
-                                                    info!(
-                                                        channel = %msg.channel,
-                                                        chat_id = %msg.chat_id,
-                                                        "Routed inbound message to active steering channel after backpressure"
-                                                    );
-                                                    continue;
-                                                }
-                                                Err(err) => {
-                                                    warn!(
-                                                        chat_id = %msg.chat_id,
-                                                        error = %err,
-                                                        "Active steering channel closed while sending; falling back to new message task"
-                                                    );
-                                                    active_steering_senders.remove(&conversation_key);
-                                                    if let Some(registry) = active_steering_registry.as_ref() {
-                                                        registry.lock().await.remove(&conversation_key);
-                                                    }
-                                                }
-                                            }
+                                        SteeringRouteOutcome::Full => {
+                                            warn!(
+                                                channel = %msg.channel,
+                                                chat_id = %msg.chat_id,
+                                                "Active steering channel is full; rejecting newest steering message"
+                                            );
+                                            continue;
                                         }
-                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        SteeringRouteOutcome::Closed => {
                                             warn!(
                                                 chat_id = %msg.chat_id,
                                                 "Active steering channel closed; falling back to new message task"
