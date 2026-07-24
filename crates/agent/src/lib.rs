@@ -23,6 +23,7 @@ pub mod hooks;
 pub mod intent;
 pub mod learning_coordinator;
 pub mod learning_dedup;
+pub mod learning_file_lock;
 pub mod learning_throttle;
 pub mod memory_adapter;
 pub mod memory_file_store;
@@ -113,7 +114,8 @@ pub use memory_system::{
 pub use response_cache::{ResponseCache, ResponseCacheConfig};
 pub use runtime::{create_evolution_deploy_callback, AgentRuntime, ConfirmRequest};
 pub use steering::{
-    SteeringChannel, SteeringMessage, SteeringRegistry, SteeringSender, SteeringSessionKey,
+    ActiveConversationKey, SteeringChannel, SteeringMessage, SteeringRegistry, SteeringSender,
+    SteeringSessionKey,
 };
 // Re-export RuntimeHandle trait from tools crate for convenience
 pub use blockcell_tools::RuntimeHandle;

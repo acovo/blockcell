@@ -2728,6 +2728,49 @@ fn test_main_session_inbound(channel: &str, chat_id: &str) -> InboundMessage {
 }
 
 #[tokio::test]
+async fn message_task_supervisor_marks_panics_failed_and_emits_cleanup() {
+    let task_manager = TaskManager::new();
+    let task_id = "panic-message-task".to_string();
+    task_manager
+        .create_and_start_task(
+            &task_id,
+            "panic test",
+            "panic",
+            "ws",
+            "chat-a",
+            Some("default"),
+            false,
+            None,
+            false,
+        )
+        .await;
+    let conversation_key = ActiveConversationKey::from_channel_chat("default", "ws", "chat-a");
+    let (task_done_tx, mut task_done_rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async { panic!("intentional message-task panic") });
+
+    supervise_message_task(
+        handle,
+        task_manager.clone(),
+        task_id.clone(),
+        None,
+        task_done_tx,
+        conversation_key.clone(),
+    )
+    .await;
+
+    let task = task_manager
+        .get_task(&task_id)
+        .await
+        .expect("task remains visible");
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert!(task
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("panicked")));
+    assert_eq!(task_done_rx.try_recv(), Ok((task_id, conversation_key)));
+}
+
+#[tokio::test]
 async fn run_loop_cancels_active_message_when_inbound_closes() {
     let started = Arc::new(tokio::sync::Notify::new());
     let provider = Arc::new(HangingStreamProvider {

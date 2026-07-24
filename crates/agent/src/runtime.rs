@@ -40,6 +40,7 @@ use crate::ghost_recall::should_inject_ghost_recall;
 use crate::history_projector::{HistoryProjector, TimeBasedMCConfig};
 use crate::hooks::{HookContext, HookEvent, HookManager};
 use crate::intent::{IntentCategory, IntentToolResolver};
+use crate::learning_coordinator::LearningReviewReservationGuard;
 use crate::memory_event;
 use crate::memory_file_store::MemoryFileStore;
 use crate::response_cache::{cleanup_tool_results, sanitize_session_key, sanitize_tool_use_id};
@@ -48,7 +49,7 @@ use crate::skill_executor::{determine_manual_load_mode, SkillExecutionResult};
 use crate::skill_file_store::SkillFileStore;
 use crate::skill_kernel::SkillRunMode;
 use crate::steering::{
-    SteeringChannel, SteeringMessage, SteeringRegistry, SteeringSender, SteeringSessionKey,
+    ActiveConversationKey, SteeringChannel, SteeringMessage, SteeringRegistry, SteeringSender,
 };
 use crate::summary_queue::MainSessionSummaryQueue;
 use crate::system_event_orchestrator::{
@@ -108,22 +109,6 @@ pub(crate) enum PolicyOutcome {
     Proceed,
     ProceedConfirmed,
     Denied(String),
-}
-
-struct LearningReviewCompletionGuard {
-    coordinator: Arc<crate::learning_coordinator::LearningCoordinator>,
-}
-
-impl LearningReviewCompletionGuard {
-    fn new(coordinator: Arc<crate::learning_coordinator::LearningCoordinator>) -> Self {
-        Self { coordinator }
-    }
-}
-
-impl Drop for LearningReviewCompletionGuard {
-    fn drop(&mut self) {
-        self.coordinator.review_completed();
-    }
 }
 
 /// Memory Review 提示词

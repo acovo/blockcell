@@ -22,6 +22,7 @@ pub async fn list(item_type: Option<String>, limit: usize) -> anyhow::Result<()>
     let store = open_cli_memory_store(&paths)?;
 
     let params = QueryParams {
+        session_key: None,
         query: None,
         scope: None,
         item_type: item_type.clone(),
@@ -209,6 +210,7 @@ pub async fn search(
     let store = open_cli_memory_store(&paths)?;
 
     let params = QueryParams {
+        session_key: None,
         query: if query.is_empty() {
             None
         } else {

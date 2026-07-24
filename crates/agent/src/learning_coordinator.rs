@@ -9,7 +9,7 @@
 //! - Dedup prevents duplicate learning within a time window
 //! - Combined review when both memory and skill nudges fire
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::ghost_learning::{GhostLearningPolicy, LearningDecision};
 use crate::learning_dedup::LearningDedup;
@@ -72,6 +72,45 @@ pub struct LearningCoordinator {
     dedup: LearningDedup,
     ghost_learning_enabled: bool,
     self_improve_review_enabled: bool,
+}
+
+pub struct LearningReviewReservationGuard {
+    coordinator: Arc<LearningCoordinator>,
+    reserved: bool,
+}
+
+impl LearningReviewReservationGuard {
+    pub fn new(coordinator: Arc<LearningCoordinator>) -> Self {
+        Self {
+            coordinator,
+            reserved: true,
+        }
+    }
+
+    pub fn into_completion_guard(mut self) -> LearningReviewCompletionGuard {
+        self.reserved = false;
+        LearningReviewCompletionGuard {
+            coordinator: Arc::clone(&self.coordinator),
+        }
+    }
+}
+
+impl Drop for LearningReviewReservationGuard {
+    fn drop(&mut self) {
+        if self.reserved {
+            self.coordinator.cancel_review();
+        }
+    }
+}
+
+pub struct LearningReviewCompletionGuard {
+    coordinator: Arc<LearningCoordinator>,
+}
+
+impl Drop for LearningReviewCompletionGuard {
+    fn drop(&mut self) {
+        self.coordinator.review_completed();
+    }
 }
 
 impl std::fmt::Debug for LearningCoordinator {
@@ -406,6 +445,10 @@ impl LearningCoordinator {
         self.throttle.review_completed();
     }
 
+    pub fn cancel_review(&self) {
+        self.throttle.cancel_review();
+    }
+
     /// Get the ghost learning policy decision for a boundary
     pub fn ghost_decide(
         &self,
@@ -511,6 +554,33 @@ mod tests {
         }
         let trigger = coord.check_memory_nudge(true);
         assert!(trigger.is_some());
+    }
+
+    #[test]
+    fn pending_review_reservation_releases_slot_when_dropped_before_spawn() {
+        let coord = std::sync::Arc::new(LearningCoordinator::new(
+            SkillNudgeEngine::new(NudgeConfig {
+                min_nudge_interval_secs: 0,
+                ..Default::default()
+            }),
+            GhostLearningPolicy::default(),
+            LearningThrottle::new(1, 300),
+            LearningDedup::new(0),
+            true,
+            true,
+        ));
+        for _ in 0..3 {
+            coord.on_turn_start(true);
+        }
+        assert!(coord.check_memory_nudge(true).is_some());
+
+        let reservation = LearningReviewReservationGuard::new(std::sync::Arc::clone(&coord));
+        drop(reservation);
+
+        for _ in 0..3 {
+            coord.on_turn_start(true);
+        }
+        assert!(coord.check_memory_nudge(true).is_some());
     }
 
     #[test]

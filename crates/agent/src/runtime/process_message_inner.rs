@@ -639,6 +639,7 @@ impl AgentRuntime {
         // 延迟 Review 状态 (与 Hermes 一致: 在响应发送后触发后台 Review)
         let mut deferred_review_mode: Option<ReviewMode> = None;
         let mut deferred_review_snapshot: Vec<ChatMessage> = Vec::new();
+        let mut deferred_review_reservation: Option<LearningReviewReservationGuard> = None;
 
         // Memory Nudge: check before LLM loop (replaces skill_nudge_engine.check_memory_nudge)
         // Memory nudge is based on user turns, not tool iterations
@@ -650,6 +651,9 @@ impl AgentRuntime {
             {
                 deferred_review_mode = Some(ReviewMode::Memory);
                 deferred_review_snapshot = current_messages.clone();
+                deferred_review_reservation = Some(LearningReviewReservationGuard::new(
+                    Arc::clone(&self.learning_coordinator),
+                ));
             }
         }
 
@@ -1276,6 +1280,9 @@ impl AgentRuntime {
                     } else if deferred_review_mode.is_none() {
                         deferred_review_mode = Some(ReviewMode::Skill);
                         deferred_review_snapshot = current_messages.clone();
+                        deferred_review_reservation = Some(LearningReviewReservationGuard::new(
+                            Arc::clone(&self.learning_coordinator),
+                        ));
                     }
                 }
 
@@ -1555,7 +1562,9 @@ impl AgentRuntime {
                     // check_memory_nudge()/check_skill_nudge() — do NOT call
                     // review_started() here to avoid double increment.
                     let notify = Some((msg.channel.clone(), msg.chat_id.clone()));
-                    self.spawn_review(mode, deferred_review_snapshot, notify);
+                    if let Some(reservation) = deferred_review_reservation.take() {
+                        self.spawn_review(mode, deferred_review_snapshot, notify, reservation);
+                    }
                 }
             }
         }

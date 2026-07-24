@@ -1,5 +1,34 @@
 use super::*;
 
+pub(crate) async fn supervise_message_task(
+    handle: tokio::task::JoinHandle<()>,
+    task_manager: TaskManager,
+    task_id: String,
+    completion_receipt_id: Option<String>,
+    task_done_tx: mpsc::UnboundedSender<(String, ActiveConversationKey)>,
+    conversation_key: ActiveConversationKey,
+) {
+    match handle.await {
+        Ok(()) => {}
+        Err(error) if error.is_panic() => {
+            let message = format!("message task panicked: {error}");
+            error!(task_id = %task_id, error = %error, "Message task panicked");
+            task_manager.set_failed(&task_id, &message).await;
+            if let Some(receipt_id) = completion_receipt_id.as_deref() {
+                blockcell_core::message_receipt::complete_message_receipt(receipt_id, Err(message));
+            }
+        }
+        Err(error) => {
+            debug!(task_id = %task_id, error = %error, "Message task was cancelled");
+            if let Some(receipt_id) = completion_receipt_id.as_deref() {
+                blockcell_core::message_receipt::cancel_message_receipt(receipt_id);
+            }
+        }
+    }
+
+    let _ = task_done_tx.send((task_id, conversation_key));
+}
+
 /// Extract the first JSON object from potentially markdown-wrapped LLM output.
 /// Handles ```json...```, ```...```, `<tool_call>` XML with `<parameter=argv>`,
 /// bare `{...}` objects, and bare `[...]` arrays (wrapped as `{"argv":[...]}`).

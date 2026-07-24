@@ -339,6 +339,77 @@ fn test_upsert_and_query() {
 }
 
 #[test]
+fn query_is_scoped_to_session_and_includes_explicit_global_memory() {
+    let (store, _dir) = test_store();
+    for (content, session_key) in [
+        ("session A private", Some("ws:a")),
+        ("session B private", Some("ws:b")),
+        ("global shared", None),
+    ] {
+        store
+            .upsert(UpsertParams {
+                scope: "long_term".to_string(),
+                item_type: "fact".to_string(),
+                title: None,
+                content: content.to_string(),
+                summary: None,
+                tags: vec![],
+                source: "user".to_string(),
+                channel: Some("ws".to_string()),
+                session_key: session_key.map(str::to_string),
+                importance: 0.8,
+                dedup_key: None,
+                expires_at: None,
+            })
+            .unwrap();
+    }
+
+    let results = store
+        .query(&QueryParams {
+            session_key: Some("ws:a".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    let contents: Vec<&str> = results
+        .iter()
+        .map(|result| result.item.content.as_str())
+        .collect();
+
+    assert!(contents.contains(&"session A private"));
+    assert!(contents.contains(&"global shared"));
+    assert!(!contents.contains(&"session B private"));
+}
+
+#[test]
+fn equal_dedup_keys_in_different_sessions_create_distinct_rows() {
+    let (store, _dir) = test_store();
+    let insert = |session_key: &str, content: &str| {
+        store
+            .upsert(UpsertParams {
+                scope: "long_term".to_string(),
+                item_type: "preference".to_string(),
+                title: None,
+                content: content.to_string(),
+                summary: None,
+                tags: vec![],
+                source: "user".to_string(),
+                channel: Some("ws".to_string()),
+                session_key: Some(session_key.to_string()),
+                importance: 0.8,
+                dedup_key: Some("pref.language".to_string()),
+                expires_at: None,
+            })
+            .unwrap()
+    };
+
+    let first = insert("ws:a", "prefers Rust");
+    let second = insert("ws:b", "prefers Go");
+
+    assert_ne!(first.id, second.id);
+    assert_eq!(store.query(&QueryParams::default()).unwrap().len(), 2);
+}
+
+#[test]
 fn test_dedup_key_update() {
     let (store, _dir) = test_store();
 
@@ -1184,6 +1255,58 @@ fn test_query_falls_back_to_fts_when_vector_search_fails() {
         *embedder.query_inputs.lock().unwrap(),
         vec!["canonical memory".to_string()]
     );
+}
+
+#[test]
+fn fts_filters_deleted_candidates_before_applying_candidate_limit() {
+    let (store, _dir) = test_store();
+    for index in 0..25 {
+        let item = store
+            .upsert(UpsertParams {
+                scope: "long_term".to_string(),
+                item_type: "fact".to_string(),
+                title: Some(format!("obsolete {index}")),
+                content: "quasarneedle quasarneedle quasarneedle quasarneedle obsolete memory"
+                    .to_string(),
+                summary: None,
+                tags: vec![],
+                source: "user".to_string(),
+                channel: None,
+                session_key: None,
+                importance: 1.0,
+                dedup_key: None,
+                expires_at: None,
+            })
+            .unwrap();
+        assert!(store.soft_delete(&item.id).unwrap());
+    }
+    let active = store
+        .upsert(UpsertParams {
+            scope: "long_term".to_string(),
+            item_type: "fact".to_string(),
+            title: Some("active".to_string()),
+            content: "quasarneedle active memory".to_string(),
+            summary: None,
+            tags: vec![],
+            source: "user".to_string(),
+            channel: None,
+            session_key: None,
+            importance: 0.1,
+            dedup_key: None,
+            expires_at: None,
+        })
+        .unwrap();
+
+    let results = store
+        .query(&QueryParams {
+            query: Some("quasarneedle".to_string()),
+            top_k: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].item.id, active.id);
 }
 
 #[test]

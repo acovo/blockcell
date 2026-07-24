@@ -69,8 +69,10 @@ impl MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_memory_dedup ON memory_items(dedup_key);
             CREATE INDEX IF NOT EXISTS idx_memory_importance ON memory_items(importance);
 
+            DROP INDEX IF EXISTS idx_memory_active_dedup_unique;
+
             -- Preserve legacy duplicate rows but remove their conflicting key,
-            -- then enforce one active row for every non-empty dedup key.
+            -- then enforce one active row per session for every non-empty dedup key.
             UPDATE memory_items
             SET dedup_key = NULL
             WHERE dedup_key IS NOT NULL
@@ -82,10 +84,10 @@ impl MemoryStore {
                   WHERE dedup_key IS NOT NULL
                     AND dedup_key != ''
                     AND deleted_at IS NULL
-                  GROUP BY dedup_key
+                  GROUP BY dedup_key, COALESCE(session_key, '')
               );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_active_dedup_unique
-            ON memory_items(dedup_key)
+            CREATE UNIQUE INDEX idx_memory_active_dedup_unique
+            ON memory_items(dedup_key, COALESCE(session_key, ''))
             WHERE dedup_key IS NOT NULL AND dedup_key != '' AND deleted_at IS NULL;
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(

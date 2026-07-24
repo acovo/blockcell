@@ -22,8 +22,12 @@ impl MemoryStore {
                 if !dk.is_empty() {
                     let existing_id: Option<String> = tx
                         .query_row(
-                            "SELECT id FROM memory_items WHERE dedup_key = ?1 AND deleted_at IS NULL LIMIT 1",
-                            params![dk],
+                            "SELECT id FROM memory_items
+                             WHERE dedup_key = ?1
+                               AND COALESCE(session_key, '') = COALESCE(?2, '')
+                               AND deleted_at IS NULL
+                             LIMIT 1",
+                            params![dk, params.session_key],
                             |row| row.get(0),
                         )
                         .optional()

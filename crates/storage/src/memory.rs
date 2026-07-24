@@ -101,6 +101,7 @@ pub struct UpsertParams {
 /// Parameters for querying memory items.
 pub struct QueryParams {
     pub query: Option<String>,
+    pub session_key: Option<String>,
     pub scope: Option<String>,
     pub item_type: Option<String>,
     pub tags: Option<Vec<String>>,
@@ -113,6 +114,7 @@ impl Default for QueryParams {
     fn default() -> Self {
         Self {
             query: None,
+            session_key: None,
             scope: None,
             item_type: None,
             tags: None,

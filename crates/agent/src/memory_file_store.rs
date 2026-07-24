@@ -2,7 +2,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use blockcell_core::{Error, Paths, Result};
 use blockcell_tools::MemoryFileStoreOps;
@@ -11,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::learning_file_lock::OwnerAwareFileLock;
 use crate::unified_security_scanner::scan_learned_memory_content;
 use crate::write_guard::{WriteGuard, WriteGuardError, WriteGuardRAII, WriteTarget};
 
@@ -91,7 +91,7 @@ impl MemoryFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("memory file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let path = self.path_for(target);
         let mut entries = read_entries(path)?;
         if entries.iter().any(|entry| entry == &content) {
@@ -131,7 +131,7 @@ impl MemoryFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("memory file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let path = self.path_for(target);
         let mut entries = read_entries(path)?;
         let matches = entries
@@ -168,7 +168,7 @@ impl MemoryFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("memory file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let mut entries = read_entries(path)?;
         let matches = entries
             .iter()
@@ -198,7 +198,7 @@ impl MemoryFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("memory file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let Some(snapshot_path) = self.latest_snapshot_for(target)? else {
             return Err(Error::NotFound(format!(
                 "no snapshot found for {} memory",
@@ -392,50 +392,6 @@ fn atomic_write_text(path: &Path, content: &str) -> Result<()> {
     fs::rename(&tmp_path, path)?;
     sync_parent_dir(path)?;
     Ok(())
-}
-
-struct FileWriteGuard {
-    path: PathBuf,
-}
-
-impl FileWriteGuard {
-    fn lock(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match fs::create_dir(path) {
-                Ok(()) => {
-                    sync_parent_dir(path)?;
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                    });
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if Instant::now() >= deadline {
-                        return Err(Error::Other(format!(
-                            "timed out waiting for memory file lock: {}",
-                            path.display()
-                        )));
-                    }
-                    // Yield the CPU without blocking the tokio worker thread.
-                    // thread::sleep would block the worker; spin_loop + yield_now
-                    // lets the OS scheduler switch to another task.
-                    std::hint::spin_loop();
-                    std::thread::yield_now();
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-    }
-}
-
-impl Drop for FileWriteGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
-        let _ = sync_parent_dir(&self.path);
-    }
 }
 
 fn write_file_durable(path: &Path, content: &str) -> Result<()> {

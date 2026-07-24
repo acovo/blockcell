@@ -365,6 +365,32 @@ impl ContextBuilder {
         available_tool_names: &[String],
         tool_prompt_rules: &[String],
     ) -> String {
+        self.build_system_prompt_for_mode_with_channel_and_session(
+            mode,
+            active_skill,
+            disabled_skills,
+            disabled_tools,
+            _channel,
+            user_query,
+            available_tool_names,
+            tool_prompt_rules,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_system_prompt_for_mode_with_channel_and_session(
+        &self,
+        mode: InteractionMode,
+        active_skill: Option<&ActiveSkillContext>,
+        disabled_skills: &HashSet<String>,
+        disabled_tools: &HashSet<String>,
+        _channel: &str,
+        user_query: &str,
+        available_tool_names: &[String],
+        tool_prompt_rules: &[String],
+        session_key: Option<&str>,
+    ) -> String {
         let mut prompt = String::new();
         let is_chat = matches!(mode, InteractionMode::Chat);
         let is_skill_mode = matches!(mode, InteractionMode::Skill);
@@ -473,9 +499,17 @@ impl ContextBuilder {
         if is_skill_mode || is_general {
             if let Some(ref store) = self.memory_store {
                 let brief_result = if !user_query.is_empty() {
-                    store.generate_brief_for_query(user_query, 8)
+                    match session_key {
+                        Some(session_key) => {
+                            store.generate_brief_for_query_in_session(session_key, user_query, 8)
+                        }
+                        None => store.generate_brief_for_query(user_query, 8),
+                    }
                 } else {
-                    store.generate_brief(5, 3)
+                    match session_key {
+                        Some(session_key) => store.generate_brief_in_session(session_key, 5, 3),
+                        None => store.generate_brief(5, 3),
+                    }
                 };
                 match brief_result {
                     Ok(brief) if !brief.is_empty() => {
@@ -617,9 +651,10 @@ impl ContextBuilder {
         available_tool_names: &[String],
         tool_prompt_rules: &[String],
         memory_snapshot: Option<&FrozenFileMemorySnapshot>,
+        session_key: Option<&str>,
     ) -> String {
         if memory_snapshot.is_none() {
-            return self.build_system_prompt_for_mode_with_channel(
+            return self.build_system_prompt_for_mode_with_channel_and_session(
                 mode,
                 active_skill,
                 disabled_skills,
@@ -628,11 +663,12 @@ impl ContextBuilder {
                 user_query,
                 available_tool_names,
                 tool_prompt_rules,
+                session_key,
             );
         }
 
         let snapshot = memory_snapshot.expect("checked above");
-        let mut prompt = self.build_system_prompt_for_mode_with_channel(
+        let mut prompt = self.build_system_prompt_for_mode_with_channel_and_session(
             mode,
             active_skill,
             disabled_skills,
@@ -641,6 +677,7 @@ impl ContextBuilder {
             user_query,
             available_tool_names,
             tool_prompt_rules,
+            session_key,
         );
 
         prompt = replace_prompt_section(prompt, "## User Preferences\n", snapshot.user.as_deref());
@@ -717,6 +754,7 @@ impl ContextBuilder {
             available_tool_names,
             tool_prompt_rules,
             Some(&memory_snapshot),
+            Some(session_key),
         );
         messages.push(ChatMessage::system(&system_prompt));
         self.append_history_and_user_message(
@@ -981,6 +1019,87 @@ mod tests {
         fn maintenance(&self, _recycle_days: i64) -> Result<(usize, usize)> {
             Ok((0, 0))
         }
+    }
+
+    struct SessionCapturingMemoryStore {
+        seen_session: std::sync::Mutex<Option<String>>,
+    }
+
+    impl blockcell_tools::MemoryStoreOps for SessionCapturingMemoryStore {
+        fn upsert_json(&self, _params_json: Value) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn query_json(&self, _params_json: Value) -> Result<Value> {
+            Ok(json!([]))
+        }
+        fn soft_delete(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn batch_soft_delete_json(&self, _params_json: Value) -> Result<usize> {
+            Ok(0)
+        }
+        fn restore(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn stats_json(&self) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn generate_brief(&self, _long_term_max: usize, _short_term_max: usize) -> Result<String> {
+            Ok(String::new())
+        }
+        fn generate_brief_for_query(&self, _query: &str, _max_items: usize) -> Result<String> {
+            Ok(String::new())
+        }
+        fn generate_brief_for_query_in_session(
+            &self,
+            session_key: &str,
+            _query: &str,
+            _max_items: usize,
+        ) -> Result<String> {
+            *self.seen_session.lock().unwrap() = Some(session_key.to_string());
+            Ok(String::new())
+        }
+        fn upsert_session_summary(&self, _session_key: &str, _summary: &str) -> Result<()> {
+            Ok(())
+        }
+        fn get_session_summary(&self, _session_key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn maintenance(&self, _recycle_days: i64) -> Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+    }
+
+    #[test]
+    fn memory_brief_receives_current_session_key() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-context-session-memory-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        let store = Arc::new(SessionCapturingMemoryStore {
+            seen_session: std::sync::Mutex::new(None),
+        });
+        let mut builder = ContextBuilder::new(paths, Config::default());
+        builder.set_memory_store(store.clone());
+
+        builder.build_system_prompt_for_mode_with_channel_and_session(
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "ws",
+            "remember language",
+            &[],
+            &[],
+            Some("ws:account:3:opschat-a"),
+        );
+
+        assert_eq!(
+            store.seen_session.lock().unwrap().as_deref(),
+            Some("ws:account:3:opschat-a")
+        );
     }
     use std::fs;
 

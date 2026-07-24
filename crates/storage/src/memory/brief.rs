@@ -46,6 +46,24 @@ impl MemoryStore {
     /// Generate a brief summary for prompt injection.
     /// Returns up to `long_term_max` long-term summaries and `short_term_max` short-term summaries.
     pub fn generate_brief(&self, long_term_max: usize, short_term_max: usize) -> Result<String> {
+        self.generate_brief_with_session(None, long_term_max, short_term_max)
+    }
+
+    pub fn generate_brief_in_session(
+        &self,
+        session_key: &str,
+        long_term_max: usize,
+        short_term_max: usize,
+    ) -> Result<String> {
+        self.generate_brief_with_session(Some(session_key), long_term_max, short_term_max)
+    }
+
+    fn generate_brief_with_session(
+        &self,
+        session_key: Option<&str>,
+        long_term_max: usize,
+        short_term_max: usize,
+    ) -> Result<String> {
         let conn = self
             .inner
             .lock()
@@ -59,8 +77,9 @@ impl MemoryStore {
                 "SELECT id, title, summary, content, type, importance FROM memory_items
              WHERE scope = 'long_term' AND deleted_at IS NULL
                AND (expires_at IS NULL OR expires_at > ?1)
+               AND (?2 IS NULL OR session_key = ?2 OR session_key IS NULL)
              ORDER BY importance DESC, access_count DESC, updated_at DESC
-             LIMIT ?2",
+             LIMIT ?3",
             )
             .map_err(|e| blockcell_core::Error::Storage(format!("Brief query error: {}", e)))?;
 
@@ -68,7 +87,7 @@ impl MemoryStore {
         let now_s = now.as_str();
         let lt_max = long_term_max as i64;
         let lt_rows = stmt
-            .query_map(params![now_s, lt_max], |row| {
+            .query_map(params![now_s, session_key, lt_max], |row| {
                 let title: Option<String> = row.get("title")?;
                 let summary: Option<String> = row.get("summary")?;
                 let content: String = row.get("content")?;
@@ -115,14 +134,15 @@ impl MemoryStore {
                 "SELECT id, title, summary, content, type, importance FROM memory_items
              WHERE scope = 'short_term' AND deleted_at IS NULL
                AND (expires_at IS NULL OR expires_at > ?1)
+               AND (?2 IS NULL OR session_key = ?2 OR session_key IS NULL)
              ORDER BY updated_at DESC, importance DESC
-             LIMIT ?2",
+             LIMIT ?3",
             )
             .map_err(|e| blockcell_core::Error::Storage(format!("Brief query error: {}", e)))?;
 
         let st_max = short_term_max as i64;
         let st_rows = stmt
-            .query_map(params![now_s, st_max], |row| {
+            .query_map(params![now_s, session_key, st_max], |row| {
                 let title: Option<String> = row.get("title")?;
                 let summary: Option<String> = row.get("summary")?;
                 let content: String = row.get("content")?;
@@ -169,21 +189,46 @@ impl MemoryStore {
     /// Uses FTS5 to find memories related to the current user input.
     /// Falls back to generate_brief() when query is empty.
     pub fn generate_brief_for_query(&self, query: &str, max_items: usize) -> Result<String> {
+        self.generate_brief_for_query_with_session(None, query, max_items)
+    }
+
+    pub fn generate_brief_for_query_in_session(
+        &self,
+        session_key: &str,
+        query: &str,
+        max_items: usize,
+    ) -> Result<String> {
+        self.generate_brief_for_query_with_session(Some(session_key), query, max_items)
+    }
+
+    fn generate_brief_for_query_with_session(
+        &self,
+        session_key: Option<&str>,
+        query: &str,
+        max_items: usize,
+    ) -> Result<String> {
         let query = query.trim();
         if query.is_empty() || max_items == 0 {
             // Fallback: return a small general brief
-            return self.generate_brief(5, 3);
+            return match session_key {
+                Some(session_key) => self.generate_brief_in_session(session_key, 5, 3),
+                None => self.generate_brief(5, 3),
+            };
         }
 
         let items = HybridMemoryRetriever::new(self).search(&QueryParams {
             query: Some(query.to_string()),
+            session_key: session_key.map(str::to_string),
             top_k: max_items,
             ..Default::default()
         })?;
 
         if items.is_empty() {
             // No relevant matches — return a minimal general brief.
-            return self.generate_brief(3, 2);
+            return match session_key {
+                Some(session_key) => self.generate_brief_in_session(session_key, 3, 2),
+                None => self.generate_brief(3, 2),
+            };
         }
 
         let mut brief = String::new();

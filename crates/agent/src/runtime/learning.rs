@@ -5,10 +5,9 @@
 
 use super::{
     active_skill_name_from_metadata, chat_message_text, disable_skill_toggle,
-    persist_ghost_learning_boundary_with_decision, truncate_str, LearningReviewCompletionGuard,
-    MainSessionTarget, ReviewMode, COMBINED_REVIEW_PROMPT, LEARNED_SKILL_DISABLE_THRESHOLD,
-    MEMORY_REVIEW_PROMPT, SESSION_ACTIVE_SKILL_CORRECTIONS_KEY, SESSION_ACTIVE_SKILL_NAME_KEY,
-    SKILL_REVIEW_PROMPT,
+    persist_ghost_learning_boundary_with_decision, truncate_str, MainSessionTarget, ReviewMode,
+    COMBINED_REVIEW_PROMPT, LEARNED_SKILL_DISABLE_THRESHOLD, MEMORY_REVIEW_PROMPT,
+    SESSION_ACTIVE_SKILL_CORRECTIONS_KEY, SESSION_ACTIVE_SKILL_NAME_KEY, SKILL_REVIEW_PROMPT,
 };
 use crate::ghost_background_review::spawn_pending_background_reviews;
 use crate::ghost_learning::{
@@ -31,6 +30,7 @@ impl super::AgentRuntime {
         mode: ReviewMode,
         messages: Vec<ChatMessage>,
         notify_channel: Option<(String, String)>,
+        reservation: crate::learning_coordinator::LearningReviewReservationGuard,
     ) {
         let label = match mode {
             ReviewMode::Skill => "skill_nudge_review",
@@ -57,15 +57,13 @@ impl super::AgentRuntime {
         let outbound_tx = self.outbound_tx.clone();
         // 共享 skill_index_summary Arc, 供后台 Review 完成后刷新
         let skill_index_cache = self.context_builder.skill_index_summary_arc();
-        let learning_coordinator = Arc::clone(&self.learning_coordinator);
         // 继承主 agent 的 abort token，确保用户取消任务时后台 review 也被取消
         let review_abort_token = self.abort_token.child();
 
         tokio::spawn(async move {
+            let _review_completion_guard = reservation.into_completion_guard();
             // 用 scope_abort_token 包裹整个 review 逻辑，取消时立即退出
             scope_abort_token(review_abort_token, async {
-                let _review_completion_guard = LearningReviewCompletionGuard::new(learning_coordinator);
-
             // 构建 Skill 索引（仅在 Skill/Combined 模式下需要）
             let skill_summary = match mode_clone {
                 ReviewMode::Memory => String::new(),

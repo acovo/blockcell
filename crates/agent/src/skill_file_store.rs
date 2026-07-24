@@ -2,7 +2,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use blockcell_core::{Error, Paths, Result};
 use blockcell_tools::SkillFileStoreOps;
@@ -11,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::learning_file_lock::OwnerAwareFileLock;
 use crate::unified_security_scanner::scan_learned_skill_content;
 use crate::write_guard::{WriteGuard, WriteGuardError, WriteGuardRAII, WriteTarget};
 
@@ -168,7 +168,7 @@ impl SkillFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let skill_dir = target.dir.clone();
         if skill_dir.exists() {
             return Err(Error::Validation(format!(
@@ -209,7 +209,7 @@ impl SkillFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let skill_md = target.dir.join("SKILL.md");
         let current = fs::read_to_string(&skill_md)
             .map_err(|err| Error::NotFound(format!("skill not found: {} ({})", skill_name, err)))?;
@@ -238,7 +238,7 @@ impl SkillFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let skill_md = target.dir.join("SKILL.md");
         if !skill_md.exists() {
             return Err(Error::NotFound(format!("skill not found: {}", skill_name)));
@@ -264,7 +264,7 @@ impl SkillFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let skill_dir = target.dir.clone();
         if !skill_dir.exists() {
             return Err(Error::NotFound(format!("skill not found: {}", skill_name)));
@@ -301,7 +301,7 @@ impl SkillFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let skill_dir = target.dir.clone();
         if !skill_dir.exists() {
             return Err(Error::NotFound(format!("skill not found: {}", skill_name)));
@@ -332,7 +332,7 @@ impl SkillFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let Some(snapshot_path) = self.latest_snapshot_for(&skill_name)? else {
             return Err(Error::NotFound(format!(
                 "no snapshot found for skill: {}",
@@ -380,7 +380,7 @@ impl SkillFileStore {
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
-        let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
+        let _file_guard = OwnerAwareFileLock::acquire(&self.lock_path)?;
         let path = target.dir.join(relative_path);
         if !path.exists() || !path.is_file() {
             return Err(Error::NotFound(format!(
@@ -827,48 +827,6 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     fs::rename(tmp, path)?;
     sync_parent_dir(path)?;
     Ok(())
-}
-
-struct FileWriteGuard {
-    path: PathBuf,
-}
-
-impl FileWriteGuard {
-    fn lock(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match fs::create_dir(path) {
-                Ok(()) => {
-                    sync_parent_dir(path)?;
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                    });
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if Instant::now() >= deadline {
-                        return Err(Error::Other(format!(
-                            "timed out waiting for skill file lock: {}",
-                            path.display()
-                        )));
-                    }
-                    // Yield the CPU without blocking the tokio worker thread.
-                    std::hint::spin_loop();
-                    std::thread::yield_now();
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-    }
-}
-
-impl Drop for FileWriteGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
-        let _ = sync_parent_dir(&self.path);
-    }
 }
 
 fn write_file_durable(path: &Path, content: &str) -> Result<()> {

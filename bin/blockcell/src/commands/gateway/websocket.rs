@@ -171,10 +171,7 @@ fn route_chat_to_active_steering(
     content: String,
     channel: &str,
 ) -> bool {
-    let key = blockcell_agent::SteeringSessionKey {
-        agent_id: agent_id.to_string(),
-        chat_id: chat_id.to_string(),
-    };
+    let key = blockcell_agent::ActiveConversationKey::from_channel_chat(agent_id, channel, chat_id);
     let Some(sender) = active_steering.get(&key) else {
         return false;
     };
@@ -945,10 +942,7 @@ mod tests {
     fn active_ws_chat_routes_to_steering_channel() {
         let (mut channel, sender) = blockcell_agent::SteeringChannel::new(4);
         let active_steering = std::collections::HashMap::from([(
-            blockcell_agent::SteeringSessionKey {
-                agent_id: "ops".to_string(),
-                chat_id: "chat-a".to_string(),
-            },
+            blockcell_agent::ActiveConversationKey::from_channel_chat("ops", "ws", "chat-a"),
             sender,
         )]);
 

@@ -31,19 +31,22 @@ impl AgentRuntime {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let session_metadata = self.session_store.load_metadata(session_key)?;
-        let messages = self.context_builder.build_messages_for_mode_with_channel(
-            history,
-            &msg.content,
-            &msg.media,
-            InteractionMode::Skill,
-            Some(active_skill),
-            &disabled_skills,
-            &disabled_tools,
-            &msg.channel,
-            pending_intent,
-            tool_names,
-            &tool_prompt_rules,
-        );
+        let messages = self
+            .context_builder
+            .build_messages_for_session_mode_with_channel(
+                session_key,
+                history,
+                &msg.content,
+                &msg.media,
+                InteractionMode::Skill,
+                Some(active_skill),
+                &disabled_skills,
+                &disabled_tools,
+                &msg.channel,
+                pending_intent,
+                tool_names,
+                &tool_prompt_rules,
+            );
 
         let mut tools = if tool_names.is_empty() {
             Vec::new()

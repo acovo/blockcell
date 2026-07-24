@@ -69,6 +69,7 @@ impl MemoryStoreOps for MemoryStoreAdapter {
 
         let params = QueryParams {
             query: Self::get_string(&params_json, "query"),
+            session_key: Self::get_string(&params_json, "session_key"),
             scope: Self::get_string(&params_json, "scope"),
             item_type: Self::get_string(&params_json, "type"),
             tags,
@@ -125,8 +126,28 @@ impl MemoryStoreOps for MemoryStoreAdapter {
         self.store.generate_brief(long_term_max, short_term_max)
     }
 
+    fn generate_brief_in_session(
+        &self,
+        session_key: &str,
+        long_term_max: usize,
+        short_term_max: usize,
+    ) -> Result<String> {
+        self.store
+            .generate_brief_in_session(session_key, long_term_max, short_term_max)
+    }
+
     fn generate_brief_for_query(&self, query: &str, max_items: usize) -> Result<String> {
         self.store.generate_brief_for_query(query, max_items)
+    }
+
+    fn generate_brief_for_query_in_session(
+        &self,
+        session_key: &str,
+        query: &str,
+        max_items: usize,
+    ) -> Result<String> {
+        self.store
+            .generate_brief_for_query_in_session(session_key, query, max_items)
     }
 
     fn upsert_session_summary(&self, session_key: &str, summary: &str) -> Result<()> {

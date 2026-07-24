@@ -34,7 +34,9 @@ impl<'a> HybridMemoryRetriever<'a> {
         let fts_window = candidate_window(params.top_k);
         let vector_window = candidate_window(params.top_k);
 
-        let fts_hits = self.store.search_fts_candidates(&fts_query, fts_window)?;
+        let fts_hits = self
+            .store
+            .search_fts_candidates(&fts_query, params, fts_window)?;
         let vector_hits = self.search_vector_candidates(query, vector_window);
 
         let mut ranks: HashMap<String, (Option<usize>, Option<usize>)> = HashMap::new();

@@ -289,8 +289,24 @@ pub trait MemoryStoreOps: Send + Sync {
     fn stats_json(&self) -> Result<Value>;
     /// Generate brief for prompt injection.
     fn generate_brief(&self, long_term_max: usize, short_term_max: usize) -> Result<String>;
+    fn generate_brief_in_session(
+        &self,
+        _session_key: &str,
+        long_term_max: usize,
+        short_term_max: usize,
+    ) -> Result<String> {
+        self.generate_brief(long_term_max, short_term_max)
+    }
     /// Generate brief filtered by relevance to a query (FTS5 search).
     fn generate_brief_for_query(&self, query: &str, max_items: usize) -> Result<String>;
+    fn generate_brief_for_query_in_session(
+        &self,
+        _session_key: &str,
+        query: &str,
+        max_items: usize,
+    ) -> Result<String> {
+        self.generate_brief_for_query(query, max_items)
+    }
     /// Upsert a session summary (L2 incremental summary).
     fn upsert_session_summary(&self, session_key: &str, summary: &str) -> Result<()>;
     /// Get session summary for a given session key.

@@ -304,6 +304,7 @@ impl Tool for MemoryQueryTool {
 
         let query_params = json!({
             "query": params.get("query").and_then(|v| v.as_str()),
+            "session_key": ctx.session_key,
             "scope": params.get("scope").and_then(|v| v.as_str()),
             "type": params.get("type").and_then(|v| v.as_str()),
             "tags": params.get("tags").and_then(|v| v.as_str()),

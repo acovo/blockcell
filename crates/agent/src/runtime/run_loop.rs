@@ -16,11 +16,13 @@ impl AgentRuntime {
         info!(tick_secs = tick_secs, "Tick interval configured");
         let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
         tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut active_chat_tasks: HashMap<String, String> = HashMap::new();
-        let mut active_steering_senders: HashMap<String, SteeringSender> = HashMap::new();
-        let mut active_message_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut active_chat_tasks: HashMap<ActiveConversationKey, String> = HashMap::new();
+        let mut active_steering_senders: HashMap<ActiveConversationKey, SteeringSender> =
+            HashMap::new();
+        let mut active_message_tasks: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
         let mut active_abort_tokens: HashMap<String, AbortToken> = HashMap::new();
-        let (task_done_tx, mut task_done_rx) = mpsc::unbounded_channel::<(String, String)>();
+        let (task_done_tx, mut task_done_rx) =
+            mpsc::unbounded_channel::<(String, ActiveConversationKey)>();
         let active_steering_registry = self.active_steering_registry.clone();
         let runtime_agent_id = self
             .agent_id
@@ -29,11 +31,10 @@ impl AgentRuntime {
 
         async fn abort_active_message_tasks(
             task_manager: &TaskManager,
-            runtime_agent_id: &str,
             active_steering_registry: Option<&SteeringRegistry>,
-            active_chat_tasks: &mut HashMap<String, String>,
-            active_steering_senders: &mut HashMap<String, SteeringSender>,
-            active_message_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+            active_chat_tasks: &mut HashMap<ActiveConversationKey, String>,
+            active_steering_senders: &mut HashMap<ActiveConversationKey, SteeringSender>,
+            active_message_tasks: &mut HashMap<String, tokio::task::AbortHandle>,
             active_abort_tokens: &mut HashMap<String, AbortToken>,
         ) {
             let active_task_ids: Vec<String> = active_message_tasks.keys().cloned().collect();
@@ -49,11 +50,8 @@ impl AgentRuntime {
             }
             if let Some(registry) = active_steering_registry {
                 let mut registry = registry.lock().await;
-                for chat_id in active_chat_tasks.keys() {
-                    registry.remove(&SteeringSessionKey {
-                        agent_id: runtime_agent_id.to_string(),
-                        chat_id: chat_id.clone(),
-                    });
+                for conversation_key in active_chat_tasks.keys() {
+                    registry.remove(conversation_key);
                 }
             }
             active_chat_tasks.clear();
@@ -74,7 +72,6 @@ impl AgentRuntime {
                     }
                     abort_active_message_tasks(
                         &self.task_manager,
-                        &runtime_agent_id,
                         active_steering_registry.as_ref(),
                         &mut active_chat_tasks,
                         &mut active_steering_senders,
@@ -84,17 +81,14 @@ impl AgentRuntime {
                     break;
                 }
                 done = task_done_rx.recv() => {
-                    if let Some((task_id, chat_id)) = done {
+                    if let Some((task_id, conversation_key)) = done {
                         active_message_tasks.remove(&task_id);
                         active_abort_tokens.remove(&task_id);
-                        if active_chat_tasks.get(&chat_id).is_some_and(|id| id == &task_id) {
-                            active_chat_tasks.remove(&chat_id);
-                            active_steering_senders.remove(&chat_id);
+                        if active_chat_tasks.get(&conversation_key).is_some_and(|id| id == &task_id) {
+                            active_chat_tasks.remove(&conversation_key);
+                            active_steering_senders.remove(&conversation_key);
                             if let Some(registry) = active_steering_registry.as_ref() {
-                                registry.lock().await.remove(&SteeringSessionKey {
-                                    agent_id: runtime_agent_id.clone(),
-                                    chat_id,
-                                });
+                                registry.lock().await.remove(&conversation_key);
                             }
                         }
                     }
@@ -104,14 +98,15 @@ impl AgentRuntime {
                         Some(mut msg) => {
                             if msg.metadata.get("cancel").and_then(|v| v.as_bool()).unwrap_or(false) {
                                 let chat_id = msg.chat_id.clone();
+                                let conversation_key = ActiveConversationKey::from_message(
+                                    &runtime_agent_id,
+                                    &msg,
+                                );
                                 let mut cancelled = false;
-                                if let Some(task_id) = active_chat_tasks.remove(&chat_id) {
-                                    active_steering_senders.remove(&chat_id);
+                                if let Some(task_id) = active_chat_tasks.remove(&conversation_key) {
+                                    active_steering_senders.remove(&conversation_key);
                                     if let Some(registry) = active_steering_registry.as_ref() {
-                                        registry.lock().await.remove(&SteeringSessionKey {
-                                            agent_id: runtime_agent_id.clone(),
-                                            chat_id: chat_id.clone(),
-                                        });
+                                        registry.lock().await.remove(&conversation_key);
                                     }
                                     // Graceful cancellation via AbortToken
                                     if let Some(token) = active_abort_tokens.remove(&task_id) {
@@ -171,20 +166,17 @@ impl AgentRuntime {
                                     }
 
                                     // 3. 从 active_chat_tasks 中移除
-                                    let chat_id_to_remove: Option<String> = {
+                                    let conversation_key_to_remove: Option<ActiveConversationKey> = {
                                         active_chat_tasks
                                             .iter()
                                             .find(|(_, tid)| *tid == task_id)
-                                            .map(|(cid, _)| cid.clone())
+                                            .map(|(key, _)| key.clone())
                                     };
-                                    if let Some(cid) = chat_id_to_remove {
-                                        active_chat_tasks.remove(&cid);
-                                        active_steering_senders.remove(&cid);
+                                    if let Some(conversation_key) = conversation_key_to_remove {
+                                        active_chat_tasks.remove(&conversation_key);
+                                        active_steering_senders.remove(&conversation_key);
                                         if let Some(registry) = active_steering_registry.as_ref() {
-                                            registry.lock().await.remove(&SteeringSessionKey {
-                                                agent_id: runtime_agent_id.clone(),
-                                                chat_id: cid,
-                                            });
+                                            registry.lock().await.remove(&conversation_key);
                                         }
                                     }
 
@@ -286,7 +278,11 @@ impl AgentRuntime {
                                     Some("slash_command") | Some("resume_auto_continue")
                                 );
                             if may_route_to_steering {
-                                if let Some(sender) = active_steering_senders.get(&msg.chat_id).cloned() {
+                                let conversation_key = ActiveConversationKey::from_message(
+                                    &runtime_agent_id,
+                                    &msg,
+                                );
+                                if let Some(sender) = active_steering_senders.get(&conversation_key).cloned() {
                                     let steering_message = SteeringMessage {
                                         content: msg.content.clone(),
                                         channel: msg.channel.clone(),
@@ -317,12 +313,9 @@ impl AgentRuntime {
                                                         error = %err,
                                                         "Active steering channel closed while sending; falling back to new message task"
                                                     );
-                                                    active_steering_senders.remove(&msg.chat_id);
+                                                    active_steering_senders.remove(&conversation_key);
                                                     if let Some(registry) = active_steering_registry.as_ref() {
-                                                        registry.lock().await.remove(&SteeringSessionKey {
-                                                            agent_id: runtime_agent_id.clone(),
-                                                            chat_id: msg.chat_id.clone(),
-                                                        });
+                                                        registry.lock().await.remove(&conversation_key);
                                                     }
                                                 }
                                             }
@@ -332,12 +325,9 @@ impl AgentRuntime {
                                                 chat_id = %msg.chat_id,
                                                 "Active steering channel closed; falling back to new message task"
                                             );
-                                            active_steering_senders.remove(&msg.chat_id);
+                                            active_steering_senders.remove(&conversation_key);
                                             if let Some(registry) = active_steering_registry.as_ref() {
-                                                registry.lock().await.remove(&SteeringSessionKey {
-                                                    agent_id: runtime_agent_id.clone(),
-                                                    chat_id: msg.chat_id.clone(),
-                                                });
+                                                registry.lock().await.remove(&conversation_key);
                                             }
                                         }
                                     }
@@ -369,10 +359,16 @@ impl AgentRuntime {
                             let tool_registry = self.tool_registry.clone();
                             let task_id_clone = task_id.clone();
                             let provider_pool = Arc::clone(&self.provider_pool);
-                            let chat_id_for_task = msg.chat_id.clone();
+                            let conversation_key =
+                                ActiveConversationKey::from_message(&runtime_agent_id, &msg);
                             let task_done_tx = task_done_tx.clone();
                             let done_task_id = task_id.clone();
-                            let done_chat_id = chat_id_for_task.clone();
+                            let done_conversation_key = conversation_key.clone();
+                            let completion_receipt_id = msg
+                                .metadata
+                                .get(blockcell_core::message_receipt::MESSAGE_RECEIPT_ID)
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string);
 
                             // 原子性地注册任务并标记为 Running（消除竞态窗口）
                             task_manager.create_and_start_task(
@@ -397,13 +393,10 @@ impl AgentRuntime {
                                 );
                             }
 
-                            if let Some(prev_task_id) = active_chat_tasks.remove(&chat_id_for_task) {
-                                active_steering_senders.remove(&chat_id_for_task);
+                            if let Some(prev_task_id) = active_chat_tasks.remove(&conversation_key) {
+                                active_steering_senders.remove(&conversation_key);
                                 if let Some(registry) = active_steering_registry.as_ref() {
-                                    registry.lock().await.remove(&SteeringSessionKey {
-                                        agent_id: runtime_agent_id.clone(),
-                                        chat_id: chat_id_for_task.clone(),
-                                    });
+                                    registry.lock().await.remove(&conversation_key);
                                 }
                                 // 清理前一个任务的 AbortToken（防止内存泄漏）
                                 if let Some(prev_token) = active_abort_tokens.remove(&prev_task_id) {
@@ -413,7 +406,7 @@ impl AgentRuntime {
                                     prev_handle.abort();
                                     self.task_manager.remove_task(&prev_task_id).await;
                                     info!(
-                                        chat_id = %chat_id_for_task,
+                                        session_key = %conversation_key.session_key,
                                         task_id = %prev_task_id,
                                         "Cancelled previous running chat task"
                                     );
@@ -421,15 +414,12 @@ impl AgentRuntime {
                             }
 
                             let (steering, steering_sender) = SteeringChannel::new(16);
-                            active_chat_tasks.insert(chat_id_for_task.clone(), task_id.clone());
+                            active_chat_tasks.insert(conversation_key.clone(), task_id.clone());
                             active_steering_senders
-                                .insert(chat_id_for_task.clone(), steering_sender.clone());
+                                .insert(conversation_key.clone(), steering_sender.clone());
                             if let Some(registry) = active_steering_registry.as_ref() {
                                 registry.lock().await.insert(
-                                    SteeringSessionKey {
-                                        agent_id: runtime_agent_id.clone(),
-                                        chat_id: chat_id_for_task.clone(),
-                                    },
+                                    conversation_key.clone(),
                                     steering_sender.clone(),
                                 );
                             }
@@ -457,9 +447,17 @@ impl AgentRuntime {
                                     task_id_clone,
                                     msg_abort_token,
                                 ).await;
-                                let _ = task_done_tx.send((done_task_id, done_chat_id));
                             });
-                            active_message_tasks.insert(task_id, handle);
+                            let abort_handle = handle.abort_handle();
+                            active_message_tasks.insert(task_id, abort_handle);
+                            tokio::spawn(supervise_message_task(
+                                handle,
+                                self.task_manager.clone(),
+                                done_task_id,
+                                completion_receipt_id,
+                                task_done_tx,
+                                done_conversation_key,
+                            ));
                         }
                         None => {
                             if let Err(e) = self.capture_main_session_end_learning_boundary().await {
@@ -467,7 +465,6 @@ impl AgentRuntime {
                             }
                             abort_active_message_tasks(
                                 &self.task_manager,
-                                &runtime_agent_id,
                                 active_steering_registry.as_ref(),
                                 &mut active_chat_tasks,
                                 &mut active_steering_senders,
@@ -617,7 +614,6 @@ impl AgentRuntime {
         }
         abort_active_message_tasks(
             &self.task_manager,
-            &runtime_agent_id,
             active_steering_registry.as_ref(),
             &mut active_chat_tasks,
             &mut active_steering_senders,

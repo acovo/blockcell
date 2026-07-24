@@ -1,13 +1,32 @@
+use blockcell_core::{build_session_key, InboundMessage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
-pub struct SteeringSessionKey {
+pub struct ActiveConversationKey {
     pub agent_id: String,
-    pub chat_id: String,
+    pub session_key: String,
 }
+
+impl ActiveConversationKey {
+    pub fn from_message(agent_id: &str, msg: &InboundMessage) -> Self {
+        Self {
+            agent_id: agent_id.to_string(),
+            session_key: msg.session_key(),
+        }
+    }
+
+    pub fn from_channel_chat(agent_id: &str, channel: &str, chat_id: &str) -> Self {
+        Self {
+            agent_id: agent_id.to_string(),
+            session_key: build_session_key(channel, chat_id),
+        }
+    }
+}
+
+pub type SteeringSessionKey = ActiveConversationKey;
 
 pub type SteeringRegistry = Arc<Mutex<HashMap<SteeringSessionKey, SteeringSender>>>;
 
@@ -69,6 +88,42 @@ impl SteeringSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blockcell_core::InboundMessage;
+
+    fn inbound(channel: &str, account_id: Option<&str>, chat_id: &str) -> InboundMessage {
+        InboundMessage {
+            channel: channel.to_string(),
+            account_id: account_id.map(str::to_string),
+            sender_id: "user".to_string(),
+            chat_id: chat_id.to_string(),
+            content: "hello".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: 1,
+        }
+    }
+
+    #[test]
+    fn active_conversation_key_separates_channels_with_same_chat_id() {
+        let ws = inbound("ws", None, "shared-chat");
+        let telegram = inbound("telegram", None, "shared-chat");
+
+        assert_ne!(
+            ActiveConversationKey::from_message("default", &ws),
+            ActiveConversationKey::from_message("default", &telegram)
+        );
+    }
+
+    #[test]
+    fn active_conversation_key_separates_accounts_with_same_channel_and_chat_id() {
+        let primary = inbound("telegram", Some("primary"), "shared-chat");
+        let secondary = inbound("telegram", Some("secondary"), "shared-chat");
+
+        assert_ne!(
+            ActiveConversationKey::from_message("default", &primary),
+            ActiveConversationKey::from_message("default", &secondary)
+        );
+    }
 
     fn message(content: &str) -> SteeringMessage {
         SteeringMessage {
