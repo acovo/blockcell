@@ -73,13 +73,12 @@ if is_error(result) {
     let error_msg = get_field(result, "error");
     log_warn("📷 [拍照] 拍照失败: " + error_msg);
     
-    // 降级策略: 如果摄像头拍照失败，尝试截屏
+    // 降级策略: 如果摄像头拍照失败，尝试全屏截图
     log("📷 [拍照] 尝试降级为截屏...");
-    let fallback_params = #{
-        action: "capture",
-        device_index: 0
-    };
-    let fallback = call_tool("camera_capture", fallback_params);
+    let fallback_path = "media/camera_fallback_" + timestamp() + ".png";
+    let fallback = call_tool("exec", #{
+        command: "mkdir -p media && screencapture -x " + fallback_path
+    });
     
     if is_error(fallback) {
         set_output(#{
@@ -89,18 +88,12 @@ if is_error(result) {
             original_error: error_msg
         });
     } else {
-        let path = get_field(fallback, "path");
-        let method = get_field(fallback, "method");
-        let size = get_field(fallback, "file_size_bytes");
-        let note = get_field(fallback, "note");
-        
         set_output(#{
             success: true,
-            path: path,
-            method: method,
-            file_size_bytes: size,
+            path: fallback_path,
+            method: "screen_capture",
             degraded: true,
-            note: if note != () { note } else { "使用了降级方式拍摄" }
+            note: "摄像头不可用，已降级为全屏截图"
         });
     }
 } else {

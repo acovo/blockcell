@@ -2,9 +2,11 @@ name: app_control
 description: 查看或操作 macOS 应用界面
 tools:
   - app_control
+  - exec
 permissions:
   - system.accessibility
   - system.automation
+  - system.exec
 fallback:
   strategy: degrade
   message: 当前无法完成应用控制，请检查系统辅助功能和自动化授权。

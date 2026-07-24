@@ -16,109 +16,110 @@ def run_applescript(script):
     """Execute AppleScript code."""
     try:
         result = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, text=True, check=True
+            ["osascript", "-e", script], capture_output=True, text=True, check=True, timeout=30
         )
         return True, result.stdout.strip()
     except subprocess.CalledProcessError as e:
         return False, e.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return False, "微信自动化操作超时"
 
 
-def send_wechat_message(contact, message):
-    """Send a message via WeChat desktop app using AppleScript."""
-    safe_contact = contact.replace("\\", "\\\\").replace('"', '\\"')
-    safe_message = message.replace("\\", "\\\\").replace('"', '\\"')
+def escape_applescript(value):
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
-    script = f'''
-    -- 1. Ensure WeChat is running
+
+def build_wechat_script(contact, message):
+    safe_contact = escape_applescript(contact)
+    safe_message = escape_applescript(message)
+    return f'''
     tell application "WeChat"
         if not running then
             run
-            delay 2 -- Wait for launch
+            delay 2
         end if
         activate
-        reopen -- Force main window to open if closed
+        reopen
     end tell
 
     delay 1
 
     tell application "System Events"
-        -- Wait for process to appear
         repeat with i from 1 to 20
             if exists process "WeChat" then exit repeat
             delay 0.5
         end repeat
-        
+
         tell process "WeChat"
             set frontmost to true
-            
-            -- Wait for main window to appear (up to 10 seconds)
             repeat with i from 1 to 20
                 if exists window 1 then exit repeat
-                
-                -- If window doesn't exist, try to reopen again
                 tell application "WeChat" to reopen
                 delay 0.5
             end repeat
-            
-            if not (exists window 1) then
-                error "无法找到微信窗口。可能原因：\n1. 微信未登录\n2. 缺少辅助功能权限 (Accessibility)\n请检查 System Settings -> Privacy & Security -> Accessibility 是否允许终端/Trae控制电脑。"
-            end if
+            if not (exists window 1) then error "无法找到微信窗口"
 
-            try
-                set value of attribute "AXMinimized" of window 1 to false
-            end try
-            delay 0.5
-            
-            -- Step 1: Search for contact
             keystroke "f" using {{command down}}
             delay 0.5
-            
-            do shell script "echo " & quoted form of "{safe_contact}" & " | pbcopy"
-            delay 0.2
+            set the clipboard to "{safe_contact}"
             keystroke "v" using {{command down}}
-            delay 1.0
-            
-            key code 36
-            delay 1.0
-            
-            -- Step 2: Focus Input Box (Click bottom-right region with randomization)
+            delay 1
+
+            set exactMatches to {{}}
+            repeat with uiItem in entire contents of window 1
+                try
+                    if role of uiItem is "AXStaticText" and value of uiItem is "{safe_contact}" then
+                        set end of exactMatches to uiItem
+                    end if
+                end try
+            end repeat
+            if (count of exactMatches) is not 1 then error "联系人校验失败：没有唯一的精确匹配"
+            set selectedConversation to value of item 1 of exactMatches
+            if selectedConversation is not "{safe_contact}" then error "联系人校验失败：搜索结果不匹配"
+            click item 1 of exactMatches
+            delay 1
+
             set winPos to position of window 1
             set winSize to size of window 1
-            set winX to item 1 of winPos
-            set winY to item 2 of winPos
-            set winW to item 1 of winSize
-            set winH to item 2 of winSize
-            
-            -- Calculate region start (bottom-right corner - region size 300x100)
-            set regionW to 300
-            set regionH to 100
-            set startX to winX + winW - regionW
-            set startY to winY + winH - regionH
-            
-            -- Randomize click within region for more natural behavior
-            set clickX to startX + (random number from 20 to (regionW - 20))
-            set clickY to startY + (random number from 20 to (regionH - 20))
-            
-            -- Try to use cliclick if available for more reliable click
-            try
-                do shell script "/usr/local/bin/cliclick c:" & (clickX as integer) & "," & (clickY as integer)
-            on error
-                -- Fallback to System Events click if cliclick missing
-                click at {{clickX, clickY}}
-            end try
-            
+            set clickX to (item 1 of winPos) + (item 1 of winSize) - 150
+            set clickY to (item 2 of winPos) + (item 2 of winSize) - 50
+            click at {{clickX, clickY}}
             delay 0.5
-            
-            -- Step 3: Type and Send
-            do shell script "export LANG=zh_CN.UTF-8; echo " & quoted form of "{safe_message}" & " | pbcopy"
-            delay 0.5
+
+            set the clipboard to "{safe_message}"
             keystroke "v" using {{command down}}
             delay 0.5
             key code 36
         end tell
     end tell
     '''
-    return run_applescript(script)
+
+
+def send_wechat_message(contact, message):
+    """Send a message via WeChat desktop app using AppleScript."""
+    return run_applescript(build_wechat_script(contact, message))
+
+
+def validate_top(value):
+    top = int(value)
+    if not 1 <= top <= 100:
+        raise ValueError("top 必须在 1 到 100 之间")
+    return top
+
+
+def parse_invocation(argv, stdin_input, context_input):
+    raw_input = stdin_input.strip()
+    for arg in argv:
+        candidate = arg.strip()
+        if candidate.startswith("{") and candidate.endswith("}"):
+            raw_input = candidate
+            break
+
+    data = json.loads(raw_input) if raw_input else {}
+    context = json.loads(context_input or "{}")
+    contact = str(data.get("contact") or context.get("contact") or "").strip()
+    top = validate_top(data.get("top", context.get("top", 10)))
+    return contact, top
 
 
 def get_binance_top_n(top=10):
@@ -165,56 +166,10 @@ def get_binance_top_n(top=10):
 def main():
     log(f"sys.argv: {sys.argv}")
 
-    # Parse Input
-    try:
-        raw_input = sys.stdin.read().strip()
-    except Exception:
-        raw_input = ""
-
-    contact = ""
-    top = 10
-
-    # The blockcell runtime passes arguments as: argv=["wechat_binance", "{\"contact\": \"发财群\", ...}"]
-    # The first argument (sys.argv[0]) is the script path or command name.
-    # The second argument (sys.argv[1]) is the method name ("wechat_binance").
-    # The third argument (sys.argv[2]) is the JSON string payload.
-    # Note: Sometimes it passes just the JSON string as argv[1].
-    # Let's search all arguments for a valid JSON string.
-    raw_input = ""
-    for arg in sys.argv[1:]:
-        if arg.startswith("{") and arg.endswith("}"):
-            raw_input = arg
-            break
-
-    # Try JSON
-    try:
-        if raw_input:
-            data = json.loads(raw_input)
-            if not contact:
-                contact = data.get("contact", "")
-            if "top" in data:
-                top = int(data.get("top", top))
-    except Exception as e:
-        log(f"Failed to parse JSON input: {e}")
-        pass
-
-    # Try Context from Environment
-    if not contact or top == 10:
-        raw_ctx = os.environ.get("BLOCKCELL_SKILL_CONTEXT", "{}")
-        try:
-            ctx = json.loads(raw_ctx)
-            if not contact:
-                contact = ctx.get("contact", "")
-            if "top" in ctx:
-                top = int(ctx.get("top"))
-        except Exception:
-            pass
-
-    if not contact and "给" in raw_input:
-        parts = raw_input.split("给", 1)
-        if len(parts) > 1:
-            sub = parts[1].split("发", 1)
-            contact = sub[0].strip()
+    stdin_input = sys.stdin.read()
+    contact, top = parse_invocation(
+        sys.argv[1:], stdin_input, os.environ.get("BLOCKCELL_SKILL_CONTEXT", "{}")
+    )
 
     log(f"Final resolved params: contact={contact}, top={top}")
 

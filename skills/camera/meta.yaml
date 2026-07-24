@@ -2,9 +2,11 @@ name: camera
 description: 用摄像头拍照并返回文件路径
 tools:
   - camera_capture
+  - exec
 permissions:
   - hardware.camera
   - fs.write
+  - system.exec
 fallback:
   strategy: degrade
   message: 当前无法使用摄像头拍照，请检查权限或稍后重试。

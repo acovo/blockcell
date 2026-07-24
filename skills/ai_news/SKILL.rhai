@@ -7,7 +7,13 @@ let input = ctx.user_input;
 let want_163        = input.contains("网易科技") || input.contains("163") || input.contains("网易");
 let want_english    = input.contains("英文") || input.contains("国际") || input.contains("global") || input.contains("english");
 
-let any_specific = want_163;
+let any_specific = want_163 || want_english;
+let chat_id = get_field(ctx, "chat_id");
+let browser_session = if chat_id != () && chat_id != "" {
+    "ai_news_" + chat_id
+} else {
+    "ai_news_" + timestamp()
+};
 
 // 构建抓取列表
 let sources = [];
@@ -42,7 +48,7 @@ for source in sources {
     let nav = call_tool("browse", #{
         action: "navigate",
         url: source.url,
-        session: "ai_news"
+        session: browser_session
     });
 
     if !is_error(nav) {
@@ -50,12 +56,12 @@ for source in sources {
         call_tool("browse", #{
             action: "wait",
             timeout: 3000,
-            session: "ai_news"
+            session: browser_session
         });
 
         let content_resp = call_tool("browse", #{
             action: "get_content",
-            session: "ai_news"
+            session: browser_session
         });
 
         if !is_error(content_resp) && content_resp.is_map() && content_resp["content"] != () {
@@ -111,7 +117,7 @@ for source in sources {
 // 关闭browser session释放资源
 call_tool("browse", #{
     action: "session_close",
-    session: "ai_news"
+    session: browser_session
 });
 
 if fetched == () {

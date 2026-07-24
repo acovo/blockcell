@@ -2,7 +2,7 @@
   "name": "fallback_on_failure",
   "input": "拍照",
   "expected_output": "degraded",
-  "expected_tools": ["camera_capture", "camera_capture"],
+  "expected_tools": ["camera_capture", "camera_capture", "exec"],
   "context": {
     "device": "0",
     "format": "jpg",

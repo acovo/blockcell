@@ -3,7 +3,11 @@ description: "抓取币安市值排名前10的代币信息并通过微信发送"
 requires:
   bins: ["python3", "osascript"]
   env: []
-permissions: []
+permissions:
+  - network
+  - system.exec
+  - system.automation
+  - system.accessibility
 always: false
 triggers:
   - "币安市值"

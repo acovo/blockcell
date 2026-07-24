@@ -1,8 +1,9 @@
 name: ai_news
 description: 聚合最新 AI 新闻并整理为简洁快讯
 tools:
-  - web_search
-  - web_fetch
+  - browse
+permissions:
+  - network
 fallback:
   strategy: degrade
   message: 当前无法完成 AI 新闻聚合，请稍后重试。
