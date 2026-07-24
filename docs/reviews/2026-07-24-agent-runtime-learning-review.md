@@ -248,6 +248,70 @@ tools receive the current runtime abort token and origin session through `Runtim
 
 **Resolution:** Fixed. Steering routing now uses a synchronous bounded outcome and rejects the newest message when the queue is full; the global inbound loop never awaits steering capacity and remains available for other conversations and cancellation directives. Regression test: `steering_queue_full_rejects_newest_without_waiting`.
 
+### R10 — Medium: The active user request is silently truncated to 4,000 characters
+
+**Locations:**
+
+- `crates/agent/src/context.rs:770-812`
+- `crates/agent/src/context.rs:942-965`
+- `crates/agent/src/runtime/process_message_inner.rs:353-393`
+
+**Trigger:** A user sends more than 4,000 Unicode characters in one request, such as source code, logs, a document, or detailed requirements whose relevant content lies in the removed middle section.
+
+**Control flow:** Context construction always applies `trim_text_head_tail(user_content, 4000)` to the current user message before the first provider call, retaining roughly two thirds from the head and one third from the tail. This limit is independent of the configured token budget, model context window, attachment handling, and Layer-4 compaction. The original untrimmed text is then appended to persisted history, so the current turn sees an incomplete request while a later turn may see the full request.
+
+**Impact:** The model can omit requirements, mis-review code, or answer from a syntactically corrupted document without the user being told that input was discarded. Persisting a different version than the one actually processed also makes later behavior and audit/replay inconsistent.
+
+**Repair direction:** Budget the current user turn by estimated tokens after reserving system/tool/output space. Preserve it intact whenever it fits; otherwise use an explicit oversize-input contract such as attachment-backed retrieval, chunking, or a user-visible rejection. Persist metadata describing exactly what was sent to the provider if any transformation is unavoidable. Add a regression test with a unique marker in the middle of a request longer than 4,000 characters.
+
+**Evidence:** Direct control-flow proof. The context test suite has no long-current-message case; `cargo test -p blockcell-agent context -- --nocapture` passed 28 tests without exercising this limit.
+
+**Resolution:** Fixed. Current text and multimodal user messages now preserve `user_content` exactly instead of applying a fixed character trim. Regression test: `preserves_long_current_user_input`.
+
+### R11 — Medium: Compact retention can create orphaned tool-result messages
+
+**Locations:**
+
+- `crates/agent/src/runtime/compaction.rs:65-75`
+- `crates/agent/src/runtime/compaction.rs:162-176`
+- `crates/agent/src/runtime/compaction.rs:92-134`
+- `crates/agent/src/runtime/process_message_inner.rs:1167-1265`
+- Compare safe-boundary logic: `crates/agent/src/context.rs:882-940`
+
+**Trigger:** Mid-loop compaction runs after an assistant emits multiple tool calls and their tool results have been appended, while `keep_recent_messages` selects only a suffix of that assistant/tool group. With the default value of two, three tool results are sufficient for the retained suffix to contain only orphaned `tool` messages.
+
+**Control flow:** `execute_layer4_compact` retains the last N individual messages with `rev().take(N)` and does not align the start to a complete user/assistant/tool boundary. `rebuild_messages_after_compact` then emits a compact system message, a synthetic continuation user message, and that raw suffix. The main loop immediately continues and sends this sequence to the provider. The separate context-history path already recognizes that a leading tool result or an assistant call missing any result is invalid and skips to a safe start, but compact retention does not reuse equivalent logic.
+
+**Impact:** OpenAI-compatible providers can reject the next request because `tool_call_id` has no preceding assistant tool call. The malformed compacted form is also saved to session history, so the conversation may continue failing after restart until repaired or compacted again.
+
+**Repair direction:** Retain complete conversational units rather than individual messages. Starting from the newest turn, include an assistant tool-call message only with every corresponding tool result, and never begin the retained suffix with a tool message. Share one protocol-boundary helper between normal context slicing and compaction. Add tests for multi-tool rounds with retention limits cutting at every position.
+
+**Evidence:** Deterministic control-flow proof. The compact suite passed 42 unit tests plus 7 integration tests, but no test constructs a retained multi-tool suffix or validates provider message protocol after rebuilding.
+
+**Resolution:** Fixed. Compact retention now selects a protocol-safe suffix: a boundary inside tool results expands backward to the declaring assistant message, while incomplete assistant/tool groups are omitted rather than persisted in malformed form. Regression test: `compact_recent_messages_preserve_complete_tool_group`.
+
+### R12 — Medium: Compact recovery total budgets are not enforced
+
+**Locations:**
+
+- `crates/agent/src/compact/mod.rs:47-85`
+- `crates/agent/src/compact/mod.rs:185-252`
+- `crates/agent/src/compact/file_tracker.rs:90-109`
+- `crates/agent/src/compact/skill_tracker.rs:65-87`
+- `crates/core/src/config/memory.rs:606-635`
+
+**Trigger:** A session loads many skills, or an administrator configures a file-recovery total below `max_single_file_tokens × max_files_to_recover`, then compaction builds its recovery message.
+
+**Control flow:** `RecoveryBudget.max_file_recovery_tokens` is never read by `build_recovery_message`; file selection applies only file count and per-file truncation. `max_skill_recovery_tokens` is passed to `get_recent_skills` and `truncate_to_tokens` as a per-skill limit, while every tracked skill is included with no total accumulator cutoff. The function computes `total_tokens` only for logging after content has already been appended. Configuration validation explicitly treats these fields as total recovery budgets and warns about their sum, so runtime behavior violates the documented contract.
+
+**Impact:** Recovery content can exceed the configured file or skill allocation, consume the space Layer 4 was intended to free, retrigger compaction repeatedly, or exceed the provider context window. Operators cannot reliably control post-compact context size through the exposed configuration.
+
+**Repair direction:** Maintain separate remaining budgets for files, skills, and session memory. Admit recent entries only while their actually emitted truncated content fits, partially truncate the final admitted entry if useful, and stop afterward. Estimate the final combined summary, recovery, synthetic continuation, and retained recent messages before accepting compact success. Add tests that set very small total budgets and many files/skills, asserting emitted token estimates stay within each allocation.
+
+**Evidence:** Direct control-flow proof. Existing `test_compact_recovery_token_budget` checks file count and per-item limits only; it does not call `build_recovery_message` with constrained total budgets or assert total emitted size.
+
+**Resolution:** Fixed. File, skill, and session-memory recovery are now assembled independently inside their configured total token allocations, including section headings and Markdown framing. Entries are admitted newest-first and the last fitting entry is estimator-truncated; remaining entries are omitted once the allocation is exhausted. Regression test: `compact_recovery_enforces_total_budgets`.
+
 ### M1 — High in multi-conversation deployments: Structured memory is automatically recalled across session boundaries
 
 **Locations:**
@@ -322,5 +386,6 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Runtime lifecycle findings R4-R5: fixed and regression-tested after the completed early-return/error audit.
 - Module 2 Task 2 authorization, path, confirmation, inheritance, subagent restriction, and policy-reload review: complete; R6-R7 fixed and regression-tested.
 - Module 2 Task 2 cancellation, steering, forked-agent work, and cleanup review: complete; R8-R9 fixed and regression-tested.
+- Module 2 Task 3 context ordering, truncation, compact recovery budgets, summaries, and file/skill tracking review: complete; R10-R12 fixed and regression-tested. Task-state and shared-state review remains pending.
 - Module 5 structured-memory and learning-lock findings M1-M3: reviewed, fixed, and regression-tested.
 - The implementation and verification record is in `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review-fixes.md`.

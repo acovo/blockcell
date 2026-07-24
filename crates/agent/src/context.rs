@@ -776,17 +776,15 @@ impl ContextBuilder {
         pending_intent: bool,
     ) {
         let user_msg = if media.is_empty() {
-            let trimmed = Self::trim_text_head_tail(user_content, 4000);
-            ChatMessage::user(&trimmed)
+            ChatMessage::user(user_content)
         } else {
-            let trimmed = Self::trim_text_head_tail(user_content, 4000);
             let all_paths: Vec<&str> = media
                 .iter()
                 .filter(|p| !p.is_empty())
                 .map(|p| p.as_str())
                 .collect();
             let text_with_paths = if all_paths.is_empty() {
-                trimmed
+                user_content.to_string()
             } else {
                 let paths_str = all_paths
                     .iter()
@@ -795,7 +793,7 @@ impl ContextBuilder {
                     .join("\n");
                 format!(
                     "{}\n\n[附件本地路径（发回给用户时请用此路径）]\n{}",
-                    trimmed, paths_str
+                    user_content, paths_str
                 )
             };
             if pending_intent {
@@ -937,31 +935,6 @@ impl ContextBuilder {
         }
 
         i
-    }
-
-    fn trim_text_head_tail(s: &str, max_chars: usize) -> String {
-        if max_chars == 0 {
-            return String::new();
-        }
-
-        let char_count = s.chars().count();
-        if char_count <= max_chars {
-            return s.to_string();
-        }
-
-        let head_chars = (max_chars * 2) / 3;
-        let tail_chars = max_chars.saturating_sub(head_chars);
-
-        let head = s.chars().take(head_chars).collect::<String>();
-        let tail = s.chars().rev().take(tail_chars).collect::<String>();
-        let tail = tail.chars().rev().collect::<String>();
-
-        format!(
-            "{}\n...<trimmed {} chars>...\n{}",
-            head,
-            char_count.saturating_sub(max_chars),
-            tail
-        )
     }
 
     fn load_file_if_exists<P: AsRef<Path>>(&self, path: P) -> Option<String> {
@@ -1407,5 +1380,25 @@ description: deploy demo
         assert!(prompt.contains("patch it with `skill_manage(action=\"patch\")`"));
         assert!(prompt.contains("Do not save task progress"));
         assert!(!prompt.contains("skill candidates"));
+    }
+
+    #[test]
+    fn preserves_long_current_user_input() {
+        let marker = "UNIQUE_MIDDLE_REQUIREMENT";
+        let user_content = format!("{}{}{}", "a".repeat(3000), marker, "z".repeat(3000));
+        let builder = ContextBuilder::new(
+            Paths::with_base(
+                std::env::temp_dir()
+                    .join(format!("blockcell-context-test-{}", uuid::Uuid::new_v4())),
+            ),
+            Config::default(),
+        );
+        let mut messages = Vec::new();
+
+        builder.append_history_and_user_message(&mut messages, &[], &user_content, &[], false);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.as_str(), Some(user_content.as_str()));
+        assert!(messages[0].content.as_str().unwrap().contains(marker));
     }
 }

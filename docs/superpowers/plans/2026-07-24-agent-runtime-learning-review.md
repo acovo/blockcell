@@ -65,7 +65,7 @@
 - Inspect: `crates/agent/src/summary_queue.rs`
 - Inspect: `crates/agent/src/response_cache/**/*.rs`
 
-- [ ] Check context ordering, truncation, recovery budgets, compact summaries, and file/skill tracking for information loss or prompt corruption.
+- [x] Check context ordering, truncation, recovery budgets, compact summaries, and file/skill tracking for information loss or prompt corruption.
 - [ ] Check task state transitions, restart recovery, event emission, and notification routing for races or inconsistent state.
 - [ ] Check mutex/RwLock usage, spawned-task ownership, shutdown handling, and cache keys for deadlocks, leaks, or cross-session contamination.
 - [ ] Record confirmed defects, architectural risks, and missing tests separately.

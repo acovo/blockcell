@@ -1,5 +1,50 @@
 use super::*;
 
+fn select_recent_messages(
+    messages: &[ChatMessage],
+    keep_recent_messages: usize,
+) -> Vec<ChatMessage> {
+    if keep_recent_messages == 0 || messages.is_empty() {
+        return Vec::new();
+    }
+
+    let mut start = messages.len().saturating_sub(keep_recent_messages);
+
+    // A retained suffix must not begin in the middle of a tool-result group.
+    while start > 0 && messages[start].role == "tool" {
+        start -= 1;
+    }
+
+    // If the boundary lands on a tool-calling assistant, retain it only when
+    // every declared result is present consecutively. Otherwise skip the
+    // incomplete group so the rebuilt provider request remains valid.
+    if messages[start].role == "assistant" {
+        if let Some(tool_calls) = &messages[start].tool_calls {
+            if !tool_calls.is_empty() {
+                let expected: std::collections::HashSet<&str> =
+                    tool_calls.iter().map(|call| call.id.as_str()).collect();
+                let mut found = std::collections::HashSet::new();
+                let mut end = start + 1;
+                while end < messages.len() && messages[end].role == "tool" {
+                    if let Some(id) = messages[end].tool_call_id.as_deref() {
+                        found.insert(id);
+                    }
+                    end += 1;
+                }
+                if !expected.iter().all(|id| found.contains(id)) {
+                    start = end;
+                }
+            }
+        }
+    }
+
+    while start < messages.len() && messages[start].role == "tool" {
+        start += 1;
+    }
+
+    messages[start..].to_vec()
+}
+
 impl AgentRuntime {
     /// Build an extractive summary from session history (no LLM call).
     /// Extracts user questions and final assistant answers, truncated to fit.
@@ -165,15 +210,7 @@ impl AgentRuntime {
             .as_ref()
             .map(|m| m.config().layer4.keep_recent_messages)
             .unwrap_or(2);
-        let recent_messages: Vec<ChatMessage> = messages
-            .iter()
-            .rev()
-            .take(keep_recent_messages)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        let recent_messages = select_recent_messages(messages, keep_recent_messages);
 
         // ========== 0. Memory Flush — 压缩前保存重要信息 ==========
         self.flush_memory_store_before_compact(messages).await;
@@ -502,5 +539,46 @@ impl AgentRuntime {
             error: None,
             recent_messages,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blockcell_core::types::ToolCallRequest;
+
+    #[test]
+    fn compact_recent_messages_preserve_complete_tool_group() {
+        let tool_calls: Vec<ToolCallRequest> = (1..=3)
+            .map(|index| ToolCallRequest {
+                id: format!("call-{index}"),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": format!("file-{index}")}),
+                thought_signature: None,
+            })
+            .collect();
+        let assistant = ChatMessage {
+            id: None,
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            reasoning_content: None,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+            name: None,
+        };
+        let messages = vec![
+            ChatMessage::user("inspect files"),
+            assistant,
+            ChatMessage::tool_result("call-1", "one"),
+            ChatMessage::tool_result("call-2", "two"),
+            ChatMessage::tool_result("call-3", "three"),
+        ];
+
+        let recent = select_recent_messages(&messages, 2);
+
+        assert_eq!(recent.len(), 4);
+        assert_eq!(recent[0].role, "assistant");
+        assert_eq!(recent[1].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(recent[3].tool_call_id.as_deref(), Some("call-3"));
     }
 }
