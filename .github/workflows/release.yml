@@ -147,6 +147,10 @@ jobs:
 
       # The Rust binary embeds webui/dist. Use the tested build produced from the
       # same release commit instead of trusting committed build output.
+      - name: Remove committed WebUI build
+        shell: bash
+        run: rm -rf webui/dist && mkdir -p webui/dist
+
       - name: Download WebUI build
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -224,7 +228,6 @@ jobs:
           PKG="blockcell-${{ needs.prepare.outputs.release_tag }}-${{ matrix.platform }}-${{ matrix.arch }}"
           mkdir -p "dist/$PKG"
           cp "$BIN" "dist/$PKG/"
-          cp README.md LICENSE 2>/dev/null || true
           [ -f README.md ] && cp README.md "dist/$PKG/" || true
           [ -f LICENSE ]   && cp LICENSE   "dist/$PKG/" || true
           cd dist

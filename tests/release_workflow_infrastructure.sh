@@ -28,6 +28,12 @@ grep -F 'npm test' "$WORKFLOW" >/dev/null \
   || fail "release workflow does not test WebUI sources"
 grep -F 'npm run build' "$WORKFLOW" >/dev/null \
   || fail "release workflow does not rebuild embedded WebUI assets"
+grep -F 'rm -rf webui/dist' "$WORKFLOW" >/dev/null \
+  || fail "release build does not remove committed WebUI assets before artifact download"
+
+if grep -E '^[[:space:]]*cp README\.md LICENSE([[:space:]]|$)' "$WORKFLOW" >/dev/null; then
+  fail "Unix packaging overwrites LICENSE with README.md"
+fi
 
 grep -E 'cargo build .*--locked' "$WORKFLOW" >/dev/null \
   || fail "release Cargo build is not locked"

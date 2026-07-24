@@ -50,12 +50,20 @@ test_source_install_checks_out_requested_version_and_replaces_atomically() {
 printf '%s\n' "$*" >"$TEST_LOG_DIR/git.args"
 for last_arg do :; done
 mkdir -p "$last_arg/target/release"
+mkdir -p "$last_arg/webui"
 printf '#!/usr/bin/env sh\nexit 0\n' >"$last_arg/target/release/blockcell"
 chmod +x "$last_arg/target/release/blockcell"
 EOF
 
   cat >"$fake_bin/cargo" <<'EOF'
 #!/usr/bin/env sh
+printf '%s\n' "$*" >"$TEST_LOG_DIR/cargo.args"
+exit 0
+EOF
+
+  cat >"$fake_bin/npm" <<'EOF'
+#!/usr/bin/env sh
+printf '%s\n' "$*" >>"$TEST_LOG_DIR/npm.args"
 exit 0
 EOF
 
@@ -71,7 +79,7 @@ printf '%s\n' "$*" >>"$TEST_LOG_DIR/mv.args"
 /bin/mv "$@"
 EOF
 
-  chmod +x "$fake_bin/git" "$fake_bin/cargo" "$fake_bin/cp" "$fake_bin/mv"
+  chmod +x "$fake_bin/git" "$fake_bin/cargo" "$fake_bin/npm" "$fake_bin/cp" "$fake_bin/mv"
 
   HOME="$home_dir" \
   PATH="$fake_bin:/usr/bin:/bin" \
@@ -89,6 +97,60 @@ EOF
     || fail "source install copied directly over the live executable"
   grep -F -- "$case_dir/install/blockcell" "$log_dir/mv.args" >/dev/null \
     || fail "source install did not atomically rename the verified executable"
+  grep -Fx 'ci' "$log_dir/npm.args" >/dev/null \
+    || fail "source install did not install locked WebUI dependencies"
+  grep -Fx 'test' "$log_dir/npm.args" >/dev/null \
+    || fail "source install did not test WebUI sources"
+  grep -Fx 'run build' "$log_dir/npm.args" >/dev/null \
+    || fail "source install did not rebuild embedded WebUI assets"
+  grep -F -- '--locked' "$log_dir/cargo.args" >/dev/null \
+    || fail "source install Cargo build is not locked"
+}
+
+test_source_install_latest_uses_latest_release_tag() {
+  case_dir="$TMP_ROOT/source_latest"
+  fake_bin="$case_dir/bin"
+  home_dir="$case_dir/home"
+  log_dir="$case_dir/log"
+  mkdir -p "$home_dir" "$log_dir"
+  make_common_fakes "$fake_bin"
+
+  cat >"$fake_bin/curl" <<'EOF'
+#!/usr/bin/env sh
+printf '%s\n' '{"tag_name":"v9.8.7"}'
+EOF
+
+  cat >"$fake_bin/git" <<'EOF'
+#!/usr/bin/env sh
+printf '%s\n' "$*" >"$TEST_LOG_DIR/git.args"
+for last_arg do :; done
+mkdir -p "$last_arg/target/release" "$last_arg/webui"
+printf '#!/usr/bin/env sh\nexit 0\n' >"$last_arg/target/release/blockcell"
+chmod +x "$last_arg/target/release/blockcell"
+EOF
+
+  cat >"$fake_bin/cargo" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
+
+  cat >"$fake_bin/npm" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
+
+  chmod +x "$fake_bin/curl" "$fake_bin/git" "$fake_bin/cargo" "$fake_bin/npm"
+
+  HOME="$home_dir" \
+  PATH="$fake_bin:/usr/bin:/bin" \
+  TEST_LOG_DIR="$log_dir" \
+  BLOCKCELL_INSTALL_METHOD=source \
+  BLOCKCELL_VERSION=latest \
+  BLOCKCELL_INSTALL_DIR="$case_dir/install" \
+    sh "$ROOT/install.sh" >/dev/null
+
+  grep -F -- '--branch v9.8.7' "$log_dir/git.args" >/dev/null \
+    || fail "latest source install did not check out the latest release tag"
 }
 
 make_release_fakes() {
@@ -188,8 +250,40 @@ test_release_rejects_unsafe_archive_paths() {
   fi
 }
 
+test_auto_does_not_fallback_after_integrity_failure() {
+  case_dir="$TMP_ROOT/auto_integrity"
+  fake_bin="$case_dir/bin"
+  home_dir="$case_dir/home"
+  mkdir -p "$home_dir"
+  make_release_fakes "$fake_bin"
+
+  cat >"$fake_bin/git" <<'EOF'
+#!/usr/bin/env sh
+touch "$TEST_GIT_MARKER"
+exit 1
+EOF
+  chmod +x "$fake_bin/git"
+
+  bad_sha=0000000000000000000000000000000000000000000000000000000000000000
+  if HOME="$home_dir" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    TEST_RELEASE_SHA="$bad_sha" \
+    TEST_TAR_ENTRY=blockcell \
+    TEST_GIT_MARKER="$case_dir/git-called" \
+    BLOCKCELL_INSTALL_METHOD=auto \
+    BLOCKCELL_INSTALL_DIR="$case_dir/install" \
+      sh "$ROOT/install.sh" >/dev/null 2>&1; then
+    fail "auto install accepted or bypassed a release integrity failure"
+  fi
+
+  test ! -e "$case_dir/git-called" \
+    || fail "auto install fell back to source after a release integrity failure"
+}
+
 test_source_install_checks_out_requested_version_and_replaces_atomically
+test_source_install_latest_uses_latest_release_tag
 test_release_rejects_checksum_mismatch
 test_release_rejects_unsafe_archive_paths
+test_auto_does_not_fallback_after_integrity_failure
 
 echo "install release infrastructure tests: ok"

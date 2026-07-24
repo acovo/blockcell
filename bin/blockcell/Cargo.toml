@@ -1,7 +1,10 @@
 [package]
 name = "blockcell"
-version = "0.1.7"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "blockcell"
@@ -46,6 +49,9 @@ crossterm = "0.28"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 qrcode = "0.14"
+
+[build-dependencies]
+sha2 = { workspace = true }
 
 [features]
 default = ["telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "qq", "weixin", "napcat"]

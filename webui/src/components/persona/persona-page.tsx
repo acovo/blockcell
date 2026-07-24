@@ -9,17 +9,17 @@ const FILE_META: Record<string, { label: string; desc: string; placeholder: stri
   'AGENTS.md': {
     label: 'Agent 角色设定',
     desc: '定义 Agent 的角色、职责和行为模式',
-    placeholder: '# Agent 角色设定\n\n## 角色定位\n你是一个...\n\n## 核心职责\n- \n\n## 行为准则\n- ',
+    placeholder: '# Agent 角色设定\n\n## 角色定位\n你是一个...\n\n## 核心职责\n-\n\n## 行为准则\n-',
   },
   'SOUL.md': {
     label: '灵魂与性格',
     desc: '定义 Agent 的性格特征、价值观和思维方式',
-    placeholder: '# 灵魂设定\n\n## 性格特征\n- 积极主动\n\n## 价值观\n- \n\n## 说话风格\n- ',
+    placeholder: '# 灵魂设定\n\n## 性格特征\n- 积极主动\n\n## 价值观\n-\n\n## 说话风格\n-',
   },
   'USER.md': {
     label: '用户信息',
     desc: '关于用户的背景、偏好和习惯信息',
-    placeholder: '# 用户信息\n\n## 基本信息\n- 姓名：\n- 职业：\n\n## 偏好\n- \n\n## 工作习惯\n- ',
+    placeholder: '# 用户信息\n\n## 基本信息\n- 姓名：\n- 职业：\n\n## 偏好\n-\n\n## 工作习惯\n-',
   },
 };
 

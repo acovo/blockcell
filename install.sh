@@ -85,20 +85,42 @@ github_release_asset_url() {
   api="https://api.github.com/repos/$REPO/releases"
 
   if [ "$VERSION" = "latest" ]; then
-    json=$(curl -fsSL "$api/latest")
+    json=$(curl -fsSL "$api/latest") || return 1
   else
-    json=$(curl -fsSL "$api/tags/$VERSION")
+    json=$(curl -fsSL "$api/tags/$VERSION") || return 1
   fi
 
-  echo "$json" \
+  url=$(echo "$json" \
     | grep -Eo '"browser_download_url"\s*:\s*"[^"]+"' \
     | sed -E 's/^"browser_download_url"\s*:\s*"(.*)"$/\1/' \
     | grep -F "$suffix" \
-    | head -n 1
+    | head -n 1)
+  if [ -z "$url" ]; then
+    return 2
+  fi
+  printf '%s\n' "$url"
+}
+
+latest_release_tag() {
+  require_cmd curl
+  require_cmd grep
+  require_cmd sed
+
+  json=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest") || return 1
+  tag=$(echo "$json" \
+    | grep -Eo '"tag_name"\s*:\s*"[^"]+"' \
+    | sed -E 's/^"tag_name"\s*:\s*"(.*)"$/\1/' \
+    | head -n 1)
+  if [ -z "$tag" ]; then
+    echo "Latest GitHub release does not contain a valid tag name" 1>&2
+    return 1
+  fi
+  printf '%s\n' "$tag"
 }
 
 install_from_source() {
   require_cmd git
+  require_cmd npm
 
   if ! command -v cargo >/dev/null 2>&1; then
     echo "Rust not found. Installing Rust via rustup..."
@@ -117,12 +139,16 @@ install_from_source() {
 
   echo "Cloning https://github.com/$REPO ..."
   if [ "$VERSION" = "latest" ]; then
-    git clone --depth 1 "https://github.com/$REPO.git" "$TMP_DIR/blockcell"
+    source_ref=$(latest_release_tag)
   else
-    git clone --depth 1 --branch "$VERSION" "https://github.com/$REPO.git" "$TMP_DIR/blockcell"
+    source_ref="$VERSION"
   fi
+  git clone --depth 1 --branch "$source_ref" "https://github.com/$REPO.git" "$TMP_DIR/blockcell"
 
-  echo "Building (release)..."
+  echo "Testing and building WebUI..."
+  (cd "$TMP_DIR/blockcell/webui" && npm ci && npm test && npm run build)
+
+  echo "Building Rust binary (release)..."
   os=$(detect_os)
   install_source_deps "$os"
 
@@ -141,7 +167,7 @@ install_from_source() {
     build_jobs=$(nproc 2>/dev/null || echo 4)
   fi
   echo "Building with $build_jobs parallel job(s)..."
-  (cd "$TMP_DIR/blockcell" && cargo build --release -j "$build_jobs")
+  (cd "$TMP_DIR/blockcell" && cargo build --release --locked -j "$build_jobs")
 
   install_binary_atomically "$TMP_DIR/blockcell/target/release/$BIN_NAME"
 }
@@ -226,7 +252,7 @@ install_from_release() {
     darwin|linux) ;;
     *)
       echo "Release install not supported on OS: $os" 1>&2
-      return 1
+      return 2
       ;;
   esac
 
@@ -235,9 +261,13 @@ install_from_release() {
     aarch64) arch="arm64" ;;
   esac
 
-  url=$(github_release_asset_url "$os" "$arch")
-  if [ -z "${url:-}" ]; then
+  url_status=0
+  url=$(github_release_asset_url "$os" "$arch") || url_status=$?
+  if [ "$url_status" -eq 2 ]; then
     echo "Failed to find a matching release asset for OS=$os ARCH=$arch VERSION=$VERSION" 1>&2
+    return 2
+  elif [ "$url_status" -ne 0 ]; then
+    echo "Failed to query GitHub release metadata" 1>&2
     return 1
   fi
 
@@ -311,9 +341,14 @@ case "$METHOD" in
     install_from_source
     ;;
   auto)
-    if ! install_from_release; then
+    release_status=0
+    install_from_release || release_status=$?
+    if [ "$release_status" -eq 2 ]; then
       echo "Release install not available, falling back to source build..."
       install_from_source
+    elif [ "$release_status" -ne 0 ]; then
+      echo "Release install failed integrity or download checks; refusing source fallback." 1>&2
+      exit 1
     fi
     ;;
   *)
