@@ -43,11 +43,18 @@ impl MainSessionSummaryQueue {
 
     pub fn enqueue(&self, item: SummaryItem) {
         let mut items = get_lock(&self.items);
+        if items.iter().any(|existing| {
+            existing
+                .source_event_ids
+                .iter()
+                .any(|event_id| item.source_event_ids.contains(event_id))
+        }) {
+            return;
+        }
         if let Some(merge_key) = item.merge_key.as_deref() {
-            if let Some(existing) = items
-                .iter_mut()
-                .find(|existing| existing.merge_key.as_deref() == Some(merge_key))
-            {
+            if let Some(existing) = items.iter_mut().find(|existing| {
+                existing.scope == item.scope && existing.merge_key.as_deref() == Some(merge_key)
+            }) {
                 for source_event_id in item.source_event_ids {
                     if !existing.source_event_ids.contains(&source_event_id) {
                         existing.source_event_ids.push(source_event_id);
@@ -67,7 +74,29 @@ impl MainSessionSummaryQueue {
     pub fn enqueue_event_as_summary_item(&self, event: &SystemEvent) -> SummaryItem {
         let item = SummaryItem {
             id: format!("sum_{}", Uuid::new_v4()),
-            scope: SummaryScope::MainSession,
+            scope: match &event.scope {
+                blockcell_core::system_event::EventScope::Global
+                | blockcell_core::system_event::EventScope::MainSession => {
+                    SummaryScope::MainSession
+                }
+                blockcell_core::system_event::EventScope::Channel { channel, chat_id } => {
+                    SummaryScope::Channel {
+                        channel: channel.clone(),
+                        chat_id: chat_id.clone(),
+                    }
+                }
+                blockcell_core::system_event::EventScope::Session {
+                    channel,
+                    account_id,
+                    chat_id,
+                    session_key,
+                } => SummaryScope::Session {
+                    channel: channel.clone(),
+                    account_id: account_id.clone(),
+                    chat_id: chat_id.clone(),
+                    session_key: session_key.clone(),
+                },
+            },
             category: category_for_event(event),
             title: event.title.clone(),
             body: event.summary.clone(),
@@ -81,7 +110,7 @@ impl MainSessionSummaryQueue {
     }
 
     pub fn flush_due_items(&self, now_ms: i64) -> Vec<SummaryItem> {
-        let mut items = get_lock(&self.items);
+        let items = get_lock(&self.items);
         if items.is_empty() {
             return Vec::new();
         }
@@ -100,8 +129,12 @@ impl MainSessionSummaryQueue {
 
         let mut flushed = items.clone();
         flushed.sort_by_key(|item| item.created_at_ms);
-        items.clear();
         flushed
+    }
+
+    pub fn acknowledge_items(&self, item_ids: &[String]) {
+        let mut items = get_lock(&self.items);
+        items.retain(|item| !item_ids.iter().any(|item_id| item_id == &item.id));
     }
 
     pub fn snapshot(&self) -> SummaryQueueSnapshot {

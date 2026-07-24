@@ -322,6 +322,7 @@ impl AgentRuntime {
             provider_pool: Arc::clone(&self.provider_pool),
             agent_id: resolve_routed_agent_id(&msg.metadata).or_else(|| self.agent_id.clone()),
             event_tx: self.event_tx.clone(),
+            origin_account_id: msg.account_id.clone(),
             origin_session_key: msg.session_key(),
             response_cache: self.response_cache.clone(),
             event_emitter: self.system_event_emitter.clone(),

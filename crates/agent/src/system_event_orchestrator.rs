@@ -66,13 +66,10 @@ impl SystemEventOrchestrator {
     pub fn process_tick(&self, now_ms: i64) -> HeartbeatDecision {
         let context = self.build_context(now_ms);
         let mut decision = HeartbeatDecision::default();
-        let mut delivered_ids = Vec::new();
 
         for event in context.pending_events {
-            delivered_ids.push(event.id.clone());
-            decision.ack_event_ids.push(event.id.clone());
-
             if event.priority == EventPriority::Low || !event.delivery.notify_user {
+                decision.ack_event_ids.push(event.id.clone());
                 continue;
             }
 
@@ -95,15 +92,24 @@ impl SystemEventOrchestrator {
             }
         }
 
-        if !delivered_ids.is_empty() {
-            self.store.mark_delivered(&delivered_ids);
-        }
-
         let flushed = self.queue.flush_due_items(now_ms);
         if !flushed.is_empty() {
-            decision
-                .flushed_summaries
-                .push(self.queue.build_session_summary(flushed));
+            let mut scoped_groups: Vec<Vec<SummaryItem>> = Vec::new();
+            for item in flushed {
+                if let Some(group) = scoped_groups
+                    .iter_mut()
+                    .find(|group| group.first().is_some_and(|first| first.scope == item.scope))
+                {
+                    group.push(item);
+                } else {
+                    scoped_groups.push(vec![item]);
+                }
+            }
+            decision.flushed_summaries.extend(
+                scoped_groups
+                    .into_iter()
+                    .map(|items| self.queue.build_session_summary(items)),
+            );
         }
 
         decision

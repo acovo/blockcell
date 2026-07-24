@@ -23,6 +23,8 @@ pub enum EventScope {
     },
     Session {
         channel: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
         chat_id: String,
         session_key: String,
     },
@@ -119,8 +121,20 @@ impl SystemEvent {
 #[serde(rename_all = "snake_case")]
 pub enum SummaryScope {
     MainSession,
-    Channel { channel: String, chat_id: String },
-    User { user_id: String },
+    Channel {
+        channel: String,
+        chat_id: String,
+    },
+    Session {
+        channel: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+        chat_id: String,
+        session_key: String,
+    },
+    User {
+        user_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

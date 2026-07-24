@@ -29,9 +29,9 @@ fn orchestrator_sends_critical_events_as_immediate_notifications() {
 
     assert_eq!(decision.immediate_notifications.len(), 1);
     assert_eq!(decision.immediate_notifications[0].title, event.title);
-    assert!(decision.ack_event_ids.contains(&event.id));
+    assert!(!decision.ack_event_ids.contains(&event.id));
     assert_eq!(queue.snapshot().pending_count, 1);
-    assert!(store.list_pending(10).is_empty());
+    assert_eq!(store.list_pending(10).len(), 1);
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn orchestrator_enqueues_normal_events_for_summary() {
     assert!(decision.immediate_notifications.is_empty());
     assert_eq!(decision.summary_updates.len(), 1);
     assert_eq!(queue.snapshot().pending_count, 1);
-    assert!(decision.ack_event_ids.contains(&event.id));
+    assert!(!decision.ack_event_ids.contains(&event.id));
 }
 
 #[test]
@@ -66,11 +66,11 @@ fn orchestrator_keeps_low_events_silent_by_default() {
     assert!(decision.summary_updates.is_empty());
     assert!(decision.ack_event_ids.contains(&event.id));
     assert_eq!(queue.snapshot().pending_count, 0);
-    assert!(store.list_pending(10).is_empty());
+    assert_eq!(store.list_pending(10).len(), 1);
 }
 
 #[test]
-fn orchestrator_returns_acked_ids_for_all_processed_events() {
+fn orchestrator_only_returns_immediately_ackable_event_ids() {
     let store = InMemorySystemEventStore::default();
     let queue = MainSessionSummaryQueue::with_policy(5, 30_000);
     let orchestrator = SystemEventOrchestrator::new(store.clone(), queue.clone());
@@ -82,7 +82,5 @@ fn orchestrator_returns_acked_ids_for_all_processed_events() {
 
     let decision = orchestrator.process_tick(1_000);
 
-    assert_eq!(decision.ack_event_ids.len(), 2);
-    assert!(decision.ack_event_ids.contains(&first.id));
-    assert!(decision.ack_event_ids.contains(&second.id));
+    assert!(decision.ack_event_ids.is_empty());
 }

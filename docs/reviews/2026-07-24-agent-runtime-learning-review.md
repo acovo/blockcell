@@ -312,6 +312,91 @@ tools receive the current runtime abort token and origin session through `Runtim
 
 **Resolution:** Fixed. File, skill, and session-memory recovery are now assembled independently inside their configured total token allocations, including section headings and Markdown framing. Entries are admitted newest-first and the last fitting entry is estimator-truncated; remaining entries are omitted once the allocation is exhausted. Regression test: `compact_recovery_enforces_total_budgets`.
 
+### R13 — High: Background-task lifecycle results can be delivered to the wrong conversation
+
+**Locations:**
+
+- `crates/agent/src/task_manager.rs:315-381`
+- `crates/agent/src/runtime/subagent.rs:29-40`
+- `crates/agent/src/runtime/subagent.rs:138-174`
+- `crates/agent/src/runtime/wiring.rs:496-531`
+- `crates/agent/src/runtime/wiring.rs:533-590`
+
+**Trigger:** Conversation A starts a background subagent task. Before it completes, the same runtime processes a normal inbound message from conversation B, making B the current `main_session_target`. The task then completes or fails and the system-event heartbeat runs.
+
+**Control flow:** `run_subagent_task` records A's `origin_channel` and `origin_chat_id` and enables lifecycle system events. `TaskManager::emit_lifecycle_event` includes those origin fields only in `details`; it always constructs the event with `SystemEvent::new_main_session`, and a completed event's summary embeds the task result. `update_main_session_target` replaces the runtime target whenever another eligible conversation sends a message. Delivery of `EventScope::MainSession` resolves against that mutable latest target, so the lifecycle event from A is routed to B. The separate `deliver_subagent_result_to_origin` path correctly sends the direct result to A, but does not prevent the lifecycle summary copy from going to B.
+
+**Impact:** Cross-conversation disclosure of background-task output or error details, plus misleading task notifications in the unrelated conversation. Gateway agents serving multiple chats are directly exposed to this race.
+
+**Repair direction:** Scope task lifecycle events to their immutable origin with `EventScope::Session` or `EventScope::Channel`, preserving account/session identity as well as channel and chat ID. Summary queue items must retain and flush per target instead of collapsing all scopes into one main-session queue. Add a test that starts a task in chat A, switches the runtime target to chat B, completes the task, and asserts every notification and summary remains addressed to A.
+
+**Evidence:** Deterministic control-flow proof. Existing lifecycle tests assert event kinds only, while runtime notification tests use one fixed main-session target and therefore do not exercise target rotation.
+
+**Resolution:** Fixed. Event-producing tasks now persist their immutable origin account and session key; lifecycle events and summary items carry that scope through grouping and final dispatch. Target rotation no longer changes their destination. Regression tests: `task_lifecycle_event_stays_with_origin_after_target_rotation` and `task_summary_delivery_stays_with_origin_after_target_rotation`.
+
+### R14 — Medium: Events are marked delivered before notification delivery succeeds
+
+**Locations:**
+
+- `crates/agent/src/system_event_orchestrator.rs:66-109`
+- `crates/agent/src/runtime/wiring.rs:560-590`
+- `crates/agent/src/runtime/wiring.rs:595-637`
+- `crates/agent/src/summary_queue.rs:82-109`
+
+**Trigger:** A critical notification or due summary is processed while its WebSocket broadcast has no receiver, its outbound channel is absent or closed, or the runtime shuts down between orchestration and dispatch.
+
+**Control flow:** `SystemEventOrchestrator::process_tick` marks every selected event delivered before returning its delivery decision. The runtime dispatches afterward and ignores both broadcast and outbound send failures. Due summary items are also removed from the queue before dispatch. No failure path clears `delivered`, requeues the summary, or retries the request.
+
+**Impact:** User-visible task failures and system summaries can be lost permanently while the store reports no pending work. Monitoring cannot distinguish successful delivery from an attempted or skipped send.
+
+**Repair direction:** Separate selection from acknowledgement. Mark an event delivered only after the target transport accepts it; retain or requeue on failure and record attempts/backoff. Make dispatch return a delivery outcome, and flush summary items transactionally only after successful send. Add closed-channel and missing-target tests that assert the event remains pending.
+
+**Evidence:** Direct control-flow proof. `cargo test -p blockcell-agent --test system_event_orchestrator -- --nocapture` passed 4 tests, but those tests explicitly expect events to become non-pending during `process_tick` and do not invoke a failing transport.
+
+**Resolution:** Fixed. Orchestration now selects delivery candidates without acknowledging user-visible events. Runtime dispatch returns a transport outcome, marks events delivered only after success, and acknowledges summary items only after their scoped outbound succeeds. Repeated ticks deduplicate summary items by source event ID. Regression tests: `system_event_delivery_failure_keeps_pending` and `summary_delivery_failure_keeps_items`.
+
+### R15 — Medium: Restart recovery silently converts interrupted tasks to Failed
+
+**Locations:**
+
+- `crates/agent/src/task_manager/persistence.rs:64-150`
+- `bin/blockcell/src/commands/agent.rs:349-357`
+- `bin/blockcell/src/commands/gateway.rs:827-838`
+- `crates/agent/src/task_manager.rs:315-381`
+
+**Trigger:** The process restarts while a persisted queued or running background task has `emit_system_events = true`.
+
+**Control flow:** Startup calls `restore_from_disk` before the runtime registers its task event emitter. Recovery changes each unfinished task to `Failed`, writes the new state, and logs it, but does not call the lifecycle emitter, publish a completion event, or route a direct failure notification to the recorded origin. The restored task remains queryable until cleanup, so internal state says Failed while the user-facing notification state remains silent and `notified` remains false.
+
+**Impact:** Users can wait indefinitely for a background task that was interrupted by restart unless they manually inspect `/tasks`. Automation consuming task lifecycle events also never observes the terminal transition.
+
+**Repair direction:** Restore into an explicit interrupted/recovery state or produce a durable failure event after runtime wiring is ready. Replay one idempotent origin-scoped terminal notification, persist its notification/ack state, and cover both agent and gateway startup paths.
+
+**Evidence:** Direct control-flow proof. `test_restore_from_disk_persists_failed_state` confirms the state rewrite but has no event or notification assertion; `cargo test -p blockcell-agent task_manager -- --nocapture` passed all 17 focused tests.
+
+**Resolution:** Fixed. Restored interrupted tasks carry an explicit restart marker. After the matching agent emitter is registered, startup replays one origin-scoped failure lifecycle event, atomically marks the task notified, and persists that notification state. Regression test: `restored_interrupted_task_emits_failure_once`.
+
+### R16 — Medium: Persisted terminal task files survive restarts indefinitely and can block unfinished-task recovery
+
+**Locations:**
+
+- `crates/agent/src/task_manager/persistence.rs:69-147`
+- `crates/agent/src/task_manager/persistence.rs:198-241`
+- `crates/agent/src/task_manager.rs:818-835`
+- `crates/agent/src/task_manager.rs:844-870`
+
+**Trigger:** The process stops after terminal task state has been persisted but before the in-process five-minute cleanup removes its JSON file. This repeats over many executions or restarts.
+
+**Control flow:** `restore_from_disk` scans terminal JSON files but neither loads nor deletes them. Both cleanup paths derive deletion candidates exclusively from the in-memory task map, so skipped terminal files can never be selected after restart. The restore scan stops after 1,000 directory entries, without ordering unfinished files ahead of stale terminal files.
+
+**Impact:** `.blockcell/tasks` grows across restarts, startup repeatedly parses stale records, and once the directory exceeds the scan cap an actually queued/running task can occur after the first 1,000 entries and never be converted to its recoverable failed state. Disk usage and task observability degrade over time.
+
+**Repair direction:** During startup, classify every persisted record: restore interrupted tasks and delete or retain terminal records according to an explicit TTL based on `completed_at`. Apply the scan bound after filtering/prioritization, or sort unfinished records first. Add a restart test with terminal files plus an unfinished file beyond a small injected scan limit.
+
+**Evidence:** Deterministic persistence/cleanup control-flow proof. Existing tests cover same-process file deletion and nonterminal restoration separately, but no test restarts with terminal records or exercises the scan limit.
+
+**Resolution:** Fixed. Startup scanning deletes valid terminal task records immediately and counts only unfinished tasks against the 1,000-task recovery limit, while continuing to process entries one at a time. Regression test: `restore_deletes_terminal_files_without_consuming_limit`.
+
 ### M1 — High in multi-conversation deployments: Structured memory is automatically recalled across session boundaries
 
 **Locations:**
@@ -378,6 +463,14 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Session-scoped structured-memory recall and deduplication.
 - FTS candidate windows dominated by deleted/expired rows.
 - Recovery from stale file-memory and skill lock directories.
+- Background task lifecycle notification and summary routing after main-session rotation.
+- Immediate-event and summary transport failure retry state.
+- Idempotent notification of tasks interrupted by restart.
+- Startup cleanup of terminal task records without consuming the unfinished-task recovery limit.
+
+## Open architecture risks and missing coverage
+
+- `DeliveryPolicy.persist` and `max_delay_seconds` remain unenforced by the in-memory event store. Pending events and summary items can still disappear on process restart even though the default policy requests persistence.
 
 ## Review progress
 
@@ -386,6 +479,7 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Runtime lifecycle findings R4-R5: fixed and regression-tested after the completed early-return/error audit.
 - Module 2 Task 2 authorization, path, confirmation, inheritance, subagent restriction, and policy-reload review: complete; R6-R7 fixed and regression-tested.
 - Module 2 Task 2 cancellation, steering, forked-agent work, and cleanup review: complete; R8-R9 fixed and regression-tested.
-- Module 2 Task 3 context ordering, truncation, compact recovery budgets, summaries, and file/skill tracking review: complete; R10-R12 fixed and regression-tested. Task-state and shared-state review remains pending.
+- Module 2 Task 3 context ordering, truncation, compact recovery budgets, summaries, and file/skill tracking review: complete; R10-R12 fixed and regression-tested.
+- Module 2 Task 3 task state, restart recovery, event emission, and notification routing review: complete; R13-R16 fixed and regression-tested. Shared-state/concurrency review remains pending.
 - Module 5 structured-memory and learning-lock findings M1-M3: reviewed, fixed, and regression-tested.
 - The implementation and verification record is in `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review-fixes.md`.

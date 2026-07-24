@@ -67,12 +67,19 @@ impl TaskManager {
     /// 只恢复未达到终止状态的任务，恢复为 Queued 状态。
     /// 限制最大恢复文件数，防止目录异常导致 OOM 或启动过慢。
     pub async fn restore_from_disk(&self, workspace_dir: &Path) -> usize {
-        /// 最大恢复文件数限制
-        const MAX_RESTORE_FILES: usize = 1000;
+        const MAX_RESTORE_TASKS: usize = 1000;
+        self.restore_from_disk_with_limit(workspace_dir, MAX_RESTORE_TASKS)
+            .await
+    }
 
+    pub(super) async fn restore_from_disk_with_limit(
+        &self,
+        workspace_dir: &Path,
+        max_restore_tasks: usize,
+    ) -> usize {
         let tasks_dir = Self::tasks_dir(workspace_dir);
         let mut count = 0;
-        let mut total_scanned = 0;
+        let mut limit_warned = false;
 
         // 目录不存在则跳过
         if !tokio::fs::try_exists(&tasks_dir).await.unwrap_or(false) {
@@ -88,22 +95,18 @@ impl TaskManager {
         };
 
         while let Ok(Some(entry)) = entries.next_entry().await {
-            total_scanned += 1;
-            if total_scanned > MAX_RESTORE_FILES {
-                tracing::warn!(
-                    limit = MAX_RESTORE_FILES,
-                    "恢复文件数超过限制，跳过剩余文件"
-                );
-                break;
-            }
-
             let path = entry.path();
             if path.extension().map(|e| e == "json").unwrap_or(false) {
                 match tokio::fs::read_to_string(&path).await {
                     Ok(content) => match serde_json::from_str::<TaskInfo>(&content) {
                         Ok(task) => {
-                            // 只恢复未完成的任务
-                            if !is_terminal_status(&task.status) {
+                            if is_terminal_status(&task.status) {
+                                if let Err(e) = tokio::fs::remove_file(&path).await {
+                                    tracing::warn!(path = %path.display(), error = %e, "Failed to delete terminal persisted task");
+                                } else {
+                                    tracing::debug!(task_id = %task.id, path = %path.display(), "Deleted terminal persisted task during startup");
+                                }
+                            } else if count < max_restore_tasks {
                                 // 标记为 Failed 而非 Queued，因为没有机制重新执行恢复的任务
                                 // 避免僵尸任务永远停留在 Queued 状态
                                 let mut restored_task = task.clone();
@@ -112,6 +115,8 @@ impl TaskManager {
                                 restored_task.completed_at = Some(Utc::now());
                                 restored_task.progress = None;
                                 restored_task.result = None;
+                                restored_task.notified = false;
+                                restored_task.restored_after_restart = true;
                                 restored_task.error = Some(
                                 "Task restored from disk after restart; not re-executed automatically".to_string()
                             );
@@ -132,6 +137,12 @@ impl TaskManager {
                                     task_id = %task.id,
                                     agent_type = ?task.agent_type,
                                     "Restored unfinished task"
+                                );
+                            } else if !limit_warned {
+                                limit_warned = true;
+                                tracing::warn!(
+                                    limit = max_restore_tasks,
+                                    "未完成任务恢复数量超过限制，额外任务保持在磁盘"
                                 );
                             }
                         }

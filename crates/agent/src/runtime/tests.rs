@@ -3492,6 +3492,108 @@ async fn test_orchestrator_tick_emits_event_tx_for_immediate_notifications() {
 }
 
 #[tokio::test]
+async fn system_event_delivery_failure_keeps_pending() {
+    let runtime = test_runtime();
+    let mut event = SystemEvent::new_main_session(
+        "task.failed",
+        "task_manager",
+        EventPriority::Critical,
+        "Task failed",
+        "retry me",
+    );
+    event.delivery.immediate = true;
+    runtime.event_emitter_handle().emit(event.clone());
+
+    runtime
+        .process_system_event_tick(chrono::Utc::now().timestamp_millis())
+        .await;
+
+    let pending = runtime.system_event_store.list_pending(10);
+    assert!(pending.iter().any(|candidate| candidate.id == event.id));
+}
+
+#[tokio::test]
+async fn summary_delivery_failure_keeps_items() {
+    let runtime = test_runtime();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut event = SystemEvent::new_main_session(
+        "task.completed",
+        "task_manager",
+        EventPriority::Normal,
+        "Report ready",
+        "retry summary",
+    );
+    event.created_at_ms = now_ms - 60_000;
+    runtime.event_emitter_handle().emit(event.clone());
+
+    runtime.process_system_event_tick(now_ms).await;
+
+    assert!(runtime
+        .system_event_store
+        .list_pending(10)
+        .iter()
+        .any(|candidate| candidate.id == event.id));
+    assert_eq!(
+        runtime
+            .system_event_orchestrator
+            .queue()
+            .snapshot()
+            .pending_count,
+        1
+    );
+}
+
+#[tokio::test]
+async fn task_summary_delivery_stays_with_origin_after_target_rotation() {
+    let mut runtime = test_runtime();
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+    runtime.set_outbound(outbound_tx);
+    runtime
+        .update_main_session_target(&InboundMessage {
+            channel: "telegram".to_string(),
+            account_id: Some("account-b".to_string()),
+            sender_id: "user-b".to_string(),
+            chat_id: "chat-b".to_string(),
+            content: "switch target".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .await;
+
+    runtime
+        .task_manager
+        .create_and_start_task_with_route(
+            "task-origin-summary",
+            "private report",
+            "inspect private data",
+            "telegram",
+            "chat-a",
+            Some("account-a"),
+            Some("telegram:account:9:account-achat-a"),
+            runtime.agent_id.as_deref(),
+            true,
+            Some("explore"),
+            false,
+        )
+        .await;
+    runtime
+        .task_manager
+        .set_completed("task-origin-summary", "secret result from chat A")
+        .await;
+
+    runtime
+        .process_system_event_tick(chrono::Utc::now().timestamp_millis() + 60_000)
+        .await;
+
+    let outbound = outbound_rx.recv().await.expect("origin summary outbound");
+    assert_eq!(outbound.channel, "telegram");
+    assert_eq!(outbound.account_id.as_deref(), Some("account-a"));
+    assert_eq!(outbound.chat_id, "chat-a");
+    assert!(outbound.content.contains("后台任务已完成"));
+}
+
+#[tokio::test]
 async fn test_orchestrator_tick_flushes_summary_to_main_session_outbound() {
     let mut runtime = test_runtime();
     let (outbound_tx, mut outbound_rx) = mpsc::channel(8);

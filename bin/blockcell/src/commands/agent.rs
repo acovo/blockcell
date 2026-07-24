@@ -509,6 +509,12 @@ pub async fn run(
         runtime.set_confirm(confirm_tx);
         runtime.set_task_manager(task_manager.clone());
         runtime.set_agent_id(Some(agent_id.clone()));
+        let replayed = task_manager
+            .replay_restored_failure_notifications(Some(&agent_id))
+            .await;
+        if replayed > 0 {
+            info!(replayed, agent_id = %agent_id, "Queued interrupted task failure notifications");
+        }
         runtime.set_event_tx(event_tx.clone());
         if let Some(ref store) = memory_store_handle {
             runtime.set_memory_store(store.clone());

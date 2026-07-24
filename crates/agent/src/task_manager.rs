@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use blockcell_core::system_event::{DeliveryPolicy, EventPriority, SystemEvent};
+use blockcell_core::system_event::{DeliveryPolicy, EventPriority, EventScope, SystemEvent};
 use blockcell_core::{AbortToken, AgentResult, Error};
 use blockcell_tools::{EventEmitterHandle, TaskManagerOps};
 use chrono::{DateTime, Utc};
@@ -60,6 +60,12 @@ pub struct TaskInfo {
     pub origin_channel: String,
     /// Origin chat_id that spawned this task.
     pub origin_chat_id: String,
+    /// Optional channel account that owns this task's origin conversation.
+    #[serde(default)]
+    pub origin_account_id: Option<String>,
+    /// Canonical immutable session key for origin-scoped event delivery.
+    #[serde(default)]
+    pub origin_session_key: Option<String>,
     /// Agent that owns this task. Missing values are treated as the default agent.
     pub agent_id: Option<String>,
     #[serde(default)]
@@ -87,6 +93,9 @@ pub struct TaskInfo {
     /// 结果是否已注入到主agent的LLM对话中（防止重复注入）
     #[serde(default)]
     pub result_injected: bool,
+    /// Set when an unfinished persisted task is converted to Failed on startup.
+    #[serde(default)]
+    pub restored_after_restart: bool,
 }
 
 impl TaskInfo {
@@ -368,6 +377,19 @@ impl TaskManager {
             title,
             summary,
         );
+        event.scope = if let Some(session_key) = task.origin_session_key.as_ref() {
+            EventScope::Session {
+                channel: task.origin_channel.clone(),
+                account_id: task.origin_account_id.clone(),
+                chat_id: task.origin_chat_id.clone(),
+                session_key: session_key.clone(),
+            }
+        } else {
+            EventScope::Channel {
+                channel: task.origin_channel.clone(),
+                chat_id: task.origin_chat_id.clone(),
+            }
+        };
         event.delivery = delivery;
         event.dedup_key = Some(format!("task:{}", task.id));
         event.details = json!({
@@ -408,6 +430,8 @@ impl TaskManager {
             error: None,
             origin_channel: origin_channel.to_string(),
             origin_chat_id: origin_chat_id.to_string(),
+            origin_account_id: None,
+            origin_session_key: None,
             agent_id: agent_id.map(str::to_string),
             emit_system_events,
             agent_type: agent_type.map(str::to_string),
@@ -418,6 +442,7 @@ impl TaskManager {
             output_file: None,
             evict_after: None,
             result_injected: false,
+            restored_after_restart: false,
         };
         {
             let mut tasks = self.tasks.lock().await;
@@ -444,6 +469,38 @@ impl TaskManager {
         agent_type: Option<&str>,
         one_shot: bool,
     ) -> TaskInfo {
+        self.create_and_start_task_with_route(
+            task_id,
+            label,
+            description,
+            origin_channel,
+            origin_chat_id,
+            None,
+            None,
+            agent_id,
+            emit_system_events,
+            agent_type,
+            one_shot,
+        )
+        .await
+    }
+
+    /// Atomically create a running task with immutable origin routing metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_and_start_task_with_route(
+        &self,
+        task_id: &str,
+        label: &str,
+        description: &str,
+        origin_channel: &str,
+        origin_chat_id: &str,
+        origin_account_id: Option<&str>,
+        origin_session_key: Option<&str>,
+        agent_id: Option<&str>,
+        emit_system_events: bool,
+        agent_type: Option<&str>,
+        one_shot: bool,
+    ) -> TaskInfo {
         let now = Utc::now();
         let info = TaskInfo {
             id: task_id.to_string(),
@@ -458,6 +515,8 @@ impl TaskManager {
             error: None,
             origin_channel: origin_channel.to_string(),
             origin_chat_id: origin_chat_id.to_string(),
+            origin_account_id: origin_account_id.map(str::to_string),
+            origin_session_key: origin_session_key.map(str::to_string),
             agent_id: agent_id.map(str::to_string),
             emit_system_events,
             agent_type: agent_type.map(str::to_string),
@@ -467,6 +526,7 @@ impl TaskManager {
             output_file: None,
             evict_after: None,
             result_injected: false,
+            restored_after_restart: false,
         };
         {
             let mut tasks = self.tasks.lock().await;
@@ -1055,6 +1115,38 @@ impl TaskManager {
         false
     }
 
+    /// Emit one idempotent lifecycle failure for tasks interrupted by restart.
+    pub async fn replay_restored_failure_notifications(&self, agent_id: Option<&str>) -> usize {
+        if self.event_emitter_for_agent(agent_id).is_none() {
+            return 0;
+        }
+
+        let agent_key = normalized_agent_key(agent_id);
+        let tasks_to_notify = {
+            let mut tasks = self.tasks.lock().await;
+            tasks
+                .values_mut()
+                .filter(|task| {
+                    task.restored_after_restart
+                        && task.status == TaskStatus::Failed
+                        && task.emit_system_events
+                        && !task.notified
+                        && normalized_agent_key(task.agent_id.as_deref()) == agent_key
+                })
+                .map(|task| {
+                    task.notified = true;
+                    task.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for task in &tasks_to_notify {
+            self.emit_lifecycle_event(task, "failed");
+            self.persist_if_configured(task).await;
+        }
+        tasks_to_notify.len()
+    }
+
     /// 设置失败并延迟清理（失败后保留一段时间供用户查看）
     /// 参考: Claude Code LocalAgentTask.tsx evictAfter
     pub async fn set_failed_with_grace(&self, task_id: &str, error: &str) {
@@ -1418,6 +1510,13 @@ mod tests {
                 .map(|event| event.kind.clone())
                 .collect()
         }
+
+        fn events(&self) -> Vec<SystemEvent> {
+            self.events
+                .lock()
+                .expect("task manager recording emitter lock poisoned")
+                .clone()
+        }
     }
 
     impl blockcell_tools::SystemEventEmitter for RecordingEmitter {
@@ -1458,6 +1557,47 @@ mod tests {
                 "task.running".to_string(),
                 "task.completed".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_lifecycle_event_stays_with_origin_after_target_rotation() {
+        let manager = TaskManager::new();
+        let emitter = RecordingEmitter::default();
+        manager.register_event_emitter(Some("ops"), emitter.handle());
+
+        manager
+            .create_and_start_task_with_route(
+                "task-origin",
+                "private report",
+                "inspect private data",
+                "ws",
+                "chat-a",
+                Some("account-a"),
+                Some("ws:account:9:account-achat-a"),
+                Some("ops"),
+                true,
+                Some("explore"),
+                false,
+            )
+            .await;
+        manager
+            .set_completed("task-origin", "secret result from chat A")
+            .await;
+
+        let completed = emitter
+            .events()
+            .into_iter()
+            .find(|event| event.kind == "task.completed")
+            .expect("completed lifecycle event");
+        assert_eq!(
+            completed.scope,
+            blockcell_core::system_event::EventScope::Session {
+                channel: "ws".to_string(),
+                account_id: Some("account-a".to_string()),
+                chat_id: "chat-a".to_string(),
+                session_key: "ws:account:9:account-achat-a".to_string(),
+            }
         );
     }
 
@@ -1733,6 +1873,116 @@ mod tests {
             .expect("read restored task file");
         let persisted: TaskInfo = serde_json::from_str(&content).expect("parse restored task file");
         assert_eq!(persisted.status, TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn restored_interrupted_task_emits_failure_once() {
+        let temp_dir = tempfile::TempDir::new().expect("temp workspace");
+        let workspace = temp_dir.path();
+        let manager = TaskManager::with_workspace(workspace);
+        manager
+            .create_and_start_task_with_route(
+                "restore-notify-1",
+                "background report",
+                "restore notification test",
+                "telegram",
+                "chat-a",
+                Some("account-a"),
+                Some("telegram:account:9:account-achat-a"),
+                Some("ops"),
+                true,
+                Some("explore"),
+                false,
+            )
+            .await;
+
+        let restored_manager = TaskManager::with_workspace(workspace);
+        assert_eq!(restored_manager.restore_from_disk(workspace).await, 1);
+        let emitter = RecordingEmitter::default();
+        restored_manager.register_event_emitter(Some("ops"), emitter.handle());
+
+        assert_eq!(
+            restored_manager
+                .replay_restored_failure_notifications(Some("ops"))
+                .await,
+            1
+        );
+        assert_eq!(
+            restored_manager
+                .replay_restored_failure_notifications(Some("ops"))
+                .await,
+            0
+        );
+        assert_eq!(
+            emitter
+                .events()
+                .iter()
+                .filter(|event| event.kind == "task.failed")
+                .count(),
+            1
+        );
+
+        let file_path = workspace
+            .join(".blockcell")
+            .join("tasks")
+            .join("restore-notify-1.json");
+        let content = tokio::fs::read_to_string(file_path)
+            .await
+            .expect("read restored task");
+        let persisted: TaskInfo = serde_json::from_str(&content).expect("parse restored task");
+        assert!(persisted.notified);
+        assert!(persisted.restored_after_restart);
+    }
+
+    #[tokio::test]
+    async fn restore_deletes_terminal_files_without_consuming_limit() {
+        let temp_dir = tempfile::TempDir::new().expect("temp workspace");
+        let workspace = temp_dir.path();
+        let manager = TaskManager::with_workspace(workspace);
+        manager
+            .create_and_start_task(
+                "terminal-first",
+                "finished",
+                "terminal task",
+                "cli",
+                "chat-a",
+                None,
+                false,
+                None,
+                false,
+            )
+            .await;
+        manager.set_completed("terminal-first", "done").await;
+        manager
+            .create_and_start_task(
+                "unfinished-second",
+                "running",
+                "unfinished task",
+                "cli",
+                "chat-a",
+                None,
+                false,
+                None,
+                false,
+            )
+            .await;
+
+        let restored_manager = TaskManager::with_workspace(workspace);
+        assert_eq!(
+            restored_manager
+                .restore_from_disk_with_limit(workspace, 1)
+                .await,
+            1
+        );
+        assert!(restored_manager
+            .get_task("unfinished-second")
+            .await
+            .is_some());
+        assert!(!workspace
+            .join(".blockcell")
+            .join("tasks")
+            .join("terminal-first.json")
+            .exists());
     }
 
     #[tokio::test]

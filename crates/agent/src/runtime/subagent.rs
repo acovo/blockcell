@@ -15,6 +15,7 @@ pub(crate) async fn run_subagent_task(
     label: String,
     origin_channel: String,
     origin_chat_id: String,
+    origin_account_id: Option<String>,
     agent_id: Option<String>,
     event_tx: Option<broadcast::Sender<String>>,
     origin_history_seed: Vec<ChatMessage>,
@@ -27,12 +28,14 @@ pub(crate) async fn run_subagent_task(
     // This eliminates the race condition where a concurrent cleanup could
     // remove the task between create_task and set_running.
     task_manager
-        .create_and_start_task(
+        .create_and_start_task_with_route(
             &task_id,
             &label,
             &task_str,
             &origin_channel,
             &origin_chat_id,
+            origin_account_id.as_deref(),
+            Some(&origin_session_key),
             agent_id.as_deref(),
             true,
             agent_type.as_deref(), // agent_type

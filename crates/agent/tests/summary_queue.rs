@@ -81,6 +81,13 @@ fn summary_queue_flushes_due_items_by_count_or_age() {
     by_count.enqueue(build_item("two", 200, None, "Two"));
     let flushed = by_count.flush_due_items(250);
     assert_eq!(flushed.len(), 2);
+    assert_eq!(by_count.snapshot().pending_count, 2);
+    by_count.acknowledge_items(
+        &flushed
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>(),
+    );
     assert_eq!(by_count.snapshot().pending_count, 0);
 
     let by_age = MainSessionSummaryQueue::with_policy(5, 1_000);

@@ -1182,6 +1182,12 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             agent_memory_stores.insert(agent_id.clone(), memory_store_handle);
         }
         task_manager.register_event_emitter(Some(&agent_id), event_emitter.clone());
+        let replayed = task_manager
+            .replay_restored_failure_notifications(Some(&agent_id))
+            .await;
+        if replayed > 0 {
+            info!(replayed, agent_id = %agent_id, "Queued interrupted task failure notifications");
+        }
         agent_event_emitters.insert(agent_id.clone(), event_emitter);
         runtime_senders.insert(agent_id.clone(), agent_tx);
         runtime_handles.push((format!("runtime:{}", agent_id), agent_handle));

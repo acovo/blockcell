@@ -544,11 +544,12 @@ impl AgentRuntime {
             }),
             EventScope::Session {
                 channel,
+                account_id,
                 chat_id,
                 session_key,
             } => Some(MainSessionTarget {
                 channel: channel.clone(),
-                account_id: None,
+                account_id: account_id.clone(),
                 chat_id: chat_id.clone(),
                 session_key: session_key.clone(),
                 agent_id: self.agent_id.clone(),
@@ -557,12 +558,15 @@ impl AgentRuntime {
         }
     }
 
-    pub(crate) async fn dispatch_system_event_notification(&self, request: &NotificationRequest) {
+    pub(crate) async fn dispatch_system_event_notification(
+        &self,
+        request: &NotificationRequest,
+    ) -> bool {
         let target = self.resolve_event_delivery_target(&request.scope);
         let target_channel = target.as_ref().map(|value| value.channel.clone());
         let target_chat_id = target.as_ref().map(|value| value.chat_id.clone());
 
-        if let Some(ref event_tx) = self.event_tx {
+        let event_sent = if let Some(ref event_tx) = self.event_tx {
             let event = serde_json::json!({
                 "type": "system_event_notification",
                 "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
@@ -573,12 +577,14 @@ impl AgentRuntime {
                 "channel": target_channel,
                 "chat_id": target_chat_id,
             });
-            let _ = event_tx.send(event.to_string());
-        }
+            event_tx.send(event.to_string()).is_ok()
+        } else {
+            false
+        };
 
         if let Some(target) = target {
             if target.channel == "ws" {
-                return;
+                return event_sent;
             }
             if let Some(tx) = &self.outbound_tx {
                 let mut outbound = OutboundMessage::new(
@@ -587,17 +593,41 @@ impl AgentRuntime {
                     &render_system_notification_text(request),
                 );
                 outbound.account_id = target.account_id.clone();
-                let _ = tx.send(outbound).await;
+                return tx.send(outbound).await.is_ok();
             }
         }
+        false
     }
 
-    pub(crate) async fn dispatch_system_event_summary(&self, summary: &SessionSummary) {
-        let target = self.main_session_target.clone();
+    pub(crate) async fn dispatch_system_event_summary(&self, summary: &SessionSummary) -> bool {
+        let target = match summary.items.first().map(|item| &item.scope) {
+            Some(blockcell_core::system_event::SummaryScope::Channel { channel, chat_id }) => {
+                Some(MainSessionTarget {
+                    channel: channel.clone(),
+                    account_id: None,
+                    chat_id: chat_id.clone(),
+                    session_key: format!("{}:{}", channel, chat_id),
+                    agent_id: self.agent_id.clone(),
+                })
+            }
+            Some(blockcell_core::system_event::SummaryScope::Session {
+                channel,
+                account_id,
+                chat_id,
+                session_key,
+            }) => Some(MainSessionTarget {
+                channel: channel.clone(),
+                account_id: account_id.clone(),
+                chat_id: chat_id.clone(),
+                session_key: session_key.clone(),
+                agent_id: self.agent_id.clone(),
+            }),
+            _ => self.main_session_target.clone(),
+        };
         let target_channel = target.as_ref().map(|value| value.channel.clone());
         let target_chat_id = target.as_ref().map(|value| value.chat_id.clone());
 
-        if let Some(ref event_tx) = self.event_tx {
+        let event_sent = if let Some(ref event_tx) = self.event_tx {
             let event = serde_json::json!({
                 "type": "system_event_summary",
                 "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
@@ -607,12 +637,14 @@ impl AgentRuntime {
                 "compact_text": summary.compact_text.clone(),
                 "items": summary.items.clone(),
             });
-            let _ = event_tx.send(event.to_string());
-        }
+            event_tx.send(event.to_string()).is_ok()
+        } else {
+            false
+        };
 
         if let Some(target) = target {
             if target.channel == "ws" {
-                return;
+                return event_sent;
             }
             if let Some(tx) = &self.outbound_tx {
                 let mut outbound = OutboundMessage::new(
@@ -621,20 +653,42 @@ impl AgentRuntime {
                     &render_session_summary_text(summary),
                 );
                 outbound.account_id = target.account_id.clone();
-                let _ = tx.send(outbound).await;
+                return tx.send(outbound).await.is_ok();
             }
         }
+        false
     }
 
     pub(crate) async fn process_system_event_tick(&self, now_ms: i64) -> HeartbeatDecision {
         let decision = self.system_event_orchestrator.process_tick(now_ms);
+        let mut delivered_event_ids = decision.ack_event_ids.clone();
 
         for request in &decision.immediate_notifications {
-            self.dispatch_system_event_notification(request).await;
+            if self.dispatch_system_event_notification(request).await {
+                delivered_event_ids.push(request.event_id.clone());
+            }
         }
 
         for summary in &decision.flushed_summaries {
-            self.dispatch_system_event_summary(summary).await;
+            if self.dispatch_system_event_summary(summary).await {
+                delivered_event_ids.extend(
+                    summary
+                        .items
+                        .iter()
+                        .flat_map(|item| item.source_event_ids.iter().cloned()),
+                );
+                let item_ids: Vec<String> =
+                    summary.items.iter().map(|item| item.id.clone()).collect();
+                self.system_event_orchestrator
+                    .queue()
+                    .acknowledge_items(&item_ids);
+            }
+        }
+
+        if !delivered_event_ids.is_empty() {
+            delivered_event_ids.sort();
+            delivered_event_ids.dedup();
+            self.system_event_store.mark_delivered(&delivered_event_ids);
         }
 
         let _ = self.system_event_store.cleanup_expired(7 * 24 * 60 * 60);
