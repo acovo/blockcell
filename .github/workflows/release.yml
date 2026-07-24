@@ -1,8 +1,5 @@
 name: Build & Release
 
-permissions:
-  contents: write
-
 on:
   push:
     tags:
@@ -19,7 +16,88 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      workspace_version: ${{ steps.version.outputs.workspace_version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          release_tag="$REQUESTED_VERSION"
+          [[ "$release_tag" == v* ]] || release_tag="v$release_tag"
+
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $release_tag" >&2
+            exit 1
+          fi
+
+          workspace_version=$(awk '
+            /^\[workspace.package\]$/ { section = 1; next }
+            /^\[/ { section = 0 }
+            section && /^version[[:space:]]*=/ {
+              value = $0
+              sub(/^[^"]*"/, "", value)
+              sub(/".*$/, "", value)
+              print value
+              exit
+            }
+          ' Cargo.toml)
+
+          if [[ -z "$workspace_version" ]]; then
+            echo "Unable to read [workspace.package] version from Cargo.toml" >&2
+            exit 1
+          fi
+          release_version="${release_tag#v}"
+          if [[ "$release_version" != "$workspace_version" ]]; then
+            echo "Release version $release_version does not match Cargo workspace version $workspace_version" >&2
+            exit 1
+          fi
+
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "workspace_version=$workspace_version" >> "$GITHUB_OUTPUT"
+
+  webui:
+    needs: prepare
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Test and build WebUI
+        working-directory: webui
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Upload WebUI build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: webui-dist
+          path: webui/dist
+          if-no-files-found: error
+
   build:
+    needs: [prepare, webui]
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -65,20 +143,28 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      # The Rust binary embeds webui/dist. Use the tested build produced from the
+      # same release commit instead of trusting committed build output.
+      - name: Download WebUI build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: webui-dist
+          path: webui/dist
 
       # ── Rust toolchain ────────────────────────────────────────────────────
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.target }}
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           key: ${{ matrix.target }}
 
@@ -126,27 +212,16 @@ jobs:
             export OPENSSL_VENDORED=1
             export OPENSSL_STATIC=1
           fi
-          cargo build --release --target ${{ matrix.target }} --bin blockcell
+          cargo build --release --locked --target ${{ matrix.target }} --bin blockcell
 
       # ── Package ───────────────────────────────────────────────────────────
-      - name: Determine version string
-        id: ver
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            v="${{ inputs.version }}"
-            [[ "$v" == v* ]] || v="v$v"
-            echo "version=$v" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Package (Unix — tar.gz)
         if: matrix.archive_ext == 'tar.gz'
         shell: bash
         run: |
           BIN="target/${{ matrix.target }}/release/${{ matrix.binary }}"
-          PKG="blockcell-${{ steps.ver.outputs.version }}-${{ matrix.platform }}-${{ matrix.arch }}"
+          PKG="blockcell-${{ needs.prepare.outputs.release_tag }}-${{ matrix.platform }}-${{ matrix.arch }}"
           mkdir -p "dist/$PKG"
           cp "$BIN" "dist/$PKG/"
           cp README.md LICENSE 2>/dev/null || true
@@ -161,7 +236,7 @@ jobs:
         shell: pwsh
         run: |
           $BIN  = "target\${{ matrix.target }}\release\${{ matrix.binary }}"
-          $PKG  = "blockcell-${{ steps.ver.outputs.version }}-${{ matrix.platform }}-${{ matrix.arch }}"
+          $PKG  = "blockcell-${{ needs.prepare.outputs.release_tag }}-${{ matrix.platform }}-${{ matrix.arch }}"
           New-Item -ItemType Directory -Force -Path "dist\$PKG" | Out-Null
           Copy-Item $BIN "dist\$PKG\"
           if (Test-Path README.md) { Copy-Item README.md "dist\$PKG\" }
@@ -189,11 +264,11 @@ jobs:
         shell: bash
         run: |
           BIN="target/${{ matrix.target }}/release/${{ matrix.binary }}"
-          UPDATER="blockcell-${{ steps.ver.outputs.version }}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.updater_ext }}"
+          UPDATER="blockcell-${{ needs.prepare.outputs.release_tag }}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.updater_ext }}"
           cp "$BIN" "dist/$UPDATER"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: blockcell-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
@@ -202,49 +277,54 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [prepare, build]
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-
-      - name: Determine release tag
-        id: reltag
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            v="${{ inputs.version }}"
-            [[ "$v" == v* ]] || v="v$v"
-            echo "tag=$v" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Create and push tag (workflow_dispatch only)
         if: github.event_name == 'workflow_dispatch'
         shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
-          TAG="${{ steps.reltag.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          current_commit=$(git rev-parse HEAD)
 
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists locally, skipping."
-          else
-            git tag -a "$TAG" -m "Release $TAG"
+          remote_refs=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          remote_commit=$(printf '%s\n' "$remote_refs" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')
+          if [[ -z "$remote_commit" ]]; then
+            remote_commit=$(printf '%s\n' "$remote_refs" | awk '{ print $1; exit }')
           fi
 
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists on origin, skipping push."
+          if [[ -n "$remote_commit" ]]; then
+            if [[ "$remote_commit" != "$current_commit" ]]; then
+              echo "Tag $TAG points to a different commit ($remote_commit instead of $current_commit)" >&2
+              exit 1
+            fi
+            echo "Tag $TAG already exists on origin at the current commit, skipping push."
           else
+            if git rev-parse "$TAG^{}" >/dev/null 2>&1; then
+              local_commit=$(git rev-parse "$TAG^{}")
+              if [[ "$local_commit" != "$current_commit" ]]; then
+                echo "Local tag $TAG points to a different commit ($local_commit instead of $current_commit)" >&2
+                exit 1
+              fi
+            else
+              git tag -a "$TAG" -m "Release $TAG"
+            fi
             git push origin "refs/tags/$TAG"
           fi
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: artifacts/
 
@@ -253,7 +333,7 @@ jobs:
         run: |
           cd artifacts
           find . -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.updater" -o -name "*.exe" \) | sort | while read f; do
-            sha256sum "$f"
+            printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$(basename "$f")"
           done > ../checksums.txt
           cat ../checksums.txt
 
@@ -262,8 +342,8 @@ jobs:
         env:
           UPDATER_PRIVATE_KEY: ${{ secrets.BLOCKCELL_UPDATER_PRIVATE_KEY }}
           UPDATER_PUBLIC_KEY: ${{ vars.BLOCKCELL_UPDATER_PUBLIC_KEY }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
-          TAG="${{ steps.reltag.outputs.tag }}"
           PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           REPO="${{ github.repository }}"
 
@@ -334,12 +414,12 @@ jobs:
           cat manifest.json
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
-          tag_name: ${{ steps.reltag.outputs.tag }}
-          name: "blockcell ${{ steps.reltag.outputs.tag }}"
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: "blockcell ${{ needs.prepare.outputs.release_tag }}"
           draft: false
-          prerelease: ${{ contains(steps.reltag.outputs.tag, '-') }}
+          prerelease: ${{ contains(needs.prepare.outputs.release_tag, '-') }}
           generate_release_notes: true
           files: |
             artifacts/**/*.tar.gz

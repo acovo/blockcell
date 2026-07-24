@@ -18,6 +18,25 @@ require_cmd() {
   fi
 }
 
+install_binary_atomically() {
+  source_path="$1"
+  mkdir -p "$INSTALL_DIR"
+
+  temporary_path=$(mktemp "$INSTALL_DIR/.$BIN_NAME.tmp.XXXXXX")
+  if ! cp "$source_path" "$temporary_path"; then
+    rm -f "$temporary_path"
+    return 1
+  fi
+  if ! chmod +x "$temporary_path"; then
+    rm -f "$temporary_path"
+    return 1
+  fi
+  if ! mv -f "$temporary_path" "$INSTALL_DIR/$BIN_NAME"; then
+    rm -f "$temporary_path"
+    return 1
+  fi
+}
+
 detect_os() {
   uname -s | tr '[:upper:]' '[:lower:]'
 }
@@ -97,7 +116,11 @@ install_from_source() {
   trap cleanup EXIT
 
   echo "Cloning https://github.com/$REPO ..."
-  git clone --depth 1 "https://github.com/$REPO.git" "$TMP_DIR/blockcell"
+  if [ "$VERSION" = "latest" ]; then
+    git clone --depth 1 "https://github.com/$REPO.git" "$TMP_DIR/blockcell"
+  else
+    git clone --depth 1 --branch "$VERSION" "https://github.com/$REPO.git" "$TMP_DIR/blockcell"
+  fi
 
   echo "Building (release)..."
   os=$(detect_os)
@@ -120,9 +143,76 @@ install_from_source() {
   echo "Building with $build_jobs parallel job(s)..."
   (cd "$TMP_DIR/blockcell" && cargo build --release -j "$build_jobs")
 
-  mkdir -p "$INSTALL_DIR"
-  cp "$TMP_DIR/blockcell/target/release/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
-  chmod +x "$INSTALL_DIR/$BIN_NAME" || true
+  install_binary_atomically "$TMP_DIR/blockcell/target/release/$BIN_NAME"
+}
+
+sha256_file() {
+  file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    echo "Error: sha256sum or shasum is required to verify release assets" 1>&2
+    return 1
+  fi
+}
+
+verify_release_checksum() {
+  archive="$1"
+  asset="$2"
+  checksums="$3"
+
+  expected=$(awk -v asset="$asset" '
+    {
+      name = $2
+      sub(/^\*/, "", name)
+      count = split(name, parts, "/")
+      if (parts[count] == asset) {
+        print $1
+        exit
+      }
+    }
+  ' "$checksums")
+
+  if ! printf '%s\n' "$expected" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+    echo "No valid SHA-256 checksum found for release asset: $asset" 1>&2
+    return 1
+  fi
+
+  actual=$(sha256_file "$archive")
+  expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+  actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+  if [ "$actual" != "$expected" ]; then
+    echo "SHA-256 checksum mismatch for release asset: $asset" 1>&2
+    return 1
+  fi
+}
+
+validate_release_archive() {
+  archive="$1"
+
+  if ! entries=$(tar -tzf "$archive"); then
+    echo "Failed to inspect release archive" 1>&2
+    return 1
+  fi
+
+  while IFS= read -r entry; do
+    normalized=${entry#./}
+    case "$normalized" in
+      /*|..|../*|*/..|*/../*)
+        echo "Unsafe path in release archive: $entry" 1>&2
+        return 1
+        ;;
+    esac
+  done <<EOF
+$entries
+EOF
+
+  if tar -tvzf "$archive" | grep -Eq '^[[:space:]]*[lh]'; then
+    echo "Release archive contains unsupported links" 1>&2
+    return 1
+  fi
 }
 
 install_from_release() {
@@ -165,6 +255,15 @@ install_from_release() {
     return 1
   fi
 
+  checksums_url="${url%/*}/checksums.txt"
+  echo "Downloading release checksums: $checksums_url"
+  if ! curl -fsSL "$checksums_url" -o "$TMP_DIR/checksums.txt"; then
+    echo "Failed to download release checksums" 1>&2
+    return 1
+  fi
+  verify_release_checksum "$TMP_DIR/$asset" "$asset" "$TMP_DIR/checksums.txt"
+  validate_release_archive "$TMP_DIR/$asset"
+
   echo "Extracting..."
   tar -xzf "$TMP_DIR/$asset" -C "$TMP_DIR"
 
@@ -174,7 +273,7 @@ install_from_release() {
       "$TMP_DIR"/*/bin/"$BIN_NAME" \
       "$TMP_DIR"/bin/"$BIN_NAME" \
       "$TMP_DIR"/"$BIN_NAME"; do
-      if [ -f "$candidate" ]; then
+      if [ -f "$candidate" ] && [ ! -L "$candidate" ]; then
         cp "$candidate" "$TMP_DIR/$BIN_NAME"
         break
       fi
@@ -186,9 +285,12 @@ install_from_release() {
     return 1
   fi
 
-  mkdir -p "$INSTALL_DIR"
-  cp "$TMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
-  chmod +x "$INSTALL_DIR/$BIN_NAME" || true
+  if [ -L "$TMP_DIR/$BIN_NAME" ]; then
+    echo "Release binary must not be a symbolic link" 1>&2
+    return 1
+  fi
+
+  install_binary_atomically "$TMP_DIR/$BIN_NAME"
 }
 
 echo "Installing $BIN_NAME..."
