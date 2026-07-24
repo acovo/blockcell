@@ -214,15 +214,18 @@ struct GatewayState {
     task_manager: TaskManager,
     checkpoint_manager: CheckpointManager,
     config: Config,
+    /// Serializes all config.json5 read/modify/write transactions.
+    config_write_lock: Arc<Mutex<()>>,
     paths: Paths,
     api_token: Option<String>,
     /// Broadcast channel for streaming events to WebSocket clients
     ws_broadcast: broadcast::Sender<String>,
     /// Pending path-confirmation requests waiting for WebUI user response (keyed by request_id)
     pending_confirms: Arc<Mutex<HashMap<String, PendingWsConfirm>>>,
-    /// Pending path-confirmation requests waiting for non-ws channel user reply (keyed by "channel:chat_id")
+    /// Pending path-confirmation requests waiting for a matching non-ws sender reply.
     #[allow(dead_code)]
-    pending_channel_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+    pending_channel_confirms:
+        Arc<Mutex<HashMap<PendingChannelConfirmScope, PendingChannelConfirm>>>,
     /// Default agent memory store handle
     memory_store: Option<MemoryStoreHandle>,
     /// Agent-scoped memory store handles
@@ -255,6 +258,37 @@ struct PendingWsConfirmScope {
 struct PendingWsConfirm {
     scope: PendingWsConfirmScope,
     response_tx: tokio::sync::oneshot::Sender<bool>,
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct PendingChannelConfirmScope {
+    channel: String,
+    account_id: Option<String>,
+    chat_id: String,
+    sender_id: String,
+}
+
+impl PendingChannelConfirmScope {
+    fn new(channel: &str, account_id: Option<&str>, chat_id: &str, sender_id: &str) -> Self {
+        Self {
+            channel: channel.to_string(),
+            account_id: account_id.map(str::to_string),
+            chat_id: chat_id.to_string(),
+            sender_id: sender_id.to_string(),
+        }
+    }
+}
+
+struct PendingChannelConfirm {
+    request_id: String,
+    response_tx: tokio::sync::oneshot::Sender<bool>,
+}
+
+fn is_channel_confirm_approved(text: &str) -> bool {
+    matches!(
+        text.trim().to_lowercase().as_str(),
+        "y" | "yes" | "允许" | "确认" | "同意" | "ok"
+    )
 }
 
 #[derive(Deserialize, Default)]
@@ -588,6 +622,46 @@ enum GatewayShutdownCause {
     ServerFailure(String),
 }
 
+fn report_critical_task_exit(
+    failure_tx: &mpsc::UnboundedSender<String>,
+    shutting_down: &std::sync::atomic::AtomicBool,
+    task_name: &str,
+    error: Option<String>,
+) {
+    use std::sync::atomic::Ordering;
+
+    if shutting_down.load(Ordering::Acquire) {
+        return;
+    }
+    let message = match error {
+        Some(error) => format!("Critical task '{task_name}' failed: {error}"),
+        None => format!("Critical task '{task_name}' stopped unexpectedly"),
+    };
+    error!(task = %task_name, message = %message);
+    let _ = failure_tx.send(message);
+}
+
+fn supervise_critical_tasks(
+    handles: Vec<(String, tokio::task::JoinHandle<()>)>,
+    failure_tx: &mpsc::UnboundedSender<String>,
+    shutting_down: &Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<(String, tokio::task::JoinHandle<()>)> {
+    handles
+        .into_iter()
+        .map(|(name, handle)| {
+            let monitor_name = name.clone();
+            let task_name = name.clone();
+            let failure_tx = failure_tx.clone();
+            let shutting_down = Arc::clone(shutting_down);
+            let monitor = tokio::spawn(async move {
+                let error = handle.await.err().map(|error| error.to_string());
+                report_critical_task_exit(&failure_tx, &shutting_down, &task_name, error);
+            });
+            (monitor_name, monitor)
+        })
+        .collect()
+}
+
 async fn wait_for_gateway_shutdown(
     mut server_failure_rx: mpsc::UnboundedReceiver<String>,
 ) -> anyhow::Result<GatewayShutdownCause> {
@@ -733,6 +807,9 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     validate_channel_owner_bindings(&config)?;
 
     info!(host = %host, port = port, "Starting blockcell gateway");
+
+    let (server_failure_tx, server_failure_rx) = mpsc::unbounded_channel::<String>();
+    let shutdown_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // ── Create message bus ──
     let bus = MessageBus::new(100);
@@ -954,9 +1031,10 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     // pending_ws_confirms: keyed by request_id, for WebUI (ws) confirmations
     let pending_ws_confirms: Arc<Mutex<HashMap<String, PendingWsConfirm>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    // pending_channel_confirms: keyed by "channel:chat_id", for non-ws channel confirmations
-    let pending_channel_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // Non-ws confirmations are scoped to one channel account, chat, and sender.
+    let pending_channel_confirms: Arc<
+        Mutex<HashMap<PendingChannelConfirmScope, PendingChannelConfirm>>,
+    > = Arc::new(Mutex::new(HashMap::new()));
     let (confirm_tx, mut confirm_rx) = mpsc::channel::<ConfirmRequest>(16);
 
     // Clone outbound_tx before it is moved into runtime tasks, so the confirm
@@ -1021,28 +1099,54 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                 event["ws_connection_id"] = serde_json::json!(ws_connection_id);
                 let _ = ws_broadcast_for_confirm.send(event.to_string());
             } else {
-                let confirm_key = format!("{}:{}", req.channel, req.chat_id);
+                let confirm_scope = PendingChannelConfirmScope::new(
+                    &req.channel,
+                    req.account_id.as_deref(),
+                    &req.chat_id,
+                    &req.sender_id,
+                );
+                let request_id = new_confirm_request_id();
                 {
                     let mut map = pending_ch_for_handler.lock().await;
-                    map.insert(confirm_key.clone(), req.response_tx);
+                    if map.contains_key(&confirm_scope) {
+                        warn!(
+                            ?confirm_scope,
+                            "Rejecting overlapping channel confirmation request"
+                        );
+                        let _ = req.response_tx.send(false);
+                        continue;
+                    }
+                    map.insert(
+                        confirm_scope.clone(),
+                        PendingChannelConfirm {
+                            request_id: request_id.clone(),
+                            response_tx: req.response_tx,
+                        },
+                    );
                 }
                 let prompt = format!(
                     "⚠️ 工具 {} 需要访问以下路径：
 {}
 
+确认编号：{}
 回复 yes / y / 允许 / 同意 进行确认，其他任意内容将拒绝。",
                     req.tool_name,
-                    req.paths.join("\n")
+                    req.paths.join("\n"),
+                    request_id,
                 );
                 let mut outbound = OutboundMessage::new(&req.channel, &req.chat_id, &prompt);
-                outbound.metadata = serde_json::json!({"confirm_request": true});
+                outbound.account_id = req.account_id;
+                outbound.metadata = serde_json::json!({
+                    "confirm_request": true,
+                    "confirm_request_id": request_id,
+                });
                 if outbound_tx_for_confirm.send(outbound).await.is_err() {
                     let mut map = pending_ch_for_handler.lock().await;
-                    if let Some(tx) = map.remove(&confirm_key) {
-                        let _ = tx.send(false);
+                    if let Some(pending) = map.remove(&confirm_scope) {
+                        let _ = pending.response_tx.send(false);
                     }
                 } else {
-                    info!(confirm_key = %confirm_key, tool = %req.tool_name, "Sent confirm_request to channel");
+                    info!(?confirm_scope, %request_id, tool = %req.tool_name, "Sent confirm_request to channel");
                 }
             }
         }
@@ -1230,27 +1334,27 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             };
             // Check if this message is a reply to a pending channel confirm
             if !is_internal_channel(&msg.channel) {
-                let confirm_key = format!("{}:{}", msg.channel, msg.chat_id);
-                let maybe_tx = {
+                let confirm_scope = PendingChannelConfirmScope::new(
+                    &msg.channel,
+                    msg.account_id.as_deref(),
+                    &msg.chat_id,
+                    &msg.sender_id,
+                );
+                let maybe_pending = {
                     let mut map = pending_ch_for_interceptor.lock().await;
-                    map.remove(&confirm_key)
+                    map.remove(&confirm_scope)
                 };
-                if let Some(tx) = maybe_tx {
+                if let Some(pending) = maybe_pending {
                     // Parse the reply as a confirm response
-                    let text = msg.content.trim().to_lowercase();
-                    let approved = text == "y"
-                        || text == "yes"
-                        || text.contains("允许")
-                        || text.contains("确认")
-                        || text.contains("同意")
-                        || text.contains("ok");
+                    let approved = is_channel_confirm_approved(&msg.content);
                     info!(
-                        confirm_key = %confirm_key,
+                        ?confirm_scope,
+                        request_id = %pending.request_id,
                         approved = approved,
                         reply = %msg.content.trim(),
                         "Channel confirm reply intercepted"
                     );
-                    let _ = tx.send(approved);
+                    let _ = pending.response_tx.send(approved);
                     continue; // Don't forward this message to the runtime
                 }
             }
@@ -1577,6 +1681,12 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         ));
     }
 
+    runtime_handles =
+        supervise_critical_tasks(runtime_handles, &server_failure_tx, &shutdown_started);
+    cron_handles = supervise_critical_tasks(cron_handles, &server_failure_tx, &shutdown_started);
+    channel_handles =
+        supervise_critical_tasks(channel_handles, &server_failure_tx, &shutdown_started);
+
     // ── Build HTTP/WebSocket server ──
     // Guarantee api_token is Some and non-empty — defensive fallback in case auto-gen above
     // somehow produced None or empty (e.g. env var was whitespace-only).
@@ -1627,6 +1737,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         task_manager,
         checkpoint_manager: CheckpointManager::new(&paths.workspace()),
         config: config.clone(),
+        config_write_lock: Arc::new(Mutex::new(())),
         paths: paths.clone(),
         api_token: api_token.clone(),
         ws_broadcast: ws_broadcast_tx.clone(),
@@ -1802,7 +1913,6 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
     let http_shutdown_rx = shutdown_tx.subscribe();
-    let (server_failure_tx, server_failure_rx) = mpsc::unbounded_channel::<String>();
     let http_failure_tx = server_failure_tx.clone();
     let http_handle = tokio::spawn(async move {
         let result = axum::serve(
@@ -1884,6 +1994,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         }
     };
 
+    shutdown_started.store(true, std::sync::atomic::Ordering::Release);
     let _ = shutdown_tx.send(());
     drop(confirm_tx);
     drop(inbound_tx);
@@ -1980,6 +2091,44 @@ mod tests {
         assert!(first["confirm_".len()..]
             .chars()
             .all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn channel_confirmation_requires_an_exact_affirmative_reply() {
+        for approved in ["y", "Y", "yes", " YES ", "允许", "确认", "同意", "ok"] {
+            assert!(
+                is_channel_confirm_approved(approved),
+                "expected approval: {approved}"
+            );
+        }
+
+        for rejected in [
+            "n",
+            "no",
+            "不允许",
+            "不同意",
+            "不确认",
+            "not ok",
+            "okay",
+            "yes please",
+        ] {
+            assert!(
+                !is_channel_confirm_approved(rejected),
+                "expected rejection: {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_confirmation_scope_includes_account_and_sender() {
+        let base = PendingChannelConfirmScope::new("telegram", Some("bot-a"), "chat-1", "user-1");
+        let other_account =
+            PendingChannelConfirmScope::new("telegram", Some("bot-b"), "chat-1", "user-1");
+        let other_sender =
+            PendingChannelConfirmScope::new("telegram", Some("bot-a"), "chat-1", "user-2");
+
+        assert_ne!(base, other_account);
+        assert_ne!(base, other_sender);
     }
 
     #[test]
@@ -2336,5 +2485,28 @@ mod tests {
             cause,
             GatewayShutdownCause::ServerFailure("http server failed: test error".to_string())
         );
+    }
+
+    #[test]
+    fn unexpected_critical_task_exit_is_reported() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+        report_critical_task_exit(&tx, &shutting_down, "runtime:default", None);
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            "Critical task 'runtime:default' stopped unexpectedly"
+        );
+    }
+
+    #[test]
+    fn critical_task_exit_during_shutdown_is_not_reported() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutting_down = std::sync::atomic::AtomicBool::new(true);
+
+        report_critical_task_exit(&tx, &shutting_down, "cron:default", None);
+
+        assert!(rx.try_recv().is_err());
     }
 }

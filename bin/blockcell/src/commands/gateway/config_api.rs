@@ -55,6 +55,7 @@ pub(super) async fn handle_config_update(
     State(state): State<GatewayState>,
     Json(req): Json<ConfigUpdateRequest>,
 ) -> impl IntoResponse {
+    let _config_guard = state.config_write_lock.lock().await;
     let config_path = state.paths.config_file();
 
     match serde_json::from_value::<Config>(req.config) {
@@ -75,6 +76,7 @@ pub(super) async fn handle_config_raw_put(
     State(state): State<GatewayState>,
     Json(req): Json<ConfigRawUpdateRequest>,
 ) -> impl IntoResponse {
+    let _config_guard = state.config_write_lock.lock().await;
     let config_path = state.paths.config_file();
     match blockcell_core::config::write_raw_validated_config_json5(&config_path, &req.content) {
         Ok(_) => Json(serde_json::json!({
@@ -220,6 +222,7 @@ pub(super) async fn handle_ghost_config_update(
     State(state): State<GatewayState>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let _config_guard = state.config_write_lock.lock().await;
     let config_path = state.paths.config_file();
     let mut config = load_config_or_state(&state);
 

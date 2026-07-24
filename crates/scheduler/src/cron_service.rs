@@ -1,5 +1,8 @@
 use crate::job::{CronJob, JobStatus, ScheduleKind};
 use blockcell_core::file_store::{atomic_write, ExclusiveFileLock};
+use blockcell_core::message_receipt::{
+    cancel_message_receipt, register_message_receipt, MESSAGE_RECEIPT_ID,
+};
 use blockcell_core::system_event::{DeliveryPolicy, EventPriority, SystemEvent};
 use blockcell_core::{InboundMessage, Paths, Result};
 use blockcell_tools::EventEmitterHandle;
@@ -9,6 +12,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info};
+
+#[cfg(not(test))]
+const CRON_EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+#[cfg(test)]
+const CRON_EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JobStore {
@@ -656,6 +664,13 @@ impl CronService {
 
         let mut metadata = metadata;
         apply_route_agent_id(&mut metadata, agent_id.as_deref());
+        let (receipt_id, receipt_rx) = register_message_receipt();
+        if let Some(metadata) = metadata.as_object_mut() {
+            metadata.insert(
+                MESSAGE_RECEIPT_ID.to_string(),
+                serde_json::Value::String(receipt_id.clone()),
+            );
+        }
 
         let msg = InboundMessage {
             channel: msg_channel,
@@ -669,6 +684,7 @@ impl CronService {
         };
 
         if let Err(e) = inbound_tx.send(msg).await {
+            cancel_message_receipt(&receipt_id);
             error!(error = %e, "Failed to send cron job message");
 
             // Emit failure event
@@ -688,25 +704,59 @@ impl CronService {
                 });
                 emitter.emit(event);
             }
-            Err(e.to_string())
-        } else {
-            // Emit completion event
-            if let Some(emitter) = event_emitter.lock().ok().and_then(|e| e.clone()) {
-                let mut event = SystemEvent::new_main_session(
-                    "cron.job_completed",
-                    "cron",
-                    EventPriority::Normal,
-                    "定时任务已派发",
-                    format!("定时任务 {} 已成功派发", job.name),
-                );
-                event.delivery = DeliveryPolicy::default();
-                event.details = serde_json::json!({
-                    "job_id": job.id.clone(),
-                    "job_name": job.name.clone(),
-                });
-                emitter.emit(event);
+            return Err(e.to_string());
+        }
+
+        let completion = match tokio::time::timeout(CRON_EXECUTION_TIMEOUT, receipt_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("agent runtime dropped the cron completion receipt".to_string()),
+            Err(_) => {
+                cancel_message_receipt(&receipt_id);
+                Err(format!(
+                    "agent runtime did not complete cron job within {} seconds",
+                    CRON_EXECUTION_TIMEOUT.as_secs_f64()
+                ))
             }
-            Ok(())
+        };
+
+        match completion {
+            Ok(()) => {
+                if let Some(emitter) = event_emitter.lock().ok().and_then(|e| e.clone()) {
+                    let mut event = SystemEvent::new_main_session(
+                        "cron.job_completed",
+                        "cron",
+                        EventPriority::Normal,
+                        "定时任务执行完成",
+                        format!("定时任务 {} 已执行完成", job.name),
+                    );
+                    event.delivery = DeliveryPolicy::default();
+                    event.details = serde_json::json!({
+                        "job_id": job.id.clone(),
+                        "job_name": job.name.clone(),
+                    });
+                    emitter.emit(event);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(emitter) = event_emitter.lock().ok().and_then(|e| e.clone()) {
+                    let mut event = SystemEvent::new_main_session(
+                        "cron.job_failed",
+                        "cron",
+                        EventPriority::Critical,
+                        "定时任务执行失败",
+                        format!("定时任务 {} 执行失败：{}", job.name, error),
+                    );
+                    event.delivery = DeliveryPolicy::critical();
+                    event.details = serde_json::json!({
+                        "job_id": job.id.clone(),
+                        "job_name": job.name.clone(),
+                        "error": error.clone(),
+                    });
+                    emitter.emit(event);
+                }
+                Err(error)
+            }
         }
     }
 
@@ -955,6 +1005,15 @@ mod tests {
         }
     }
 
+    fn complete_cron_message(message: &InboundMessage, result: std::result::Result<(), String>) {
+        let receipt_id = message.metadata[MESSAGE_RECEIPT_ID]
+            .as_str()
+            .expect("cron completion receipt id");
+        assert!(blockcell_core::message_receipt::complete_message_receipt(
+            receipt_id, result
+        ));
+    }
+
     #[test]
     fn test_apply_route_agent_id_inserts_metadata() {
         let mut metadata = serde_json::json!({"job_id":"1"});
@@ -982,9 +1041,14 @@ mod tests {
         let emitter = RecordingEmitter::default();
         service.set_event_emitter(emitter.handle());
 
-        service.execute_job(&test_job()).await;
-
-        let message = rx.recv().await.expect("receive cron inbound message");
+        let job = test_job();
+        let execution = service.execute_job(&job);
+        let receive = async {
+            let message = rx.recv().await.expect("receive cron inbound message");
+            complete_cron_message(&message, Ok(()));
+            message
+        };
+        let (_, message) = tokio::join!(execution, receive);
         assert_eq!(message.sender_id, "cron");
         assert_eq!(
             emitter.kinds(),
@@ -993,6 +1057,31 @@ mod tests {
                 "cron.job_completed".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_cron_job_waits_for_runtime_completion_receipt() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let job = test_job();
+        let event_emitter = Arc::new(StdMutex::new(None));
+        let execution = tokio::spawn(async move {
+            CronService::execute_job_internal(&job, tx, event_emitter, None).await
+        });
+
+        let message = rx.recv().await.expect("receive cron message");
+        assert!(
+            !execution.is_finished(),
+            "enqueue alone must not complete the job"
+        );
+        let receipt_id = message.metadata[blockcell_core::message_receipt::MESSAGE_RECEIPT_ID]
+            .as_str()
+            .expect("completion receipt id");
+        assert!(blockcell_core::message_receipt::complete_message_receipt(
+            receipt_id,
+            Ok(())
+        ));
+
+        assert!(execution.await.unwrap().is_ok());
     }
 
     #[tokio::test]
@@ -1029,9 +1118,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let service = CronService::new(paths, tx);
 
-        service.execute_job(&test_agent_job()).await;
-
-        let message = rx.recv().await.expect("receive cron inbound message");
+        let job = test_agent_job();
+        let execution = service.execute_job(&job);
+        let receive = async {
+            let message = rx.recv().await.expect("receive cron inbound message");
+            complete_cron_message(&message, Ok(()));
+            message
+        };
+        let (_, message) = tokio::join!(execution, receive);
         assert_eq!(message.channel, "cron");
         assert_eq!(message.content, "请搜索美国伊朗最新新闻并整理摘要");
         assert_eq!(
@@ -1062,12 +1156,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let service = CronService::new(paths, tx);
 
-        service.run_tick().await.expect("run tick");
-
-        let message = tokio::time::timeout(tokio::time::Duration::from_millis(200), rx.recv())
-            .await
-            .expect("cron message should be sent")
-            .expect("receive cron inbound message");
+        let tick = service.run_tick();
+        let receive = async {
+            let message = rx.recv().await.expect("receive cron inbound message");
+            complete_cron_message(&message, Ok(()));
+            message
+        };
+        let (tick_result, message) = tokio::join!(tick, receive);
+        tick_result.expect("run tick");
         assert_eq!(message.content, "time to sleep");
         assert_eq!(
             message.metadata.get("reminder").and_then(|v| v.as_bool()),
@@ -1095,11 +1191,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let service = CronService::new(paths.clone(), tx);
 
-        service.run_tick().await.expect("run first tick");
-        let first = tokio::time::timeout(tokio::time::Duration::from_millis(200), rx.recv())
-            .await
-            .expect("first cron message should be sent")
-            .expect("receive first cron inbound message");
+        let first_tick = service.run_tick();
+        let receive = async {
+            let message = rx.recv().await.expect("receive first cron inbound message");
+            complete_cron_message(&message, Ok(()));
+            message
+        };
+        let (first_result, first) = tokio::join!(first_tick, receive);
+        first_result.expect("run first tick");
         assert_eq!(first.content, "time to sleep");
 
         service.run_tick().await.expect("run second tick");
@@ -1120,7 +1219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_failed_due_at_delivery_remains_retryable_and_records_error() {
+    async fn test_failed_due_at_runtime_execution_remains_retryable_and_records_error() {
         let paths = Paths::with_base(
             std::env::temp_dir().join(format!("blockcell-cron-service-{}", uuid::Uuid::new_v4())),
         );
@@ -1137,11 +1236,16 @@ mod tests {
         )
         .await
         .expect("write cron store");
-        let (tx, rx) = mpsc::channel(1);
-        drop(rx);
+        let (tx, mut rx) = mpsc::channel(1);
         let service = CronService::new(paths.clone(), tx);
 
-        service.run_tick().await.expect("run failed delivery tick");
+        let tick = service.run_tick();
+        let fail_runtime = async {
+            let message = rx.recv().await.expect("receive cron message");
+            complete_cron_message(&message, Err("provider failed".to_string()));
+        };
+        let (tick_result, ()) = tokio::join!(tick, fail_runtime);
+        tick_result.expect("run failed runtime tick");
 
         let saved: JobStore = serde_json::from_str(
             &tokio::fs::read_to_string(paths.cron_jobs_file())

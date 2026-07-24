@@ -290,6 +290,8 @@ impl super::AgentRuntime {
                 response_tx,
                 agent_id: self.agent_id.clone(),
                 channel: msg.channel.clone(),
+                account_id: msg.account_id.clone(),
+                sender_id: msg.sender_id.clone(),
                 chat_id: msg.chat_id.clone(),
                 ws_connection_id: msg
                     .metadata
@@ -344,6 +346,8 @@ impl super::AgentRuntime {
                 response_tx,
                 agent_id: self.agent_id.clone(),
                 channel: msg.channel.clone(),
+                account_id: msg.account_id.clone(),
+                sender_id: msg.sender_id.clone(),
                 chat_id: msg.chat_id.clone(),
                 ws_connection_id: msg
                     .metadata

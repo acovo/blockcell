@@ -105,6 +105,11 @@ pub(crate) async fn run_message_task(
         .get("resumed_task_id")
         .and_then(|value| value.as_str())
         .map(str::to_string);
+    let completion_receipt_id = msg
+        .metadata
+        .get(blockcell_core::message_receipt::MESSAGE_RECEIPT_ID)
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
 
     // 发送开始进度
     task_manager
@@ -120,6 +125,12 @@ pub(crate) async fn run_message_task(
     let mut runtime = match AgentRuntime::new(config, paths, provider_pool, tool_registry) {
         Ok(r) => r,
         Err(e) => {
+            if let Some(receipt_id) = completion_receipt_id.as_deref() {
+                blockcell_core::message_receipt::complete_message_receipt(
+                    receipt_id,
+                    Err(e.to_string()),
+                );
+            }
             task_manager.set_failed(&task_id, &format!("{}", e)).await;
             if let Some(tx) = &outbound_tx {
                 let mut outbound =
@@ -185,6 +196,9 @@ pub(crate) async fn run_message_task(
                     warn!(task_id = %resumed_task_id, error = %e, "Failed to mark resumed checkpoint completed");
                 }
             }
+            if let Some(receipt_id) = completion_receipt_id.as_deref() {
+                blockcell_core::message_receipt::complete_message_receipt(receipt_id, Ok(()));
+            }
         }
         Err(e) => {
             let err_msg = format!("{}", e);
@@ -204,6 +218,9 @@ pub(crate) async fn run_message_task(
             }
             // Keep failed tasks briefly for visibility, then let tick cleanup handle them
             task_manager.set_failed(&task_id, &err_msg).await;
+            if let Some(receipt_id) = completion_receipt_id.as_deref() {
+                blockcell_core::message_receipt::complete_message_receipt(receipt_id, Err(err_msg));
+            }
         }
     }
 }

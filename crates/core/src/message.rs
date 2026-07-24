@@ -19,7 +19,16 @@ pub struct InboundMessage {
 
 impl InboundMessage {
     pub fn session_key(&self) -> String {
-        build_session_key(&self.channel, &self.chat_id)
+        let chat_id = match self.account_id.as_deref() {
+            Some(account_id) => format!(
+                "account:{}:{}{}",
+                account_id.len(),
+                account_id,
+                self.chat_id
+            ),
+            None => self.chat_id.clone(),
+        };
+        build_session_key(&self.channel, &chat_id)
     }
 
     pub fn cli(content: &str) -> Self {
@@ -118,7 +127,15 @@ mod tests {
         let json = serde_json::to_string(&inbound).expect("serialize inbound");
         let restored: InboundMessage = serde_json::from_str(&json).expect("deserialize inbound");
         assert_eq!(restored.account_id.as_deref(), Some("default"));
-        assert_eq!(restored.session_key(), "telegram:c1");
+        assert_ne!(restored.session_key(), "telegram:c1");
+
+        let mut other_account = restored.clone();
+        other_account.account_id = Some("secondary".to_string());
+        assert_ne!(restored.session_key(), other_account.session_key());
+
+        let mut legacy = restored.clone();
+        legacy.account_id = None;
+        assert_eq!(legacy.session_key(), "telegram:c1");
 
         let mut outbound = OutboundMessage::new("telegram", "c1", "ok");
         outbound.account_id = Some("default".to_string());

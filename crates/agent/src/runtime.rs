@@ -314,6 +314,10 @@ pub struct ConfirmRequest {
     pub agent_id: Option<String>,
     /// The channel the originating message came from (e.g. "ws", "lark", "telegram").
     pub channel: String,
+    /// Channel account that received the originating message.
+    pub account_id: Option<String>,
+    /// Sender that must answer the confirmation prompt.
+    pub sender_id: String,
     /// The chat_id of the originating message, used to route the confirmation
     /// prompt back to the correct conversation.
     pub chat_id: String,

@@ -1,5 +1,5 @@
 use super::*;
-use blockcell_core::config::{parse_json5_value, write_json5_pretty};
+use blockcell_core::config::{parse_json5_value_preserving_env, write_json5_pretty};
 
 const SUPPORTED_OWNER_CHANNELS: [&str; 11] = [
     "telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "qq",
@@ -13,7 +13,7 @@ fn load_config_or_state(state: &GatewayState) -> Config {
 fn load_config_value_or_state(state: &GatewayState) -> anyhow::Result<serde_json::Value> {
     let config_path = state.paths.config_file();
     match std::fs::read_to_string(&config_path) {
-        Ok(content) => parse_json5_value(&content).map_err(Into::into),
+        Ok(content) => parse_json5_value_preserving_env(&content).map_err(Into::into),
         Err(_) => Ok(serde_json::to_value(&state.config)?),
     }
 }
@@ -341,6 +341,7 @@ pub(super) async fn handle_channel_update(
     AxumPath(channel_id): AxumPath<String>,
     Json(req): Json<ChannelUpdateRequest>,
 ) -> impl IntoResponse {
+    let _config_guard = state.config_write_lock.lock().await;
     let config_path = state.paths.config_file();
     let result: anyhow::Result<serde_json::Value> = async {
         let mut root = load_config_value_or_state(&state)?;
@@ -433,6 +434,7 @@ pub(super) async fn handle_channel_config_update(
     AxumPath(channel): AxumPath<String>,
     Json(req): Json<ChannelConfigUpdateRequest>,
 ) -> impl IntoResponse {
+    let _config_guard = state.config_write_lock.lock().await;
     let result: anyhow::Result<serde_json::Value> = async {
         let mut cfg = load_config_or_state(&state);
         apply_channel_config_update(&mut cfg, &channel, &req)?;
@@ -618,6 +620,7 @@ pub(super) async fn handle_channel_owner_put(
     AxumPath(channel): AxumPath<String>,
     Json(req): Json<ChannelOwnerUpdateRequest>,
 ) -> impl IntoResponse {
+    let _config_guard = state.config_write_lock.lock().await;
     let config_path = state.paths.config_file();
     let result: anyhow::Result<serde_json::Value> = async {
         let mut cfg = load_config_or_state(&state);
@@ -640,6 +643,7 @@ pub(super) async fn handle_channel_account_owner_put(
     AxumPath((channel, account_id)): AxumPath<(String, String)>,
     Json(req): Json<ChannelOwnerUpdateRequest>,
 ) -> impl IntoResponse {
+    let _config_guard = state.config_write_lock.lock().await;
     let config_path = state.paths.config_file();
     let result: anyhow::Result<serde_json::Value> = async {
         let mut cfg = load_config_or_state(&state);
@@ -661,6 +665,7 @@ pub(super) async fn handle_channel_owner_delete(
     State(state): State<GatewayState>,
     AxumPath(channel): AxumPath<String>,
 ) -> impl IntoResponse {
+    let _config_guard = state.config_write_lock.lock().await;
     let config_path = state.paths.config_file();
     let result: anyhow::Result<serde_json::Value> = async {
         let mut cfg = load_config_or_state(&state);
@@ -681,6 +686,7 @@ pub(super) async fn handle_channel_account_owner_delete(
     State(state): State<GatewayState>,
     AxumPath((channel, account_id)): AxumPath<(String, String)>,
 ) -> impl IntoResponse {
+    let _config_guard = state.config_write_lock.lock().await;
     let config_path = state.paths.config_file();
     let result: anyhow::Result<serde_json::Value> = async {
         let mut cfg = load_config_or_state(&state);

@@ -11,6 +11,7 @@ pub mod file_store;
 pub mod logging;
 pub mod mcp_config;
 pub mod message;
+pub mod message_receipt;
 pub mod path_policy;
 pub mod paths;
 pub mod session_key;

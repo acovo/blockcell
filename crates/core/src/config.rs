@@ -332,6 +332,35 @@ pub fn parse_json5_value(content: &str) -> Result<Value> {
     parse_json5_str(content)
 }
 
+/// Parse JSON5 without expanding environment references. This is intended for
+/// read/modify/write operations that must preserve `${NAME}` expressions.
+pub fn parse_json5_value_preserving_env(content: &str) -> Result<Value> {
+    json5::from_str(content).map_err(|e| format_json5_parse_error(None, "JSON5", &e))
+}
+
+fn preserve_unchanged_env_placeholders(previous: &Value, next: &mut Value) {
+    match (previous, next) {
+        (Value::Object(previous), Value::Object(next)) => {
+            for (key, next_value) in next {
+                if let Some(previous_value) = previous.get(key) {
+                    preserve_unchanged_env_placeholders(previous_value, next_value);
+                }
+            }
+        }
+        (Value::Array(previous), Value::Array(next)) => {
+            for (previous_value, next_value) in previous.iter().zip(next.iter_mut()) {
+                preserve_unchanged_env_placeholders(previous_value, next_value);
+            }
+        }
+        (Value::String(previous), Value::String(next))
+            if previous.contains("${") && expand_env_vars_in_text(previous) == *next =>
+        {
+            *next = previous.clone();
+        }
+        _ => {}
+    }
+}
+
 pub fn stringify_json5_pretty<T>(value: &T) -> Result<String>
 where
     T: Serialize,
@@ -399,7 +428,20 @@ fn write_text_atomic_durable(path: &Path, content: &str) -> Result<()> {
     ));
 
     {
-        let mut file = std::fs::File::create(&tmp_path)?;
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
         use std::io::Write;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
@@ -601,7 +643,13 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        write_json5_pretty(path, self)
+        let mut next = serde_json::to_value(self)?;
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Ok(previous) = parse_json5_value_preserving_env(&raw) {
+                preserve_unchanged_env_placeholders(&previous, &mut next);
+            }
+        }
+        write_json5_pretty(path, &next)
     }
 
     pub fn get_api_key(&self) -> Option<(&str, &ProviderConfig)> {
@@ -944,6 +992,60 @@ mod tests {
             loaded.memory.vector.uri.as_deref(),
             Some("./memory/vectors.rabitq")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_config_save_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_config_path("secure-config.json5");
+        fs::write(&path, "{}\n").expect("seed config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("set permissive seed mode");
+
+        Config::default().save(&path).expect("save config");
+
+        let mode = fs::metadata(&path)
+            .expect("config metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "saved config must not be readable by other users"
+        );
+    }
+
+    #[test]
+    fn test_config_save_preserves_unchanged_env_placeholders() {
+        let path = temp_config_path("env-config.json5");
+        unsafe {
+            std::env::set_var("BLOCKCELL_TEST_SAVE_KEY", "sk-expanded-secret");
+        }
+        fs::write(
+            &path,
+            r#"{
+  providers: {
+    openai: { apiKey: "${BLOCKCELL_TEST_SAVE_KEY}" },
+  },
+  agents: { defaults: { model: "old-model" } },
+}"#,
+        )
+        .expect("write config with env placeholder");
+
+        let mut config = Config::load(&path).expect("load expanded config");
+        config.agents.defaults.model = "new-model".to_string();
+        config.save(&path).expect("save updated config");
+
+        let saved = fs::read_to_string(&path).expect("read saved config");
+        assert!(saved.contains("${BLOCKCELL_TEST_SAVE_KEY}"));
+        assert!(!saved.contains("sk-expanded-secret"));
+        assert!(saved.contains("new-model"));
+
+        unsafe {
+            std::env::remove_var("BLOCKCELL_TEST_SAVE_KEY");
+        }
     }
 
     #[test]

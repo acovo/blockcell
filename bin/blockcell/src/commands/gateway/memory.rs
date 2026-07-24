@@ -276,6 +276,7 @@ mod tests {
             task_manager: TaskManager::new(),
             checkpoint_manager: CheckpointManager::new(&paths.workspace()),
             config,
+            config_write_lock: Arc::new(Mutex::new(())),
             paths,
             api_token: None,
             ws_broadcast,
@@ -300,6 +301,18 @@ mod tests {
             .await
             .expect("read response body");
         serde_json::from_slice(&body).expect("response json")
+    }
+
+    #[tokio::test]
+    async fn gateway_state_clones_share_one_config_write_lock() {
+        let store: blockcell_tools::MemoryStoreHandle = Arc::new(CaptureMemoryStore::new());
+        let state = test_gateway_state(store);
+        let cloned = state.clone();
+
+        let guard = state.config_write_lock.lock().await;
+        assert!(cloned.config_write_lock.try_lock().is_err());
+        drop(guard);
+        assert!(cloned.config_write_lock.try_lock().is_ok());
     }
 
     #[tokio::test]
