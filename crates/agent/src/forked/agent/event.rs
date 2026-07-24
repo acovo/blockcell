@@ -111,6 +111,21 @@ pub(crate) fn truncate_path(path: &str) -> String {
 /// 根据 disallowed_tools 过滤掉不允许的工具。
 ///
 /// 支持的工具：read_file, list_dir, grep, glob, file_edit, edit_file, file_write, write_file
+pub fn default_read_only_fork_disallowed_tools() -> Vec<String> {
+    [
+        "agent",
+        "spawn",
+        "exec",
+        "edit_file",
+        "file_edit",
+        "write_file",
+        "file_write",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json::Value> {
     use serde_json::json;
 

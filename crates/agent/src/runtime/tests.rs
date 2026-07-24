@@ -4634,7 +4634,8 @@ async fn tool_policy_ask_confirmation_skips_duplicate_path_confirmation() {
     };
 
     let mut runtime = test_runtime();
-    let outside_path = std::env::temp_dir()
+    let outside_path = dirs::home_dir()
+        .expect("home directory")
         .join(format!("blockcell-policy-outside-{}", uuid::Uuid::new_v4()))
         .join("secrets.env");
     let mut ask_env_write =
@@ -4670,6 +4671,45 @@ async fn tool_policy_ask_confirmation_skips_duplicate_path_confirmation() {
         .expect("tool task should finish");
 
     assert!(result.contains("Unknown tool"));
+    assert!(confirm_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn tool_policy_ask_cannot_override_builtin_path_deny() {
+    use blockcell_core::tool_policy::{ToolPolicy, ToolPolicyConfig, ToolPolicyDecision};
+
+    let mut runtime = test_runtime();
+    let ask_write = tool_policy_rule("ask-write", "write_file", ToolPolicyDecision::Ask);
+    runtime.tool_policy = ToolPolicy::from_config(ToolPolicyConfig {
+        rules: vec![ask_write],
+        ..Default::default()
+    });
+    let (confirm_tx, mut confirm_rx) = mpsc::channel(2);
+    runtime.confirm_tx = Some(confirm_tx);
+
+    let sensitive_path = dirs::home_dir()
+        .expect("home directory")
+        .join(".ssh")
+        .join("authorized_keys");
+    let msg = test_main_session_inbound("cli", "policy-hard-deny");
+    let call = tool_call(
+        "write_file",
+        serde_json::json!({
+            "path": sensitive_path.to_string_lossy(),
+            "content": "ssh-ed25519 test"
+        }),
+    );
+    let handle = tokio::spawn(async move { runtime.execute_tool_call(&call, &msg, None).await });
+
+    let request = confirm_rx
+        .recv()
+        .await
+        .expect("tool policy ask should request confirmation");
+    request.response_tx.send(true).expect("approve tool policy");
+
+    let result = handle.await.expect("tool call should finish");
+    assert!(result.contains("Path access denied"), "result: {result}");
+    assert!(!result.contains("Unknown tool"), "result: {result}");
     assert!(confirm_rx.try_recv().is_err());
 }
 

@@ -32,7 +32,8 @@ mod can_use_tool;
 mod context;
 
 pub use agent::{
-    build_forked_tool_schemas, run_forked_agent, ForkedAgentParams, ForkedAgentResult,
+    build_forked_tool_schemas, default_read_only_fork_disallowed_tools, run_forked_agent,
+    ForkedAgentParams, ForkedAgentResult,
 };
 // UsageMetrics 现在从 blockcell_core 导入，不再本地定义
 pub use cache_safe::{

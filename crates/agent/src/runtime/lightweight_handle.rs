@@ -252,6 +252,7 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                     ..Default::default()
                 };
 
+                let fork_disallowed = crate::forked::default_read_only_fork_disallowed_tools();
                 let mut builder = ForkedAgentParams::builder()
                     .provider_pool(self.provider_pool.clone())
                     .prompt_messages(fork_messages)
@@ -259,7 +260,7 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                     .fork_label("fork")
                     .max_turns(10)
                     .agent_type(None)
-                    .disallowed_tools(vec!["agent".to_string(), "spawn".to_string()])
+                    .disallowed_tools(fork_disallowed.clone())
                     .one_shot(true)
                     .overrides(overrides);
 
@@ -287,7 +288,6 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                 builder = builder.skills_dir(self.paths.skills_dir());
 
                 // 构建并传递工具 schema，让 LLM 知道可以调用哪些工具
-                let fork_disallowed = vec!["agent".to_string(), "spawn".to_string()];
                 let tool_schemas = crate::forked::build_forked_tool_schemas(&fork_disallowed);
                 builder = builder.tool_schemas(tool_schemas);
 

@@ -216,13 +216,7 @@ impl AgentRuntime {
             .await
         {
             PolicyOutcome::Proceed => false,
-            PolicyOutcome::ProceedConfirmed => {
-                for access in self.extract_path_accesses(&tool_call.name, &tool_call.arguments) {
-                    let resolved = self.resolve_path(&access.path);
-                    self.authorize_directory(&resolved, access.op);
-                }
-                true
-            }
+            PolicyOutcome::ProceedConfirmed => true,
             PolicyOutcome::Denied(reason) => {
                 return serde_json::json!({
                     "error": reason,
@@ -301,7 +295,12 @@ impl AgentRuntime {
 
         // Check path safety before executing filesystem/exec tools
         if !self
-            .check_path_permission(&tool_call.name, &tool_call.arguments, msg)
+            .check_path_permission_with_confirmation(
+                &tool_call.name,
+                &tool_call.arguments,
+                msg,
+                policy_confirmed,
+            )
             .await
         {
             return crate::error::path_access_denied(&tool_call.name, "outside workspace");

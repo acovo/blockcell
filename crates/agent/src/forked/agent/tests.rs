@@ -148,6 +148,28 @@ fn test_filter_tool_schemas_wildcard_keeps_all_except_disallowed() {
 }
 
 #[test]
+fn default_fork_capabilities_are_structurally_read_only() {
+    let disallowed = default_read_only_fork_disallowed_tools();
+    for tool in ["exec", "edit_file", "file_edit", "write_file", "file_write"] {
+        assert!(
+            disallowed.iter().any(|name| name == tool),
+            "{tool} must be denied in default fork mode"
+        );
+    }
+
+    let schemas = build_forked_tool_schemas(&disallowed);
+    assert_eq!(
+        schema_names(&schemas),
+        vec![
+            "read_file".to_string(),
+            "list_dir".to_string(),
+            "grep".to_string(),
+            "glob".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn test_forked_tool_schemas_prefer_relative_paths() {
     let schemas = build_forked_tool_schemas(&[]);
     let serialized = serde_json::to_string(&schemas).unwrap();

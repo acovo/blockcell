@@ -1,13 +1,13 @@
 # Agent Runtime and Learning Systems Review
 
 **Date:** 2026-07-24
-**Status:** Runtime findings remediated; review in progress
+**Status:** Tool-authorization findings remediated; review in progress
 **Plan:** `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review.md`
 
 ## Verification baseline
 
 - `cargo test -p blockcell-storage -- --nocapture`: 59 passed, 0 failed.
-- `cargo test -p blockcell-agent runtime -- --nocapture`: 121 passed, 0 failed; 491 filtered out.
+- `cargo test -p blockcell-agent runtime -- --nocapture`: 122 passed, 0 failed; 492 filtered out.
 
 Passing tests establish the current baseline. The remediated cross-channel/account routing,
 message-task panic, and deferred-review cleanup cases now have regression coverage. The
@@ -35,6 +35,23 @@ InboundMessage
 ```
 
 Shared objects passed into the per-message runtime include the provider pool, tool registry, task manager, outbound/confirmation/event channels, structured memory handle, capability registry, and evolution engine. File-memory and skill stores are reopened for each per-message runtime and coordinate through their filesystem lock directories.
+
+## Tool authorization map
+
+```text
+Model ToolCallRequest(name, arguments)
+  -> disabled tool/skill toggles
+  -> ToolPolicy evaluate + audit (allow / ask / deny)
+  -> dangerous exec/file_ops confirmation
+  -> extracted path accesses + PathPolicy/session authorization
+  -> ToolContext channel/user permissions
+  -> ToolRegistry lookup + schema validation + required-permission check
+  -> concrete Tool::execute
+```
+
+The runtime performs policy and path gates before constructing `ToolContext`; the registry then
+performs the final tool lookup, parameter validation, and permission-subset check. Spawn-capable
+tools receive the current runtime abort token and origin session through `RuntimeSpawnHandle`.
 
 ## Confirmed findings
 
@@ -138,6 +155,51 @@ Shared objects passed into the per-message runtime include the provider pool, to
 
 **Resolution:** Fixed. The explicit `StreamChunk::Done` path now reports `CallResult::Success` before returning, resetting the transient failure sequence and incrementing success statistics. Regression test: `explicit_stream_done_reports_provider_success`.
 
+### R6 — Medium: Tool-policy confirmation can bypass hard path-policy denial
+
+**Locations:**
+
+- `crates/agent/src/runtime/tool_exec.rs:214-224`
+- `crates/agent/src/runtime/tool_exec.rs:302-308`
+- `crates/agent/src/runtime/path_security.rs:152-188`
+- `crates/agent/src/runtime/path_security.rs:230-267`
+- `crates/core/src/path_policy.rs:195-242`
+- `crates/agent/src/runtime/tests.rs:4630-4674`
+
+**Trigger:** An administrator configures a matching `tool_policy` rule with decision `ask` for a filesystem-bearing tool, the model supplies a path that `PathPolicy` would deny (including built-in protected paths such as `~/.ssh`), and the user approves the tool-policy confirmation.
+
+**Control flow:** A successful tool-policy `ask` returns `ProceedConfirmed`. Before the path gate runs, `execute_tool_call` extracts every referenced path and inserts its directory plus operation into `authorized_dirs`. `check_path_permission` checks this session authorization before evaluating `PathPolicy`, so it returns success for the newly cached directory and never reaches the built-in/user deny rule. The existing `tool_policy_ask_confirmation_skips_duplicate_path_confirmation` test confirms that approval intentionally suppresses the later path-policy confirmation; the same ordering also suppresses hard denial.
+
+**Impact:** Adding an interactive tool-policy guard can weaken the independent path-security boundary. A user approval intended to authorize one tool invocation overrides a path policy documented to treat built-in sensitive paths as always denied, permitting reads/writes/exec operations that the path policy would otherwise block.
+
+**Repair direction:** Preserve hard-deny precedence. Evaluate all extracted paths against `PathPolicy` before caching any approval; reject immediately on `Deny`, and use the tool-policy approval only to satisfy paths whose result is `Confirm`. Cache only those confirmed path/operation pairs after the hard-deny pass. Add regression tests for a tool-policy `ask` combined with both a built-in sensitive-path deny and an explicit user deny rule.
+
+**Resolution:** Fixed. PathPolicy is now evaluated for hard denial before workspace or cached authorization. ToolPolicy approval satisfies only `Confirm` outcomes and is cached only after the deny pass, preserving one-confirm behavior without weakening protected paths. Regression test: `tool_policy_ask_cannot_override_builtin_path_deny`.
+
+### R7 — High: Fork-mode agents bypass runtime tool and path authorization
+
+**Locations:**
+
+- `crates/tools/src/agent.rs:124-149`
+- `crates/agent/src/runtime.rs:2315-2321`
+- `crates/agent/src/runtime/lightweight_handle.rs:185-292`
+- `crates/agent/src/forked/agent.rs:74-128`
+- `crates/agent/src/forked/agent.rs:554-583`
+- `crates/agent/src/forked/agent/event.rs:110-282`
+- `crates/agent/src/forked/agent/tool_exec.rs:3-25`
+- `crates/agent/src/forked/agent/tool_exec.rs:305-341`
+- `crates/agent/src/forked/agent/tool_exec.rs:470-579`
+
+**Trigger:** The lead model invokes the `agent` tool without `subagent_type`, entering synchronous fork mode, and the forked model selects `write_file`, `edit_file`, or `exec` despite the prompt describing its Bash access as read-only.
+
+**Control flow:** Message runtimes expose `LightweightRuntimeHandle` to the `agent` tool. Its fork builder disallows only `agent` and `spawn`, then supplies the standard fork schemas, which include file editing, file writing, and shell execution. No `can_use_tool` callback is supplied, so the builder defaults to `ToolPermission::Allow`. Forked tools execute in a separate dispatcher rather than `AgentRuntime::execute_tool_call`; consequently they do not evaluate ToolPolicy, PathPolicy, interactive confirmations, disabled-tool toggles, or `ToolRegistry` permission requirements. With no isolated `working_dir`, absolute paths are accepted and relative paths use the process working directory. The shell denylist covers only a small set of catastrophic command patterns and is not an authorization boundary.
+
+**Impact:** A nested model call can perform filesystem writes or shell mutations that the parent runtime would deny or ask the user to confirm. This bypasses configured sensitive-path rules and channel/user permission policy, and turns prompt injection or model misbehavior inside fork mode into host/workspace modification capability.
+
+**Repair direction:** Make fork capabilities structural rather than prompt-only. For the default fork route, pass an explicit read-only whitelist and deny `write_file`, `edit_file`, and `exec` unless a separately authorized mode requires them. Route any mutating fork operation through a parent-provided authorization callback that enforces the same disabled toggles, ToolPolicy, PathPolicy, confirmation, and origin permissions as `execute_tool_call`. Require an isolated working directory where applicable and fail closed when no authorization callback is installed. Add tests proving default fork schemas are read-only and that nested writes/exec cannot bypass a parent deny rule.
+
+**Resolution:** Fixed. Default fork mode now uses one canonical runtime-enforced disallow list covering spawn, shell execution, file editing, and file writing; the same list filters advertised schemas and rejects forged/undeclared calls in the fork dispatcher. Typed agents retain their explicit configured capabilities. Regression test: `default_fork_capabilities_are_structurally_read_only`.
+
 ### M1 — High in multi-conversation deployments: Structured memory is automatically recalled across session boundaries
 
 **Locations:**
@@ -210,5 +272,6 @@ Shared objects passed into the per-message runtime include the provider pool, to
 - Module 2 Task 1 lifecycle and early-return/error audit: complete.
 - Runtime lifecycle findings R1-R3: fixed and regression-tested.
 - Runtime lifecycle findings R4-R5: fixed and regression-tested after the completed early-return/error audit.
+- Module 2 Task 2 authorization, path, confirmation, inheritance, subagent restriction, and policy-reload review: complete; R6-R7 fixed and regression-tested. Cancellation and steering review is in progress.
 - Module 5 structured-memory and learning-lock findings M1-M3: reviewed, fixed, and regression-tested.
 - The implementation and verification record is in `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review-fixes.md`.

@@ -109,6 +109,8 @@ impl AgentRuntime {
                     ..Default::default()
                 };
 
+                let fork_disallowed = crate::forked::default_read_only_fork_disallowed_tools();
+
                 // 构建 ForkedAgentParams（使用 builder 模式）
                 let params = ForkedAgentParams::builder()
                     .provider_pool(self.provider_pool.clone())
@@ -117,7 +119,7 @@ impl AgentRuntime {
                     .fork_label("fork")
                     .max_turns(10)
                     .agent_type(None)
-                    .disallowed_tools(vec!["agent".to_string(), "spawn".to_string()])
+                    .disallowed_tools(fork_disallowed)
                     .one_shot(true)
                     .overrides(overrides)
                     .build()

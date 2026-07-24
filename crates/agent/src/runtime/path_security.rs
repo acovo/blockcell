@@ -197,11 +197,23 @@ impl super::AgentRuntime {
     /// 3. Policy `Deny`         → rejected immediately, no confirmation sent
     /// 4. Policy `Allow`        → allowed immediately, cached for this session
     /// 5. Policy `Confirm`      → user confirmation required
+    #[cfg(test)]
     pub(super) async fn check_path_permission(
         &mut self,
         tool_name: &str,
         args: &serde_json::Value,
         msg: &InboundMessage,
+    ) -> bool {
+        self.check_path_permission_with_confirmation(tool_name, args, msg, false)
+            .await
+    }
+
+    pub(super) async fn check_path_permission_with_confirmation(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        msg: &InboundMessage,
+        policy_confirmed: bool,
     ) -> bool {
         if matches!(tool_name, "exec_local" | "exec_skill_script") {
             // These run scripts addressed relative to the active skill
@@ -230,6 +242,19 @@ impl super::AgentRuntime {
         for access in &path_accesses {
             let resolved = self.resolve_path(&access.path);
 
+            // Hard path-policy denial always wins, including over prior session
+            // authorization and approval of a separate ToolPolicy `ask` rule.
+            let action = self.path_policy.evaluate(&resolved, access.op);
+            if action == PolicyAction::Deny {
+                warn!(
+                    tool = tool_name,
+                    path = %resolved.display(),
+                    "Path access denied by policy"
+                );
+                deny_paths.push(access.path.clone());
+                continue;
+            }
+
             // 1. Workspace-safe → always OK
             if self.is_path_safe(&resolved) {
                 continue;
@@ -240,17 +265,9 @@ impl super::AgentRuntime {
                 continue;
             }
 
-            // 3. Evaluate policy
-            let action = self.path_policy.evaluate(&resolved, access.op);
+            // 3. Apply the non-deny policy outcome
             match action {
-                PolicyAction::Deny => {
-                    warn!(
-                        tool = tool_name,
-                        path = %resolved.display(),
-                        "Path access denied by policy"
-                    );
-                    deny_paths.push(access.path.clone());
-                }
+                PolicyAction::Deny => unreachable!("deny handled before authorization checks"),
                 PolicyAction::Allow => {
                     // Policy explicitly allows — cache for this session
                     info!(
@@ -263,7 +280,13 @@ impl super::AgentRuntime {
                     }
                 }
                 PolicyAction::Confirm => {
-                    confirm_paths.push(access.clone());
+                    if policy_confirmed {
+                        if self.path_policy.cache_confirmed_dirs() {
+                            self.authorize_directory(&resolved, access.op);
+                        }
+                    } else {
+                        confirm_paths.push(access.clone());
+                    }
                 }
             }
         }
