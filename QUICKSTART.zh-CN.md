@@ -130,7 +130,7 @@ blockcell gateway
 
 如果配置了 `gateway.apiToken`：
 
-- HTTP 调用：`Authorization: Bearer <token>`（或 `?token=<token>`）
+- HTTP 调用：`Authorization: Bearer <token>`
 - WebSocket：也可用 `?token=<token>`
 
 WebUI 登录密码与 API token 现在分离：

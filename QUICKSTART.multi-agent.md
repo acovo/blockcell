@@ -154,7 +154,7 @@ Default ports:
 
 If `gateway.apiToken` is set, use it as:
 
-- HTTP: `Authorization: Bearer <token>` or `?token=<token>`
+- HTTP: `Authorization: Bearer <token>`
 - WebSocket: `?token=<token>` also works
 
 ## Recommended rollout order

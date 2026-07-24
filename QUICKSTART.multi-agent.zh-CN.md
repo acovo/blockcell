@@ -154,7 +154,7 @@ blockcell gateway
 
 如果配置了 `gateway.apiToken`，调用方式是：
 
-- HTTP：`Authorization: Bearer <token>` 或 `?token=<token>`
+- HTTP：`Authorization: Bearer <token>`
 - WebSocket：也支持 `?token=<token>`
 
 ## 推荐上线顺序
