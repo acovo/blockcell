@@ -46,7 +46,7 @@ enum Commands {
         /// Reset existing config to defaults before setup
         #[arg(long)]
         force: bool,
-        /// LLM provider name (deepseek/openai/kimi/anthropic/gemini/zhipu/minimax/ollama)
+        /// LLM provider name (deepseek/openai/kimi/anthropic/gemini/zhipu/qwen/xai/mistral/minimax/groq/siliconflow/openrouter/ollama)
         #[arg(long)]
         provider: Option<String>,
         /// API key for selected provider
