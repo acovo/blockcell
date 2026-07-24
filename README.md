@@ -135,6 +135,9 @@ v0.1.7 进一步收紧 agent 的执行边界：
 - **Discord**（Gateway WebSocket）
 - **钉钉**（Stream SDK）
 - **企业微信**（WeCom，轮询/Webhook）
+- **QQ**（官方机器人 Gateway/Webhook）
+- **NapCatQQ**（OneBot 11 WebSocket/HTTP）
+- **微信**（Weixin iLink Bot API，扫码登录/长轮询）
 
 #### 📖 渠道接入指南
 
@@ -150,6 +153,9 @@ v0.1.7 进一步收紧 agent 的执行边界：
 [企业微信配置](docs/channels/zh/06_wecom.md) | [WeCom Setup](docs/channels/en/06_wecom.md)
 [WhatsApp 配置](docs/channels/zh/07_whatsapp.md) | [WhatsApp Setup](docs/channels/en/07_whatsapp.md)
 [Lark 配置](docs/channels/zh/08_lark.md) | [Lark Setup](docs/channels/en/08_lark.md)
+[QQ 配置](docs/channels/zh/09_qq.md) | [QQ Setup](docs/channels/en/09_qq.md)
+[NapCatQQ 配置](docs/channels/zh/10_napcatqq.md) | [NapCatQQ Setup](docs/channels/en/10_napcatqq.md)
+[微信配置](docs/channels/zh/11_weixin.md) | [Weixin Setup](docs/channels/en/11_weixin.md)
 
 每份指南包含：
 - 📝 应用创建步骤

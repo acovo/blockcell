@@ -135,12 +135,15 @@ Run BlockCell as a daemon and connect it to:
 - **Discord** (Gateway WebSocket)
 - **DingTalk** (Stream SDK)
 - **WeCom** (polling / webhook)
+- **QQ** (official bot Gateway / webhook)
+- **NapCatQQ** (OneBot 11 WebSocket / HTTP)
+- **Weixin** (iLink Bot API with QR login and long polling)
 
 #### 📖 Channel Integration Guides
 
 Each channel has detailed configuration documentation (bilingual):
 
-**中文文档** | **English Docs**
+**Chinese Docs** | **English Docs**
 --- | ---
 [Telegram 配置](docs/channels/zh/01_telegram.md) | [Telegram Setup](docs/channels/en/01_telegram.md)
 [Discord 配置](docs/channels/zh/02_discord.md) | [Discord Setup](docs/channels/en/02_discord.md)
@@ -150,6 +153,9 @@ Each channel has detailed configuration documentation (bilingual):
 [企业微信配置](docs/channels/zh/06_wecom.md) | [WeCom Setup](docs/channels/en/06_wecom.md)
 [WhatsApp 配置](docs/channels/zh/07_whatsapp.md) | [WhatsApp Setup](docs/channels/en/07_whatsapp.md)
 [Lark 配置](docs/channels/zh/08_lark.md) | [Lark Setup](docs/channels/en/08_lark.md)
+[QQ 配置](docs/channels/zh/09_qq.md) | [QQ Setup](docs/channels/en/09_qq.md)
+[NapCatQQ 配置](docs/channels/zh/10_napcatqq.md) | [NapCatQQ Setup](docs/channels/en/10_napcatqq.md)
+[微信配置](docs/channels/zh/11_weixin.md) | [Weixin Setup](docs/channels/en/11_weixin.md)
 
 Each guide includes:
 - 📝 Application creation steps
