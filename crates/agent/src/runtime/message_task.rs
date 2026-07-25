@@ -121,6 +121,7 @@ pub(crate) async fn run_message_task(
     event_tx: Option<broadcast::Sender<String>>,
     agent_id: Option<String>,
     event_emitter: EventEmitterHandle,
+    learning_coordinator: Arc<crate::learning_coordinator::LearningCoordinator>,
     steering: SteeringChannel,
     steering_sender: SteeringSender,
     msg: InboundMessage,
@@ -170,6 +171,7 @@ pub(crate) async fn run_message_task(
             return;
         }
     };
+    runtime.install_shared_learning_coordinator(learning_coordinator);
 
     // Wire up channels
     if let Some(tx) = outbound_tx.clone() {

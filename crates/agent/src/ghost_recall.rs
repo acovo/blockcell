@@ -24,6 +24,7 @@ pub fn build_ghost_recall_context_block(
 
     let items = query_file_memory_recall_items(
         paths,
+        Some(&msg.session_key()),
         &msg.content,
         config.agents.ghost.learning.recall_max_items as usize,
     )?;
@@ -90,6 +91,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 pub(crate) fn query_file_memory_recall_items(
     paths: &Paths,
+    session_key: Option<&str>,
     raw_query: &str,
     limit: usize,
 ) -> Result<Vec<FileMemoryRecallItem>> {
@@ -102,7 +104,7 @@ pub(crate) fn query_file_memory_recall_items(
         return Ok(Vec::new());
     }
 
-    let mut collected = collect_file_memory_items(paths, &query_tokens)?;
+    let mut collected = collect_file_memory_items(paths, session_key, &query_tokens)?;
     collected.sort_by(|left, right| {
         right
             .score
@@ -123,14 +125,24 @@ pub(crate) struct FileMemoryRecallItem {
 
 fn collect_file_memory_items(
     paths: &Paths,
+    session_key: Option<&str>,
     query_tokens: &[String],
 ) -> Result<Vec<FileMemoryRecallItem>> {
     let mut seen = HashSet::new();
     let mut items = Vec::new();
-    for (source, path) in [
+    let mut sources = vec![
         ("USER.md", paths.user_md()),
         ("MEMORY.md", paths.memory_md()),
-    ] {
+    ];
+    if let Some(session_key) = session_key {
+        let session_root = paths
+            .memory_dir()
+            .join("sessions")
+            .join(blockcell_core::stable_hash_session_key(session_key));
+        sources.push(("session/USER.md", session_root.join("USER.md")));
+        sources.push(("session/MEMORY.md", session_root.join("MEMORY.md")));
+    }
+    for (source, path) in sources {
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -286,5 +298,53 @@ mod tests {
         let message = build_ghost_recall_context_block(&paths, &config, &test_msg("deploy docs"))
             .expect("recall");
         assert!(message.is_none());
+    }
+
+    #[test]
+    fn ghost_session_recall_merges_global_but_not_other_sessions() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-ghost-recall-session-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        crate::memory_file_store::MemoryFileStore::open(&paths)
+            .unwrap()
+            .add(
+                crate::memory_file_store::MemoryFileTarget::Memory,
+                "Global release checklist uses signed artifacts.",
+            )
+            .unwrap();
+        crate::memory_file_store::MemoryFileStore::open_for_session(&paths, "cli:chat-1")
+            .unwrap()
+            .add(
+                crate::memory_file_store::MemoryFileTarget::Memory,
+                "Private narwhal deployment codename.",
+            )
+            .unwrap();
+
+        let own = query_file_memory_recall_items(
+            &paths,
+            Some("cli:chat-1"),
+            "narwhal signed artifacts",
+            10,
+        )
+        .unwrap();
+        let other = query_file_memory_recall_items(
+            &paths,
+            Some("cli:chat-2"),
+            "narwhal signed artifacts",
+            10,
+        )
+        .unwrap();
+
+        assert!(own.iter().any(|item| item.content.contains("narwhal")));
+        assert!(own
+            .iter()
+            .any(|item| item.content.contains("signed artifacts")));
+        assert!(!other.iter().any(|item| item.content.contains("narwhal")));
+        assert!(other
+            .iter()
+            .any(|item| item.content.contains("signed artifacts")));
     }
 }

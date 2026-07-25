@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use blockcell_core::types::{ChatMessage, PermissionSet, ToolCallRequest};
-use blockcell_core::{Config, Error, Paths, Result};
+use blockcell_core::{AbortToken, Config, Error, Paths, Result};
 use blockcell_providers::{CallResult, ProviderPool};
 use blockcell_storage::ghost_ledger::NewGhostReviewRun;
 use blockcell_storage::GhostLedger;
@@ -84,6 +84,27 @@ pub async fn run_background_review_for_episode(
     ledger: &GhostLedger,
     review_worker_id: Option<&str>,
 ) -> Result<GhostBackgroundReviewOutcome> {
+    run_background_review_for_episode_with_lease_abort(
+        paths,
+        provider_pool,
+        episode_id,
+        config,
+        ledger,
+        review_worker_id,
+        None,
+    )
+    .await
+}
+
+async fn run_background_review_for_episode_with_lease_abort(
+    paths: &Paths,
+    provider_pool: Arc<ProviderPool>,
+    episode_id: &str,
+    config: &Config,
+    ledger: &GhostLedger,
+    review_worker_id: Option<&str>,
+    lease_abort: Option<AbortToken>,
+) -> Result<GhostBackgroundReviewOutcome> {
     let Some(episode) = ledger.get_episode(episode_id)? else {
         return Err(Error::NotFound(format!(
             "Ghost episode not found for background review: {}",
@@ -140,6 +161,7 @@ pub async fn run_background_review_for_episode(
         &snapshot,
         config,
         ghost_memory_lifecycle,
+        lease_abort,
     )
     .await
     {
@@ -293,19 +315,25 @@ pub async fn run_pending_background_reviews(
     let mut outcomes = Vec::with_capacity(episodes.len());
     for episode in episodes {
         // review loop 开始前 heartbeat 延长 lease
-        if let Err(e) =
-            ledger.heartbeat_review_lease(&episode.id, &worker_id, REVIEW_LEASE_DURATION_SECS)
-        {
-            warn!(
-                episode_id = %episode.id,
-                error = %e,
-                "Failed to heartbeat review lease before processing episode"
-            );
-            // lease 丢失，跳过此 episode
-            continue;
+        match ledger.heartbeat_review_lease(&episode.id, &worker_id, REVIEW_LEASE_DURATION_SECS) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(episode_id = %episode.id, "Lost review lease before processing episode");
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    episode_id = %episode.id,
+                    error = %e,
+                    "Failed to heartbeat review lease before processing episode"
+                );
+                continue;
+            }
         }
 
         // Spawn periodic heartbeat during review execution
+        let lease_abort = AbortToken::new();
+        let heartbeat_abort = lease_abort.clone();
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let hb_ledger = GhostLedger::open(&paths.ghost_ledger_db())?;
         let hb_episode_id = episode.id.clone();
@@ -327,12 +355,14 @@ pub async fn run_pending_background_reviews(
                             Ok(true) => consecutive_failures = 0,
                             Ok(false) => {
                                 warn!(episode_id = %hb_episode_id, worker_id = %hb_worker_id, "Lost review lease during heartbeat");
+                                heartbeat_abort.cancel();
                                 break;
                             }
                             Err(e) => {
                                 consecutive_failures += 1;
                                 warn!(episode_id = %hb_episode_id, worker_id = %hb_worker_id, error = %e, consecutive_failures, "Failed to heartbeat review lease (will retry)");
                                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                    heartbeat_abort.cancel();
                                     break;
                                 }
                             }
@@ -342,13 +372,14 @@ pub async fn run_pending_background_reviews(
             }
         });
 
-        let review_result = run_background_review_for_episode(
+        let review_result = run_background_review_for_episode_with_lease_abort(
             paths,
             Arc::clone(&provider_pool),
             &episode.id,
             config,
             &ledger,
             Some(&worker_id),
+            Some(lease_abort),
         )
         .await;
 
@@ -427,6 +458,7 @@ async fn run_restricted_review_tool_loop(
     snapshot: &GhostEpisodeSnapshot,
     config: &Config,
     ghost_memory_lifecycle: Option<Arc<dyn GhostMemoryLifecycleOps + Send + Sync>>,
+    lease_abort: Option<AbortToken>,
 ) -> Result<GhostReviewToolLoopOutcome> {
     let registry = restricted_review_tool_registry();
     let tools = registry.get_filtered_schemas(REVIEW_ALLOWED_TOOLS);
@@ -438,13 +470,26 @@ async fn run_restricted_review_tool_loop(
 
     // Create stores once before the loop — avoids re-opening per tool call
     let memory_file_store: blockcell_tools::MemoryFileStoreHandle =
-        Arc::new(MemoryFileStore::open(paths)?);
+        Arc::new(if let Some(session_key) = snapshot.session_key.as_deref() {
+            MemoryFileStore::open_for_session(paths, session_key)?
+        } else {
+            MemoryFileStore::open(paths)?
+        });
     let skill_file_store: blockcell_tools::SkillFileStoreHandle =
         Arc::new(SkillFileStore::open(paths)?);
 
     for _round in 0..REVIEW_TOOL_LOOP_MAX_ROUNDS {
         rounds_used += 1;
-        let response = provider.chat(&messages, &tools).await?;
+        let response = if let Some(abort) = lease_abort.as_ref() {
+            tokio::select! {
+                _ = abort.cancelled() => {
+                    return Err(Error::Storage("Lost review lease".into()));
+                }
+                result = provider.chat(&messages, &tools) => result?,
+            }
+        } else {
+            provider.chat(&messages, &tools).await?
+        };
         if response.tool_calls.is_empty() {
             stopped = true;
             stop_reason = "model_stopped".to_string();
@@ -456,6 +501,9 @@ async fn run_restricted_review_tool_loop(
         messages.push(assistant);
 
         for call in response.tool_calls {
+            if lease_abort.as_ref().is_some_and(AbortToken::is_cancelled) {
+                return Err(Error::Storage("Lost review lease".into()));
+            }
             if !REVIEW_ALLOWED_TOOLS.contains(&call.name.as_str()) {
                 let result = serde_json::json!({
                     "error": format!("tool '{}' is not allowed in ghost review", call.name),
@@ -590,7 +638,10 @@ fn review_tool_context_with_stores(
         base: paths.base.clone(),
         builtin_skills_dir: Some(paths.builtin_skills_dir()),
         active_skill_dir: None,
-        session_key: "ghost_background_review".to_string(),
+        session_key: snapshot
+            .session_key
+            .clone()
+            .unwrap_or_else(|| "ghost_background_review".to_string()),
         channel: "ghost".to_string(),
         account_id: None,
         sender_id: None,
@@ -1005,6 +1056,7 @@ mod tests {
                 summary: "learn deploy preference => prefer canary-first rollout".to_string(),
                 metadata: serde_json::json!({
                     "boundaryKind": "turn_end",
+                    "sessionKey": "cli:ghost-review",
                     "subjectKey": "chat:ghost-review",
                     "userIntentSummary": "learn deploy preference",
                     "assistantOutcomeSummary": "prefer canary-first rollout",
@@ -1053,6 +1105,43 @@ mod tests {
         assert!(prompt.contains("Do not create, edit, or request skills"));
         assert!(!prompt.contains("prompt-only skills"));
         assert!(!REVIEW_ALLOWED_TOOLS.contains(&"skill_manage"));
+    }
+
+    #[tokio::test]
+    async fn ghost_review_stops_after_lease_loss_before_memory_write() {
+        let paths = temp_paths("lease-loss");
+        let snapshot = GhostEpisodeSnapshot {
+            boundary_kind: crate::ghost_learning::GhostLearningBoundaryKind::TurnEnd,
+            session_key: Some("cli:lease-loss".to_string()),
+            subject_key: Some("chat:lease-loss".to_string()),
+            user_intent_summary: "learn deploy preference".to_string(),
+            assistant_outcome_summary: "prefer canary-first rollout".to_string(),
+            tool_call_count: 0,
+            memory_write_count: 0,
+            correction_count: 1,
+            preference_correction_count: 1,
+            complexity_score: 5,
+            reusable_lesson: Some("Prefer canary-first rollout".to_string()),
+            decision: crate::ghost_learning::LearningDecision::ReviewAfterResponse,
+        };
+        let provider = ToolLoopReviewProvider::new(ToolLoopMode::WriteFiles);
+        let lease_abort = blockcell_core::AbortToken::new();
+        lease_abort.cancel();
+
+        let error = run_restricted_review_tool_loop(
+            &paths,
+            &provider,
+            &snapshot,
+            &Config::default(),
+            None,
+            Some(lease_abort),
+        )
+        .await
+        .expect_err("lost lease must stop review");
+
+        assert!(error.to_string().contains("Lost review lease"));
+        let scoped = MemoryFileStore::open_for_session(&paths, "cli:lease-loss").unwrap();
+        assert!(scoped.load_snapshot().unwrap().user_block.is_none());
     }
 
     fn test_runtime_with_background_review(
@@ -1140,7 +1229,13 @@ mod tests {
             ]
         );
 
-        let user_memory = std::fs::read_to_string(paths.user_md()).expect("read USER.md");
+        assert!(!paths.user_md().exists());
+        let user_memory = MemoryFileStore::open_for_session(&paths, "cli:ghost-review")
+            .expect("open scoped memory")
+            .load_snapshot()
+            .expect("load scoped memory")
+            .user_block
+            .expect("scoped USER memory");
         assert!(user_memory.contains("canary-first rollout"));
         assert!(!paths
             .skills_dir()
@@ -1219,7 +1314,13 @@ mod tests {
         .expect("run background review");
 
         assert_eq!(outcome.status, "completed");
-        let durable_memory = std::fs::read_to_string(paths.memory_md()).expect("read MEMORY.md");
+        assert!(!paths.memory_md().exists());
+        let durable_memory = MemoryFileStore::open_for_session(&paths, "cli:ghost-review")
+            .expect("open scoped memory")
+            .load_snapshot()
+            .expect("load scoped memory")
+            .memory_block
+            .expect("scoped MEMORY memory");
         assert!(durable_memory.contains("Check rollback order before release verification"));
         let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
         let run = ledger

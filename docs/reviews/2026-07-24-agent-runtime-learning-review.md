@@ -1,7 +1,7 @@
 # Agent Runtime and Learning Systems Review
 
 **Date:** 2026-07-24
-**Status:** Tool-authorization findings remediated; review in progress
+**Status:** Module 5 Task 5 findings remediated; Module 5 Task 6 review pending
 **Plan:** `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review.md`
 
 ## Verification baseline
@@ -31,6 +31,14 @@ Module 5 Task 4 review verification (review-only; no implementation changes):
 - `cargo test -p blockcell-agent memory -- --nocapture`: 150 focused unit tests and 10 memory integration tests passed, 0 failed.
 - `cargo test -p blockcell-tools memory -- --nocapture`: 24 passed, 0 failed.
 - `cargo test -p blockcell --bin blockcell memory -- --nocapture`: 7 passed, 0 failed.
+
+Module 5 Task 5 review verification (review-only; no production-code changes):
+
+- `cargo test -p blockcell-agent ghost -- --nocapture`: 33 passed, 0 failed after the M9-M15 fixes.
+- `cargo test -p blockcell-agent learning -- --nocapture`: 37 passed, 0 failed after sharing the coordinator.
+- `cargo test -p blockcell-agent skill_file_store -- --nocapture`: 29 passed, 0 failed.
+- `cargo test -p blockcell-storage ghost_ledger -- --nocapture`: 6 passed, 0 failed.
+- `cargo test -p blockcell-agent runtime -- --nocapture`: 127 passed, 0 failed.
 
 ## Runtime lifecycle map
 
@@ -639,6 +647,180 @@ tools receive the current runtime abort token and origin session through `Runtim
 
 **Resolution:** Fixed. SQLite query and batch-delete predicates now compare comma-delimited complete tokens with `instr`, and canonical/vector post-filters use string equality. Regression tests: `tag_query_requires_exact_membership` and `batch_delete_tag_requires_exact_membership`.
 
+### M9 — High in multi-conversation deployments: Ghost learning promotes private episodes into Agent-global file memory
+
+**Locations:**
+
+- `crates/agent/src/runtime/learning.rs:639-694`
+- `crates/agent/src/ghost_background_review.rs:24-26`
+- `crates/agent/src/ghost_background_review.rs:424-495`
+- `crates/agent/src/ghost_background_review.rs:580-618`
+- `crates/agent/src/memory_file_store.rs:65-76`
+- `crates/agent/src/ghost_recall.rs:20-35`
+- `crates/agent/src/ghost_recall.rs:79-110`
+
+**Trigger:** One Agent serves multiple conversations or users. A Ghost episode from session A contains a private preference, correction, project fact, or other reusable-looking detail and is selected for background review.
+
+**Control flow:** The episode ledger retains `session_key` and `subject_key`, but the restricted reviewer can write only through `memory_manage` into the single Agent-wide `USER.md` or `MEMORY.md`. The tool context replaces the original identity with the constant `ghost_background_review`, and `MemoryFileStore` has no session/subject namespace. Later Ghost recall reads the same two files without filtering by the current session and injects matching content into any eligible conversation for that Agent. There is no explicit promotion decision, redaction step, or global-memory authorization boundary between a private episode and the shared files.
+
+**Impact:** Information learned from one conversation can be injected into another conversation's model context and potentially disclosed. This recreates the cross-session confidentiality problem fixed for structured memory in M1, but through the Ghost file-memory path.
+
+**Repair direction:** Define private versus Agent-global ownership for file memory. Preserve the episode subject/session through review tool context, default learned entries to session-private storage, and require an explicit policy-approved promotion for global `USER.md`/`MEMORY.md`. Apply current-session filtering during recall and add a two-session regression test proving that a lesson from A is absent from B unless promoted.
+
+**Evidence:** Direct end-to-end control-flow proof plus the passing `ghost_learning_closes_loop_from_experience_to_file_memory_only` test, which confirms that episode review writes the shared file-memory layer. Existing tests use one conversation and do not exercise cross-session recall.
+
+**Resolution:** Fixed. Automatic Ghost reviews now open a stable-hash session-scoped `MemoryFileStore` and preserve the episode session in tool context. Recall merges only the current session's files with explicit global `USER.md`/`MEMORY.md`; another session's automatic memory is not searched. Regression tests: `ghost_session_file_memory_is_isolated_by_session_key`, `ghost_session_recall_merges_global_but_not_other_sessions`, and the updated `ghost_learning_closes_loop_from_experience_to_file_memory_only`.
+
+### M10 — Medium: Per-message coordinator lifetime disables cross-turn nudges and global review throttling
+
+**Locations:**
+
+- `crates/agent/src/runtime/message_task.rs:107-155`
+- `crates/agent/src/runtime.rs:2293-2310`
+- `crates/agent/src/runtime/process_message_inner.rs:33-37`
+- `crates/agent/src/runtime/process_message_inner.rs:644-657`
+- `crates/agent/src/learning_dedup.rs:16-26`
+- `crates/agent/src/learning_throttle.rs:12-26`
+
+**Trigger:** A normal gateway/daemon conversation sends the default three or more user turns, or several conversations finish nudge-eligible work concurrently.
+
+**Control flow:** `run_message_task` constructs a fresh `AgentRuntime` for every inbound message. The `SkillNudgeEngine`, `LearningDedup`, and `LearningThrottle` are constructed inside that Runtime and store all state only in process memory. Each message therefore starts with zero user turns, records exactly one turn, and is dropped before the next message; the default Memory Nudge soft threshold of three can never be reached on this path. The ten-minute dedup window, two-review concurrency limit, and five-minute completion cooldown are likewise isolated per message task, so they do not deduplicate or throttle reviews created by other messages.
+
+**Impact:** Turn-based self-improvement review is silently unavailable on the primary per-message runtime path, while iteration-based reviews can bypass the intended Agent-wide storm controls when multiple messages run concurrently. Unit tests pass because they reuse one coordinator across several synthetic turns, unlike production.
+
+**Repair direction:** Move nudge counters, dedup state, and throttle state to an Agent-scoped shared service keyed by the intended conversation/Agent ownership contract, or persist the counters where restart continuity is required. Pass that shared handle into each per-message Runtime. Add a production-shaped test that invokes separate message tasks for successive turns and a concurrency test spanning separate Runtime instances.
+
+**Evidence:** Direct lifecycle proof. `test_memory_nudge_after_turns` and throttle/dedup unit tests pass within one long-lived coordinator but do not construct a new Runtime per turn.
+
+**Resolution:** Fixed. The long-lived run-loop Runtime now passes its shared `Arc<LearningCoordinator>` into every per-message Runtime, so turn counters, deduplication, concurrency slots, and cooldown state survive message-task replacement. Regression test: `shared_learning_coordinator_accumulates_turns_across_message_runtimes`.
+
+### M11 — Medium: Losing a Ghost review lease does not stop already-running side effects
+
+**Locations:**
+
+- `crates/agent/src/ghost_background_review.rs:285-353`
+- `crates/agent/src/ghost_background_review.rs:424-495`
+- `crates/storage/src/ghost_ledger.rs:382-507`
+- `crates/storage/src/ghost_ledger.rs:524-541`
+- `crates/storage/src/ghost_ledger.rs:571-660`
+
+**Trigger:** A background review runs longer than the 600-second lease while its heartbeat loses ownership or exits after three storage failures. Another worker later cleans up and reclaims the same episode.
+
+**Control flow:** The heartbeat task only logs and exits on lost ownership or repeated failure; it does not cancel or notify `run_background_review_for_episode`. The restricted tool loop continues provider calls and executes `memory_manage` side effects without checking lease ownership before or after each action. Owner-aware ledger finalization prevents the stale worker from inserting the final review run, but it happens after the file-memory mutations. A replacement worker can therefore review and write for the same episode again.
+
+**Impact:** One episode can produce duplicate or conflicting add/replace/remove operations, and the durable audit can show only the winning worker even though the stale worker already changed memory. Exact duplicate adds are partially idempotent, but replacements, removals, and different model outputs are not.
+
+**Repair direction:** Couple lease ownership to execution cancellation. Expose heartbeat loss through a cancellation token, check ownership immediately before every side-effecting tool call and after slow provider calls, and stop without further writes when ownership is uncertain. For stronger recovery, persist idempotency keys or stage mutations and commit them with the review run.
+
+**Evidence:** Direct control-flow proof. Ledger tests cover claim, expiry cleanup, and owner-aware finalization, but no test loses a lease while a tool loop is active.
+
+**Resolution:** Fixed. Each claimed review owns an `AbortToken`; heartbeat ownership loss or repeated heartbeat failure cancels it. Provider waits select against cancellation, and the tool loop checks the token again before every tool action. The initial heartbeat also now requires `Ok(true)` rather than treating `Ok(false)` as success. Regression test: `ghost_review_stops_after_lease_loss_before_memory_write`.
+
+### M12 — High: SkillFileStore follows symlinked skill paths outside the skills root
+
+**Locations:**
+
+- `crates/agent/src/skill_file_store.rs:82-123`
+- `crates/agent/src/skill_file_store.rs:198-221`
+- `crates/agent/src/skill_file_store.rs:284-313`
+- `crates/agent/src/skill_file_store.rs:595-620`
+- `crates/agent/src/skill_file_store.rs:649-710`
+- `crates/agent/src/skill_file_store.rs:860-872`
+- `crates/agent/src/forked/agent/tool_exec.rs:809-850`
+
+**Trigger:** A symlinked category, skill directory, `SKILL.md`, or auxiliary subdirectory exists below the configured skills directory and points elsewhere. The main Agent or a review Agent then views or mutates that skill.
+
+**Control flow:** Target validation is lexical. Existing-target resolution uses `is_dir`, `exists`, and recursive directory traversal, all of which follow symlinks, then accepts the lexical path with `strip_prefix` instead of comparing canonical paths. Reads follow linked files and directories; writes through a linked parent directory are created outside the skills root. Atomic replacement of a linked leaf replaces that leaf link, but only after the existing external target may already have been read and snapshotted. `copy_dir_recursive` skips symlinks only while snapshotting/restoring; normal resolution, `collect_files`, and mutations do not reject them. Forked reviews prefer this `SkillFileStore` path whenever the handle is present.
+
+**Impact:** Skill operations can read files outside the skills root, recurse through external directories or cycles, and overwrite external files through a linked parent directory. This bypasses the intended skill path boundary and can turn a learned-skill write into an arbitrary filesystem write within the process's OS permissions.
+
+**Repair direction:** Canonicalize the skills root and every existing target, reject any symlink in the target chain, and verify the canonical target remains beneath the canonical root before reads, recursion, snapshots, deletion, or writes. For new files, validate the nearest existing canonical ancestor and use no-follow/open-at-style primitives where available.
+
+**Evidence:** Direct filesystem-semantics proof. Current traversal tests cover `..` and absolute-style names only; the 23 passing SkillFileStore tests contain no symlink case.
+
+**Resolution:** Fixed. `SkillFileStore` canonicalizes its skills root, rejects symbolic links in every existing target component, verifies canonical targets remain beneath the root, skips symlinks during discovery/listing, and validates auxiliary destinations before mutation. Regression tests: `skill_file_store_rejects_symlinked_skill_directory` and `skill_file_store_rejects_symlinked_auxiliary_parent`.
+
+### M13 — High: Skill patch safety scanning checks only the replacement fragment
+
+**Locations:**
+
+- `crates/agent/src/skill_file_store.rs:198-221`
+- `crates/agent/src/skill_file_store/patch.rs:8-59`
+- `crates/agent/src/unified_security_scanner.rs:22-46`
+- `crates/agent/src/forked/agent/tool_exec.rs:809-841`
+- `crates/tools/src/security_scan.rs:409-415`
+
+**Trigger:** Existing skill text contains a benign prefix and a patch supplies a separately benign fragment that becomes unsafe only after composition, for example changing `Ignore previous PLACEHOLDER` so the final file contains `Ignore previous instructions`.
+
+**Control flow:** `SkillFileStore::patch` normalizes and scans only the replacement `content`, then composes `next` with the existing file and writes it without scanning the result or the full skill directory. The scanner's injection rules operate on complete phrases, so split payloads can evade fragment scanning. Forked review execution routes `skill_manage patch` through this store when available, bypassing its older fallback path that correctly scans the composed `new_content`.
+
+**Impact:** An Agent-created learned skill can persist prompt injection, dangerous commands, credential-access instructions, or other content that the AgentCreated trust policy is intended to block. The unsafe skill can later be injected into prompts or executed as procedure content.
+
+**Repair direction:** Scan the fully composed `next` content before snapshot/write, and run directory-level scanning when an auxiliary file or multi-file relationship can create the unsafe condition. Keep one shared mutation implementation so the tool and store paths cannot diverge.
+
+**Evidence:** Deterministic composition proof. Existing tests verify unsafe full create/edit content and patch matching, but do not test a payload formed across the old/new boundary.
+
+**Resolution:** Fixed. Patch now composes the final candidate first and runs the AgentCreated safety scan against that complete content before snapshot or write. Regression test: `skill_file_store_patch_scans_composed_content`.
+
+### M14 — Medium: Skill restore overlays snapshots and leaves post-snapshot files active
+
+**Locations:**
+
+- `crates/agent/src/skill_file_store.rs:323-366`
+- `crates/agent/src/skill_file_store.rs:430-474`
+- `crates/agent/src/skill_file_store.rs:875-900`
+
+**Trigger:** A skill gains a new auxiliary file after a snapshot, such as `scripts/new.py`, and the operator or Agent invokes `restore_latest` to roll back to the older snapshot that does not contain that file.
+
+**Control flow:** Restore creates the destination directory and recursively copies snapshot entries over it, but never removes or atomically replaces the current skill directory. Files present only in the current version survive the restore. The operation also does not security-scan the final restored directory.
+
+**Impact:** Rollback reports success while newly added behavior remains active. A faulty or unsafe script can survive an attempted recovery, and subsequent loading sees a hybrid state that never existed in any snapshot.
+
+**Repair direction:** Restore into a fresh sibling directory, security-scan the complete candidate, then atomically swap it into place while retaining the current snapshot for undo. Add a regression test proving destination-only files disappear.
+
+**Evidence:** Direct copy semantics proof. Existing restore tests verify that snapshot files are copied back, but do not assert removal of files absent from the snapshot.
+
+**Resolution:** Fixed. Every mutation snapshot now captures the complete skill directory. Restore builds and safety-scans a fresh sibling candidate, renames the live directory aside, swaps the candidate into place, and removes the replaced directory only after commit. Destination-only files therefore disappear. Regression tests: `skill_file_store_restore_is_exact_and_removes_new_files` and `skill_file_store_restore_is_exact_and_scans_snapshot`.
+
+### M15 — Medium: Skill mutations can report failure after partially committing filesystem state
+
+**Locations:**
+
+- `crates/agent/src/skill_file_store.rs:154-195`
+- `crates/agent/src/skill_file_store.rs:198-257`
+- `crates/agent/src/skill_file_store.rs:284-320`
+- `crates/agent/src/skill_file_store.rs:477-502`
+
+**Trigger:** A secondary step fails after the primary content write, such as `meta.yaml` creation, re-enabling the toggle file, or deleting `.skills_prompt_snapshot.json`.
+
+**Control flow:** Create first makes the live directory and writes `SKILL.md`, then writes metadata and cache/toggle state. Edit, patch, and auxiliary writes similarly commit the primary file before updating toggle/cache state. There is no staging directory, rollback guard, or committed-state marker. The caller receives `Err` even though the skill may already be created or changed; a create retry is then rejected because the partial directory exists, while a patch retry may apply against already-mutated content.
+
+**Impact:** Failures are ambiguous and retries are not safe. Reviews can be recorded as failed even though they changed active skill state, and partially created skills can require manual repair.
+
+**Repair direction:** Stage complete create operations and atomically rename them into place. For mutations, define a transaction/commit order in which post-write cache invalidation is infallible or recoverable, and roll back from the snapshot when a required secondary update fails. Return an explicit committed-with-warning result for non-critical cache cleanup failures rather than a generic failure.
+
+**Evidence:** Direct ordered-write proof. Existing mutation tests cover successful invalidation and normal snapshots, not injected failures between steps.
+
+**Resolution:** Fixed. Create writes and scans a complete staging directory before one live-directory rename. After committed create/edit/patch/write/restore/delete operations, toggle and prompt-snapshot maintenance failures are logged without turning a visible commit into `Err`; parent-sync and replaced-directory cleanup failures follow the same committed-with-warning rule. Regression test: `skill_file_store_post_commit_cache_failure_is_non_fatal`.
+
+## Module 5 Task 5 architecture risks and missing coverage
+
+- `MemoryFileStore::restore_latest` restores snapshot text without re-running the learned-memory security scan or the current character budget. Snapshots normally originate from previously accepted content, but external modification or legacy snapshots can reintroduce unsafe/oversized memory.
+- `LearningCoordinator::evaluate_nudge` calls `check_skill_nudge` twice in one branch. No production caller currently uses this method, so it is recorded as dormant correctness debt rather than a live defect.
+- Ghost review side effects and ledger audit are not one transaction. A process crash after a file write but before review-run insertion leaves an unaudited mutation and makes retry semantics dependent on the action's accidental idempotency.
+- Coverage now closes cross-session Ghost recall, per-message Runtime nudge accumulation, active lease-loss cancellation, symlinked skills, split-payload patch scanning, destination-only rollback files, unsafe snapshot restore, and post-commit cache failure. A real process crash between external file mutation and ledger audit remains untested.
+
+## Module 5 Task 5 reviewed areas with no confirmed defect
+
+- Ghost policy is refreshed from the live Runtime configuration before turn/delegation/evolution decisions; no stale-policy path was confirmed.
+- Pending episode claim and completed/failed review-run insertion use transactional owner-aware ledger updates, preventing a stale worker from overwriting the winning ledger state at finalization.
+- Provider lifecycle uses shutdown guards, and review failure paths record failed runs when ownership remains valid.
+- Restricted Ghost background review exposes only `memory_manage`, `session_search`, and `skill_view`; it cannot modify skills directly.
+- Learning reservation/completion RAII balances throttle slots on early return, task cancellation, and panic unwind within one coordinator instance.
+- File-memory add/replace/remove normal paths scan newly supplied content, require unique replacement/removal matches, serialize read-modify-write with process and owner-aware filesystem locks, snapshot before mutation, and use durable atomic replacement.
+- Skill target names and auxiliary relative paths reject lexical traversal components and constrain ordinary auxiliary files to approved subdirectories; the remaining escape is the unresolved symlink boundary in M12.
+- Skill snapshots skip symlink entries, and successful writes use durable temporary-file replacement.
+
 ## Module 5 Task 4 architecture risks and missing coverage
 
 - `restore` immediately enqueues and performs a vector upsert without checking whether `expires_at` is already in the past. Canonical retrieval filters the row, but the stale vector can occupy finite candidate windows until maintenance.
@@ -686,4 +868,5 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Module 2 Task 3 task state, restart recovery, event emission, notification routing, shared state, spawned-task ownership, shutdown, and cache-key review: complete. R13-R19 are fixed and regression-tested.
 - Module 5 structured-memory and learning-lock findings M1-M3: reviewed, fixed, and regression-tested.
 - Module 5 Task 4 persistence, retrieval, session isolation, vector synchronization, crash consistency, and mutation-contract review: complete. M4-M8 are fixed and regression-tested.
+- Module 5 Task 5 Ghost decisions, background review, ledger leases, dedup/throttle lifetime, guarded file writes, snapshots, rollback, traversal, and security scanning: complete. M9-M15 are fixed and regression-tested.
 - The implementation and verification record is in `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review-fixes.md`.

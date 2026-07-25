@@ -341,6 +341,7 @@ impl AgentRuntime {
                             let event_tx = self.event_tx.clone();
                             let agent_id = self.agent_id.clone();
                             let event_emitter = self.system_event_emitter.clone();
+                            let learning_coordinator = Arc::clone(&self.learning_coordinator);
                             let tool_registry = self.tool_registry.clone();
                             let task_id_clone = task_id.clone();
                             let provider_pool = Arc::clone(&self.provider_pool);
@@ -426,6 +427,7 @@ impl AgentRuntime {
                                     event_tx,
                                     agent_id,
                                     event_emitter,
+                                    learning_coordinator,
                                     steering,
                                     steering_sender,
                                     msg,

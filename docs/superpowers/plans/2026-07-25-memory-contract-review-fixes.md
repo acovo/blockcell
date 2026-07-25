@@ -108,7 +108,7 @@
 - Modify: `docs/reviews/2026-07-24-agent-runtime-learning-review.md`
 - Modify: `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review.md`
 
-- [ ] Review Ghost learning decisions, deduplication, throttling, guarded file writes, background scheduling, and failure recovery end-to-end.
-- [ ] Run focused Ghost/learning tests without modifying production code during review.
-- [ ] Record confirmed defects, architecture risks, missing tests, and reviewed no-defect areas in the review MD.
-- [ ] Mark Module 5 Task 5 complete; do not fix or commit newly discovered defects without a new user instruction.
+- [x] Review Ghost learning decisions, deduplication, throttling, guarded file writes, background scheduling, and failure recovery end-to-end.
+- [x] Run focused Ghost/learning tests without modifying production code during review.
+- [x] Record confirmed defects, architecture risks, missing tests, and reviewed no-defect areas in the review MD.
+- [x] Mark Module 5 Task 5 complete; do not fix or commit newly discovered defects without a new user instruction.

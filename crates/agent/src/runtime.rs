@@ -2322,6 +2322,13 @@ impl AgentRuntime {
             as blockcell_tools::AgentRuntimeHandle;
         self.runtime_handle = Some(handle);
     }
+
+    pub(crate) fn install_shared_learning_coordinator(
+        &mut self,
+        coordinator: Arc<crate::learning_coordinator::LearningCoordinator>,
+    ) {
+        self.learning_coordinator = coordinator;
+    }
 }
 
 /// 创建技能部署成功后的回调，记录 EvolutionSuccess ghost learning boundary。

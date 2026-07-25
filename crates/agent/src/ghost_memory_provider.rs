@@ -371,8 +371,13 @@ impl GhostMemoryProvider for LocalFileGhostMemoryProvider {
         self.build_system_prompt()
     }
 
-    fn prefetch(&self, query: &str, _session_id: &str, max_items: usize) -> Result<String> {
-        let items = query_file_memory_recall_items(&self.paths, query, max_items)?;
+    fn prefetch(&self, query: &str, session_id: &str, max_items: usize) -> Result<String> {
+        let items = query_file_memory_recall_items(
+            &self.paths,
+            (!session_id.is_empty()).then_some(session_id),
+            query,
+            max_items,
+        )?;
         let lines = items
             .into_iter()
             .map(|item| format!("- [{}] {}", item.source, item.content.trim()))

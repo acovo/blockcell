@@ -63,14 +63,26 @@ pub struct MemoryFileStore {
 
 impl MemoryFileStore {
     pub fn open(paths: &Paths) -> Result<Self> {
-        fs::create_dir_all(paths.memory_dir())?;
-        let snapshots_dir = paths.memory_dir().join(".snapshots");
+        Self::open_at(paths.user_md(), paths.memory_md(), paths.memory_dir())
+    }
+
+    pub fn open_for_session(paths: &Paths, session_key: &str) -> Result<Self> {
+        let root = paths
+            .memory_dir()
+            .join("sessions")
+            .join(blockcell_core::stable_hash_session_key(session_key));
+        Self::open_at(root.join("USER.md"), root.join("MEMORY.md"), root)
+    }
+
+    fn open_at(user_path: PathBuf, memory_path: PathBuf, state_dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&state_dir)?;
+        let snapshots_dir = state_dir.join(".snapshots");
         fs::create_dir_all(&snapshots_dir)?;
         Ok(Self {
-            user_path: paths.user_md(),
-            memory_path: paths.memory_md(),
+            user_path,
+            memory_path,
             snapshots_dir,
-            lock_path: paths.memory_dir().join(".memory_file_store.lockdir"),
+            lock_path: state_dir.join(".memory_file_store.lockdir"),
             write_guard: None,
             write_lock: Arc::new(Mutex::new(())),
         })
@@ -470,6 +482,29 @@ mod tests {
             .user_block
             .unwrap()
             .contains("User prefers concise Chinese updates."));
+    }
+
+    #[test]
+    fn ghost_session_file_memory_is_isolated_by_session_key() {
+        let paths = test_paths("ghost-session-isolation");
+        let session_a = MemoryFileStore::open_for_session(&paths, "cli:session-a").unwrap();
+        let session_b = MemoryFileStore::open_for_session(&paths, "cli:session-b").unwrap();
+
+        session_a
+            .add(
+                MemoryFileTarget::Memory,
+                "Session A uses a private canary codename.",
+            )
+            .unwrap();
+
+        assert!(session_a
+            .load_snapshot()
+            .unwrap()
+            .memory_block
+            .unwrap()
+            .contains("private canary codename"));
+        assert!(session_b.load_snapshot().unwrap().memory_block.is_none());
+        assert!(!paths.memory_md().exists());
     }
 
     #[test]

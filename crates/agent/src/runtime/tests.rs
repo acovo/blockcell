@@ -2610,6 +2610,28 @@ fn test_runtime() -> AgentRuntime {
     test_runtime_with_provider_and_paths(paths, Arc::new(TestProvider), config)
 }
 
+#[test]
+fn shared_learning_coordinator_accumulates_turns_across_message_runtimes() {
+    let first = test_runtime();
+    let shared = Arc::clone(&first.learning_coordinator);
+
+    first.learning_coordinator.on_turn_start(true);
+
+    let mut second = test_runtime();
+    second.install_shared_learning_coordinator(Arc::clone(&shared));
+    second.learning_coordinator.on_turn_start(true);
+
+    let mut third = test_runtime();
+    third.install_shared_learning_coordinator(Arc::clone(&shared));
+    third.learning_coordinator.on_turn_start(true);
+
+    assert!(Arc::ptr_eq(&shared, &third.learning_coordinator));
+    assert!(third
+        .learning_coordinator
+        .check_memory_nudge(true)
+        .is_some());
+}
+
 fn test_runtime_with_provider(provider: Arc<dyn Provider>) -> AgentRuntime {
     let mut config = Config::default();
     config.agents.defaults.model = "test/mock".to_string();
@@ -3352,8 +3374,15 @@ async fn ghost_learning_closes_loop_from_experience_to_file_memory_only() {
 
     wait_for_runtime_review_runs(&paths, 1).await;
 
-    let user_memory = std::fs::read_to_string(paths.user_md()).expect("read USER.md");
-    let durable_memory = std::fs::read_to_string(paths.memory_md()).expect("read MEMORY.md");
+    assert!(!paths.user_md().exists());
+    assert!(!paths.memory_md().exists());
+    let scoped_memory =
+        crate::memory_file_store::MemoryFileStore::open_for_session(&paths, "cli:ghost-closure")
+            .expect("open scoped ghost memory")
+            .load_snapshot()
+            .expect("load scoped ghost memory");
+    let user_memory = scoped_memory.user_block.expect("scoped USER memory");
+    let durable_memory = scoped_memory.memory_block.expect("scoped MEMORY memory");
     assert!(user_memory.contains("canary-first rollout"));
     assert!(durable_memory.contains("Confirm rollback plan before release verification"));
     assert!(!paths

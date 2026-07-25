@@ -107,10 +107,10 @@
 - Inspect: `crates/agent/src/unified_security_scanner.rs`
 - Inspect: `crates/storage/src/ghost_ledger.rs`
 
-- [ ] Trace all learning boundaries and decisions through deduplication, throttling, background review, ledger state, security scanning, snapshot creation, write, rollback, and audit.
-- [ ] Verify that failures release throttle slots and locks, retries cannot double-write, configuration reload reaches live components, and session/user boundaries remain intact.
-- [ ] Check generated Markdown and skill patches for traversal, symlink, prompt-injection, unsafe-content, and lost-update risks.
-- [ ] Run focused tests using `cargo test -p blockcell-agent ghost -- --nocapture` and `cargo test -p blockcell-agent learning -- --nocapture`.
+- [x] Trace all learning boundaries and decisions through deduplication, throttling, background review, ledger state, security scanning, snapshot creation, write, rollback, and audit.
+- [x] Verify that failures release throttle slots and locks, retries cannot double-write, configuration reload reaches live components, and session/user boundaries remain intact.
+- [x] Check generated Markdown and skill patches for traversal, symlink, prompt-injection, unsafe-content, and lost-update risks.
+- [x] Run focused tests using `cargo test -p blockcell-agent ghost -- --nocapture` and `cargo test -p blockcell-agent learning -- --nocapture`.
 
 ### Task 6: Review skill evolution lifecycle
 
