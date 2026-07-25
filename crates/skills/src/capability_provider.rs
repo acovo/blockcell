@@ -441,6 +441,47 @@ impl CapabilityRegistry {
         }
     }
 
+    /// Remove all in-memory state for a capability after a failed activation.
+    pub fn unregister(&mut self, id: &str) {
+        self.descriptors.remove(id);
+        self.executors.remove(id);
+        self.lifecycles.remove(id);
+        self.canary_trackers.remove(id);
+    }
+
+    /// Register a capability and persist it as one transaction. Any persistence
+    /// failure restores the exact previous in-memory registration, if one existed.
+    pub fn register_with_executor_and_save(
+        &mut self,
+        descriptor: CapabilityDescriptor,
+        executor: Arc<dyn CapabilityExecutor>,
+    ) -> Result<()> {
+        let id = descriptor.id.clone();
+        let previous_descriptor = self.descriptors.get(&id).cloned();
+        let previous_executor = self.executors.get(&id).cloned();
+        let previous_lifecycle = self.lifecycles.get(&id).cloned();
+        let previous_canary = self.canary_trackers.get(&id).cloned();
+
+        self.register_with_executor(descriptor, executor);
+        if let Err(error) = self.save() {
+            self.unregister(&id);
+            if let Some(value) = previous_descriptor {
+                self.descriptors.insert(id.clone(), value);
+            }
+            if let Some(value) = previous_executor {
+                self.executors.insert(id.clone(), value);
+            }
+            if let Some(value) = previous_lifecycle {
+                self.lifecycles.insert(id.clone(), value);
+            }
+            if let Some(value) = previous_canary {
+                self.canary_trackers.insert(id, value);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// 获取能力描述符
     pub fn get_descriptor(&self, id: &str) -> Option<&CapabilityDescriptor> {
         self.descriptors.get(id)
@@ -791,10 +832,21 @@ impl CapabilityRegistry {
             };
 
             self.executors.insert(id.clone(), executor);
-            self.lifecycles
-                .insert(id.clone(), CapabilityLifecycle::Active);
-            if let Some(desc) = self.descriptors.get_mut(&id) {
-                desc.status = CapabilityStatus::Active;
+            let observing = self
+                .descriptors
+                .get(&id)
+                .is_some_and(|desc| matches!(desc.status, CapabilityStatus::Available));
+            if observing {
+                self.lifecycles
+                    .insert(id.clone(), CapabilityLifecycle::Observing);
+                self.canary_trackers
+                    .insert(id.clone(), CanaryTracker::new());
+            } else {
+                self.lifecycles
+                    .insert(id.clone(), CapabilityLifecycle::Active);
+                if let Some(desc) = self.descriptors.get_mut(&id) {
+                    desc.status = CapabilityStatus::Active;
+                }
             }
             rehydrated += 1;
             info!(
@@ -1144,5 +1196,39 @@ mod tests {
         assert_eq!(stats.active, 1);
         assert_eq!(stats.available, 2); // Active + Available
         assert_eq!(stats.evolving, 1);
+    }
+
+    #[test]
+    fn canary_restart_keeps_evolved_capability_observing() {
+        let dir = std::env::temp_dir().join(format!(
+            "test_cap_registry_canary_restart_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let artifact = dir.join("candidate.sh");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&artifact, "#!/bin/bash\necho '{}'").unwrap();
+
+        let mut registry = CapabilityRegistry::new(dir.clone());
+        let cap = CapabilityDescriptor::new(
+            "test.canary",
+            "Canary",
+            "Restart canary",
+            CapabilityType::Internal,
+            ProviderKind::Process,
+        )
+        .with_provider_path(&artifact.to_string_lossy());
+        registry.register_with_executor(cap, Arc::new(MockExecutor));
+        registry.save().unwrap();
+
+        let mut restored = CapabilityRegistry::new(dir.clone());
+        restored.load().unwrap();
+        assert_eq!(restored.rehydrate_executors(), 1);
+        assert!(matches!(
+            restored.get_descriptor("test.canary").unwrap().status,
+            CapabilityStatus::Available
+        ));
+        assert!(restored.canary_trackers.contains_key("test.canary"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

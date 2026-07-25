@@ -124,10 +124,10 @@
 - Inspect: `crates/scheduler/src/skill_evolution_worker.rs`
 - Inspect: `crates/scheduler/src/ghost.rs`
 
-- [ ] Trace error observation to candidate generation, audit, compilation, testing, versioning, deployment, canary promotion, and rollback.
-- [ ] Check state-machine transitions, atomic replacement, signature/trust decisions, concurrent evolution, recovery after restart, and audit completeness.
-- [ ] Confirm that generated code cannot bypass tool/path policy through Rhai, Python, shell, or deployment hooks.
-- [ ] Run `cargo test -p blockcell-skills -- --nocapture` and focused scheduler tests.
+- [x] Trace error observation to candidate generation, audit, compilation, testing, versioning, deployment, canary promotion, and rollback.
+- [x] Check state-machine transitions, atomic replacement, signature/trust decisions, concurrent evolution, recovery after restart, and audit completeness.
+- [x] Confirm that generated code cannot bypass tool/path policy through Rhai, Python, shell, or deployment hooks.
+- [x] Run `cargo test -p blockcell-skills -- --nocapture` and focused scheduler tests.
 
 ### Task 7: Cross-boundary synthesis and report completion
 

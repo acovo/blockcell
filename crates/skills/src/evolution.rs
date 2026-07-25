@@ -5,6 +5,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
+pub(crate) fn validate_skill_name(skill_name: &str) -> Result<()> {
+    let path = Path::new(skill_name);
+    let mut components = path.components();
+    let valid = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !valid || skill_name.trim().is_empty() {
+        return Err(Error::Skill(format!("Invalid skill name: {}", skill_name)));
+    }
+    Ok(())
+}
+
 // --- submodules extracted from the original monolithic evolution.rs ---
 mod audit;
 mod compile;

@@ -1283,22 +1283,16 @@ impl EvolutionService {
                 stats.record_call(&evolution_id, is_error);
             }
 
-            if let Ok(mut record) = self.evolution.load_record(&evolution_id) {
-                if *record.status.normalize() == EvolutionStatus::Observing {
-                    record.observation_total_calls += 1;
-                    if is_error {
-                        record.observation_error_calls += 1;
-                    }
-                    record.updated_at = chrono::Utc::now().timestamp();
-                    if let Err(e) = self.evolution.save_record_public(&record) {
-                        warn!(
-                            skill = %skill_name,
-                            evolution_id = %evolution_id,
-                            error = %e,
-                            "🧠 [观察] 持久化观察期调用统计失败"
-                        );
-                    }
-                }
+            if let Err(e) = self
+                .evolution
+                .record_observation_call(&evolution_id, is_error)
+            {
+                warn!(
+                    skill = %skill_name,
+                    evolution_id = %evolution_id,
+                    error = %e,
+                    "🧠 [观察] 持久化观察期调用统计失败"
+                );
             }
         }
     }
@@ -1920,6 +1914,7 @@ impl EvolutionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evolution::ObservationWindow;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1972,6 +1967,20 @@ mod tests {
             staged: false,
             staging_skills_dir: None,
         }
+    }
+
+    #[tokio::test]
+    async fn evolution_rejects_parent_directory_skill_name() {
+        let (root, skills_dir) = setup_test_dirs("invalid_skill_name");
+        let service = make_service(skills_dir);
+
+        let error = service
+            .trigger_manual_evolution("..", "rewrite parent")
+            .await
+            .expect_err("parent directory skill name must be rejected");
+
+        assert!(error.to_string().contains("Invalid skill name"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2166,6 +2175,37 @@ mod tests {
 
         assert!((stats.error_rate("evo_1") - 1.0 / 3.0).abs() < 0.01);
         assert_eq!(stats.error_rate("evo_unknown"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn observation_concurrent_reports_preserve_all_counts() {
+        let (root, skills_dir) = setup_test_dirs("observation_concurrent");
+        let service = Arc::new(make_service(skills_dir));
+        let context = test_context("observed_skill");
+        let evolution_id = service.evolution.trigger_evolution(context).await.unwrap();
+        let mut record = service.evolution.load_record(&evolution_id).unwrap();
+        record.status = EvolutionStatus::Observing;
+        record.observation = Some(ObservationWindow::default());
+        service.evolution.save_record_public(&record).unwrap();
+
+        let mut tasks = Vec::new();
+        for index in 0..20 {
+            let service = Arc::clone(&service);
+            let evolution_id = evolution_id.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                service
+                    .evolution
+                    .record_observation_call(&evolution_id, index % 4 == 0)
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        let record = service.evolution.load_record(&evolution_id).unwrap();
+        assert_eq!(record.observation_total_calls, 20);
+        assert_eq!(record.observation_error_calls, 5);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

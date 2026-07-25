@@ -5,6 +5,7 @@ pub mod core_evolution;
 pub mod dispatcher;
 pub mod engine;
 pub mod evolution;
+mod file_owner_lock;
 pub mod manager;
 pub mod openclaw_parser;
 pub mod service;

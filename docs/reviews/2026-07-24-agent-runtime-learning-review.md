@@ -1,7 +1,7 @@
 # Agent Runtime and Learning Systems Review
 
 **Date:** 2026-07-24
-**Status:** Module 5 Task 5 findings remediated; Module 5 Task 6 review pending
+**Status:** Module 5 Task 6 skill-evolution lifecycle review complete; M16-M25 remediated
 **Plan:** `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review.md`
 
 ## Verification baseline
@@ -39,6 +39,20 @@ Module 5 Task 5 review verification (review-only; no production-code changes):
 - `cargo test -p blockcell-agent skill_file_store -- --nocapture`: 29 passed, 0 failed.
 - `cargo test -p blockcell-storage ghost_ledger -- --nocapture`: 6 passed, 0 failed.
 - `cargo test -p blockcell-agent runtime -- --nocapture`: 127 passed, 0 failed.
+
+Module 5 Task 6 review verification (review-only; no production-code changes):
+
+- `cargo test -p blockcell-skills -- --nocapture`: 113 unit tests and 6 integration tests passed, 0 failed.
+- `cargo test -p blockcell-scheduler ghost:: -- --nocapture`: 7 passed, 0 failed.
+- `cargo test -p blockcell-scheduler evolution -- --nocapture`: 0 matching tests; the evolution workers currently have no focused unit coverage.
+- `cargo test -p blockcell-scheduler -- --nocapture`: 53 passed, 2 failed in pre-existing `consolidator` lock-cleanup tests outside Task 6 (`test_dream_releases_lock_when_commit_backup_recovery_fails` and `test_dream_cleans_state_and_lock_when_staging_prepare_fails`).
+
+Module 5 Task 6 remediation verification:
+
+- `cargo test -p blockcell-skills -- --nocapture`: 123 unit tests and 6 integration tests passed, 0 failed.
+- `cargo test -p blockcell-storage evolution_workflow -- --nocapture`: 5 passed, 0 failed.
+- `cargo test -p blockcell-scheduler -- --nocapture`: 55 passed, with the same 2 pre-existing `consolidator` lock-cleanup failures outside Task 6.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
 
 ## Runtime lifecycle map
 
@@ -821,6 +835,227 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Skill target names and auxiliary relative paths reject lexical traversal components and constrain ordinary auxiliary files to approved subdirectories; the remaining escape is the unresolved symlink boundary in M12.
 - Skill snapshots skip symlink entries, and successful writes use durable temporary-file replacement.
 
+### M16 — High: Core evolution executes unaudited LLM-generated shell directly on the host
+
+**Locations:**
+
+- `crates/tools/src/system_info.rs:551-568`
+- `crates/skills/src/core_evolution/generation.rs:54-124`
+- `crates/skills/src/core_evolution.rs:900-1032`
+- `crates/skills/src/core_evolution.rs:1035-1192`
+
+**Trigger:** The model requests a Process/BuiltIn capability and the generation provider returns syntactically valid shell containing destructive filesystem access, credential reads, network exfiltration, process spawning, or another host-side effect.
+
+**Control flow:** `system_info(action="request")` lets the model enqueue a capability description. Core evolution sends that description to an LLM, extracts the returned code, and performs only `bash -n` before writing an executable artifact. `validate_artifact` then launches the generated script with ordinary `bash` on the daemon host and sends `{}` to stdin. It does not call the skill static audit, the unified security scanner, a permission policy, a restricted tool layer, or a sandbox. The ten-second timeout wraps `wait_with_output`; dropping that future does not configure `kill_on_drop`, so a timed-out child can continue running after validation returns.
+
+**Impact:** Prompt injection or a compromised generation model can obtain arbitrary command execution with the Blockcell process's OS permissions during validation, before any user invokes the capability. A forked or daemonized child can survive the validation timeout.
+
+**Repair direction:** Treat generated code as untrusted. Apply a deterministic policy before artifact creation, execute validation in an OS sandbox with an empty/minimal environment, read-only workspace, no network, bounded resources, and an explicit allowlist, and kill the entire process group on timeout/cancellation. Require explicit user approval for privilege-bearing capability classes.
+
+**Evidence:** Direct control-flow proof. The Skills suite tests extraction, syntax, provider timeouts, and registry behavior, but has no test asserting that generated shell cannot access host files/network or survive validation timeout.
+
+**Resolution:** Fixed. Core evolution now applies deterministic static policy before writing generated artifacts, and shell validation is syntax-only rather than executing generated code on the host. Regression test: `evolution_rejects_dangerous_generated_process_code`.
+
+### M17 — High: Prompt-only skill evolution bypasses the learned-skill prompt-injection scanner
+
+**Locations:**
+
+- `crates/skills/src/audit.rs:80-123`
+- `crates/skills/src/audit.rs:241-288`
+- `crates/skills/src/service.rs:730-910`
+- `crates/skills/src/evolution/versioning.rs:23-78`
+
+**Trigger:** An evolution prompt or adjacent/historical skill content causes the LLM to generate a `SKILL.md` containing prompt injection, deceptive instructions, context-exfiltration directions, or another payload that is long enough and contains Markdown headings.
+
+**Control flow:** The evolution pipeline's deterministic audit for `PromptTool` calls only `check_prompt_only` plus size/empty checks. Unlike `SkillFileStore`, it does not use the unified AgentCreated skill scanner. The independent LLM audit reviews content but is not a deterministic trust boundary. After compile/contract checks, `create_new_version` writes `patch.diff` directly to live `SKILL.md`.
+
+**Impact:** Self-evolution can persist instructions that later enter the Agent prompt and influence tool use or disclose context, bypassing the scanner enforced for ordinary learned-skill writes.
+
+**Repair direction:** Route every evolution candidate through the same AgentCreated directory-level security policy used by guarded skill writes, scan the complete final skill tree immediately before commit, and reject rather than retry indefinitely on policy violations that cannot be safely transformed.
+
+**Evidence:** Direct policy comparison. Existing prompt-only audit tests cover only minimum length and headings; no evolution test covers prompt injection or context exfiltration.
+
+**Resolution:** Fixed. PromptTool static audit now blocks deterministic prompt-injection and system-prompt exfiltration instructions before deployment. Regression test: `evolution_rejects_prompt_injection_in_prompt_only_skill`.
+
+### M18 — High: Skill names are joined into live and version paths without validation
+
+**Locations:**
+
+- `crates/skills/src/service.rs:1670-1725`
+- `crates/skills/src/evolution/lifecycle.rs:105-137`
+- `crates/skills/src/evolution/versioning.rs:17-43`
+- `crates/skills/src/versioning.rs:301-312`
+
+**Trigger:** A manual or externally constructed evolution context supplies a special skill name such as `..`, an absolute path, or a multi-component relative path.
+
+**Control flow:** `trigger_manual_evolution`, `trigger_external_evolution`, and `trigger_evolution` do not apply the single-component skill-name validation used by version import and guarded skill mutation. Deployment joins `record.skill_name` directly below the selected skill root, and VersionManager repeats the same unchecked joins for live files, history, versions, cleanup, and rollback. For example, `skills_dir.join("..")` resolves to the workspace parent while the generated evolution record ID remains a valid single filename.
+
+**Impact:** A crafted evolution can overwrite, snapshot, clear, restore, or delete files outside the skills directory under the process's permissions. Rollback and staged cleanup enlarge the possible destructive scope.
+
+**Repair direction:** Validate the skill identifier once at every public trigger boundary, require exactly one normal path component, canonicalize the skills root, reject symlinked target chains, and revalidate persisted records before every filesystem mutation.
+
+**Evidence:** Deterministic path semantics. Import has explicit component validation, demonstrating the intended rule, but the evolution triggers and VersionManager do not share it.
+
+**Resolution:** Fixed. Evolution triggers and all VersionManager path boundaries share a one-normal-component skill-name validator before joining filesystem paths. Regression tests: `evolution_rejects_parent_directory_skill_name` and `version_manager_rejects_parent_directory_skill_name`.
+
+### M19 — Medium: Evolution workers continue side effects after losing their workflow lease
+
+**Locations:**
+
+- `crates/scheduler/src/evolution_worker.rs:182-206`
+- `crates/scheduler/src/evolution_worker.rs:439-483`
+- `crates/scheduler/src/skill_evolution_worker.rs:178-199`
+- `crates/scheduler/src/skill_evolution_worker.rs:455-496`
+
+**Trigger:** A generation, compile, validation, load, or full skill pipeline step outlives its lease while heartbeat renewal returns false or fails three consecutive times; another worker recovers and reclaims the workflow.
+
+**Control flow:** Both heartbeat tasks only log and exit. They do not signal the active engine/pipeline future. The stale worker continues writing records/artifacts, executing validation, registering capabilities, deploying skills, or creating versions. The post-step ownership check discards only the workflow-store result after those side effects have happened.
+
+**Impact:** Two workers can execute the same non-idempotent evolution side effects, producing conflicting versions, duplicate validation execution, stale registry activation, or a live deployment with no matching winning workflow audit.
+
+**Repair direction:** Couple heartbeat ownership to an abort token, select every long-running provider/process/engine operation against it, check immediately before filesystem/registry mutations, and make step commits idempotent under a durable step key.
+
+**Evidence:** Direct control-flow proof; the workers have no focused tests, including no lease-loss-during-step case.
+
+**Resolution:** Fixed. Both evolution workers expose heartbeat lease loss through a cancellation receiver and select active pipeline work against it, stopping the stale future before result commit. Regression test: `evolution_lease_loss_cancels_pending_step`.
+
+### M20 — Medium: Restart promotes every persisted evolved capability past canary
+
+**Locations:**
+
+- `crates/skills/src/capability_provider.rs:401-441`
+- `crates/skills/src/capability_provider.rs:490-536`
+- `crates/skills/src/capability_provider.rs:717-749`
+- `crates/skills/src/capability_provider.rs:752-804`
+
+**Trigger:** The process restarts while a newly evolved capability is still `Available`/Observing and has fewer than five canary calls, or has accumulated errors below the evaluation point.
+
+**Control flow:** Registration stores canary counters only in the in-memory `canary_trackers` map. `save` persists descriptors but not trackers/lifecycle. On restart, `load` restores descriptors and `rehydrate_executors` rebuilds every persisted executor, sets its lifecycle to Active, and changes its descriptor status to Active without replaying or restarting canary.
+
+**Impact:** Restart is a promotion bypass. An unproven or already erroring capability becomes fully Active without meeting `CANARY_MIN_CALLS`, and the lost observations cannot trigger automatic rejection.
+
+**Repair direction:** Persist lifecycle and canary totals atomically with the descriptor, restore Observing capabilities as Observing, and continue or conservatively restart the canary after executor rehydration.
+
+**Evidence:** Direct restart-state proof. Registry tests cover in-process canary behavior and executor replacement, not save/load during canary.
+
+**Resolution:** Fixed. Rehydration keeps persisted Available evolved capabilities in Observing and starts a fresh conservative canary tracker instead of promoting them to Active. Regression test: `canary_restart_keeps_evolved_capability_observing`.
+
+### M21 — Medium: Skill durable workflows never leave Observing after success or rollback
+
+**Locations:**
+
+- `crates/scheduler/src/skill_evolution_worker.rs:202-215`
+- `crates/scheduler/src/skill_evolution_worker.rs:281-313`
+- `crates/skills/src/service.rs:993-1018`
+- `crates/skills/src/service.rs:1175-1228`
+
+**Trigger:** A deployed skill reaches the end of its observation window, either passing and becoming Completed or exceeding the error threshold and becoming RolledBack.
+
+**Control flow:** The worker changes the SQLite workflow to `Observing` when deployment starts. Later observation ticks run inside `EvolutionService` and update only the JSON evolution record plus in-memory maps. They have no workflow-store handle and never change the durable workflow to Promoted, Failed, or RolledBack. `workflow_blocks_enqueue` treats Observing as permanently active.
+
+**Impact:** Durable workflow status and audit remain stale forever, operational listings report work still observing, and the row permanently blocks re-enqueue decisions keyed to that evolution ID.
+
+**Repair direction:** Return explicit observation outcomes to the scheduler or inject a workflow-status callback, then atomically finalize the durable workflow on Completed/RolledBack and record the terminal observation metrics.
+
+**Evidence:** Repository-wide search finds the sole skill-workflow `Observing` write and no subsequent terminal update.
+
+**Resolution:** Fixed. Observation ticks now reconcile terminal JSON records back into the durable workflow store: Completed becomes Promoted, while RolledBack/Failed becomes Failed with terminal context. Regression test: `observation_workflow_maps_record_terminal_status`.
+
+### M22 — Medium: Concurrent observation reports lose persisted calls and can misclassify rollout health
+
+**Locations:**
+
+- `crates/skills/src/service.rs:1265-1300`
+- `crates/skills/src/service.rs:1165-1175`
+- `crates/skills/src/evolution/versioning.rs:413-453`
+
+**Trigger:** Two or more calls to the same observing skill finish concurrently, especially across Runtime instances or processes.
+
+**Control flow:** Each reporter loads the same JSON record, increments counters in its private copy, and replaces the record file. There is no per-record lock, compare-and-swap, or append-only event. One write can overwrite another. Once the persisted total is nonzero, observation evaluation prefers the persisted counters over the process-local tracker, so the in-memory count cannot repair the loss.
+
+**Impact:** Total/error counts and error rate are inaccurate. A bad rollout can be promoted because error calls were overwritten, or a good rollout can be rolled back from a distorted small sample.
+
+**Repair direction:** Store observation increments in a transactional database or owner-locked append log, aggregate atomically, and make evaluation consume one canonical counter source across processes.
+
+**Evidence:** Direct lost-update interleaving. Existing tests exercise `ObservationStats` sequentially only.
+
+**Resolution:** Fixed. Observation record load/increment/save is serialized by a stale-aware cross-process owner lock, preserving one canonical persisted count. Regression test: `observation_concurrent_reports_preserve_all_counts`.
+
+### M23 — Medium: Imported and restored skill versions have no authenticity or safety verification
+
+**Locations:**
+
+- `crates/skills/src/versioning.rs:324-349`
+- `crates/skills/src/versioning.rs:628-658`
+- `crates/skills/src/versioning.rs:726-863`
+
+**Trigger:** A user imports a tampered archive, or a local/legacy version snapshot is modified after creation, then switches or rolls back to it.
+
+**Control flow:** Import validates archive shape, link type, and size, but trusts `version.json`, does not recompute/compare its hash, has no signature/trust policy, and does not run the learned-skill security scan. Restore copies the selected snapshot into the live skill tree without verifying hash or scanning the complete candidate. The stored MD5 covers only the primary file at creation and is not enforced during restore.
+
+**Impact:** A modified snapshot can activate prompt injection or executable code while retaining apparently valid version metadata. Version history provides chronology but not artifact authenticity or policy compliance.
+
+**Repair direction:** Define trust levels for Manual/Evolution/Import, hash the complete canonical tree with a modern digest, verify it before restore, require signatures for external packages where applicable, and run the full directory security policy before atomic activation.
+
+**Evidence:** Direct import/restore control-flow proof. Tests cover traversal, symlinks, size, and nested asset preservation, not signature/hash mismatch or unsafe restored content.
+
+**Resolution:** Fixed. New snapshots store a sorted complete-tree SHA-256 digest; restore requires and verifies it, while import verifies supplied digests when present and security-audits the complete extracted candidate before storing it. Regression tests: `version_integrity_rejects_tampered_snapshot` and `version_integrity_rejects_unsafe_import`.
+
+### M24 — Medium: Capability activation reports success after registry persistence or rollback snapshot failure
+
+**Locations:**
+
+- `crates/skills/src/core_evolution.rs:1195-1262`
+- `crates/skills/src/core_evolution.rs:459-485`
+
+**Trigger:** `evolved_tools.json` cannot be written or capability version snapshot creation fails after the executor has been registered in memory.
+
+**Control flow:** `load_capability` registers the descriptor/executor first, logs and ignores `registry.save()` failure, then logs and ignores `create_version_if_new_artifact()` failure. It returns success, and `run_step` marks the CoreEvolutionRecord Active; the following Promote step is a no-op.
+
+**Impact:** The workflow can be marked Promoted while restart loses the capability, rollback has no snapshot, or audit claims activation that is only process-local. Retrying can encounter an already-mutated registry with incomplete durable state.
+
+**Repair direction:** Treat registry persistence and initial version snapshot as required transaction steps. Stage/verify the snapshot first, persist registry atomically, roll back the in-memory registration on failure, and only then mark Active/Promoted.
+
+**Evidence:** Direct ignored-error paths; no failure-injection test covers either persistence boundary.
+
+**Resolution:** Fixed. Capability activation now requires a rollback snapshot before registry mutation, persists registration as a transaction, restores any previous in-memory state on save failure, and propagates the error. Regression test: `capability_activation_failure_does_not_leave_registered_executor`.
+
+### M25 — Medium: Skill version operations are not serialized and history writes are not atomic
+
+**Locations:**
+
+- `crates/skills/src/versioning.rs:47-122`
+- `crates/skills/src/versioning.rs:124-278`
+- `crates/skills/src/versioning.rs:609-658`
+
+**Trigger:** Two processes or services create, switch, clean up, or roll back versions of the same skill concurrently; this can occur after lease loss/reclaim or through concurrent administrative operations.
+
+**Control flow:** Unlike `CapabilityVersionManager`, `VersionManager` has no per-skill process/file lock. Each operation independently reads `version_history.json`, chooses a version number, mutates snapshots/live files, and writes history with plain `std::fs::write`. Concurrent creates can both choose the same `vN`; cleanup can delete a snapshot being restored; a crash during history write can truncate the only history file.
+
+**Impact:** Version entries and snapshots can overwrite each other, current_version can point to the wrong or missing tree, rollback can restore a hybrid/incorrect state, and the recovery path itself can become unavailable.
+
+**Repair direction:** Add a per-skill cross-process owner lock around the full mutation, use unique staging directories and atomic/fsynced history replacement, and recover incomplete swap journals before each operation.
+
+**Evidence:** Direct read-modify-write interleaving. Capability versioning already implements the required locking/journaling pattern; skill versioning tests are single-threaded.
+
+**Resolution:** Fixed. Skill version create/switch/rollback/cleanup/import operations hold a per-skill owner lock across the complete read-modify-write interval, and history uses unique fsynced temporary files plus atomic replacement. Regression test: `version_concurrent_creates_preserve_history`.
+
+## Module 5 Task 6 architecture risks and missing coverage
+
+- Skill observation uses a fixed 60-minute window and can complete with zero calls; no minimum sample threshold is required before promotion.
+- Scheduled Ghost's `max_syncs_per_day` counter is process-local, so restart resets the daily quota; dispatch failures also consume quota before the message is accepted.
+- Core evolution supports DynamicLibrary as an advertised provider even though loading falls back to launching the `.dylib` path as a process; this is incomplete behavior rather than a newly proven privilege escalation.
+- Focused coverage now exercises lease-loss cancellation, observation terminal workflow synchronization, canary restart behavior, concurrent observation/version mutations, snapshot integrity, unsafe import, and partial activation rollback. A real process crash during a live skill-tree restore remains untested.
+
+## Module 5 Task 6 reviewed areas with no confirmed defect
+
+- Skill pipeline restart normalization maps interrupted Generating/Auditing/CompileFailed records back to a replayable checkpoint while preserving generated patch/feedback where available.
+- Static skill audit blocks several direct deletion, shell, eval, oversized-content, and wrong-language patterns before the independent LLM audit.
+- Skill snapshot copy and version import reject symlinks and special archive entries; import also constrains entries to one skill root and enforces entry/file/total size limits.
+- CapabilityVersionManager uses per-capability file locks, atomic history replacement, rollback journals, and executor rebinding after rollback.
+- Core workflow step selection distinguishes database query failure from legitimate completion, and workflow-store finalization checks lease ownership.
+- Scheduled Ghost hot reload retries failed reads, updates schedule state after configuration changes, and its prompt explicitly forbids skill creation.
+
 ## Module 5 Task 4 architecture risks and missing coverage
 
 - `restore` immediately enqueues and performs a vector upsert without checking whether `expires_at` is already in the past. Canonical retrieval filters the row, but the stale vector can occupy finite candidate windows until maintenance.
@@ -869,4 +1104,5 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Module 5 structured-memory and learning-lock findings M1-M3: reviewed, fixed, and regression-tested.
 - Module 5 Task 4 persistence, retrieval, session isolation, vector synchronization, crash consistency, and mutation-contract review: complete. M4-M8 are fixed and regression-tested.
 - Module 5 Task 5 Ghost decisions, background review, ledger leases, dedup/throttle lifetime, guarded file writes, snapshots, rollback, traversal, and security scanning: complete. M9-M15 are fixed and regression-tested.
-- The implementation and verification record is in `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review-fixes.md`.
+- Module 5 Task 6 skill/core evolution generation, audit, compilation, versioning, deployment, canary, restart recovery, rollback, worker leases, and scheduled Ghost review: complete. M16-M25 are fixed and regression-tested.
+- The implementation and verification record is in `docs/superpowers/plans/2026-07-25-skill-evolution-lifecycle-fixes.md`.

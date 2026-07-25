@@ -191,6 +191,21 @@ pub struct CoreEvolution {
 mod generation;
 
 impl CoreEvolution {
+    fn audit_generated_code(provider_kind: &ProviderKind, code: &str) -> Result<()> {
+        let skill_type = match provider_kind {
+            ProviderKind::ExternalApi => crate::evolution::SkillType::Python,
+            ProviderKind::RhaiScript => crate::evolution::SkillType::Rhai,
+            _ => crate::evolution::SkillType::LocalScript,
+        };
+        let result = crate::audit::static_audit(&skill_type, code);
+        if result.passed {
+            return Ok(());
+        }
+        Err(Error::Evolution(
+            crate::audit::format_static_audit_feedback(&result),
+        ))
+    }
+
     pub fn new(
         base_dir: PathBuf,
         registry: CapabilityRegistryHandle,
@@ -904,6 +919,8 @@ impl CoreEvolution {
             .as_ref()
             .ok_or_else(|| Error::Evolution("No source code to compile".to_string()))?;
 
+        Self::audit_generated_code(&record.provider_kind, code)?;
+
         std::fs::create_dir_all(&self.artifacts_dir)?;
 
         let safe_id = record.capability_id.replace('.', "_");
@@ -1073,104 +1090,16 @@ impl CoreEvolution {
             },
         });
 
-        // Check 3: For scripts, try a dry-run with empty input
+        // Check 3: Generated artifacts are not executed during validation. Syntax checks
+        // happen in compile_artifact; executing untrusted generated code on the host would
+        // turn validation into an arbitrary-command boundary.
         match record.provider_kind {
             ProviderKind::Process | ProviderKind::BuiltIn => {
-                // On Windows, bash is typically unavailable, so we skip the
-                // dry-run validation for shell scripts (same as compile_artifact
-                // skips bash -n syntax check on Windows). The script will be
-                // validated at runtime by Git Bash or WSL.
-                #[cfg(target_os = "windows")]
-                {
-                    debug!(
-                        path = %artifact_path,
-                        "🧬 [核心进化] Windows 环境，跳过 shell 脚本 dry-run 验证"
-                    );
-                    checks.push(ValidationCheck {
-                        name: "dry_run".to_string(),
-                        passed: true,
-                        message: "Shell script dry-run skipped on Windows (bash unavailable)"
-                            .to_string(),
-                    });
-                }
-
-                #[cfg(not(target_os = "windows"))]
-                let output = tokio::process::Command::new("bash")
-                    .arg(artifact_path)
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn();
-
-                #[cfg(not(target_os = "windows"))]
-                match output {
-                    Ok(mut child) => {
-                        // Send empty JSON input
-                        if let Some(mut stdin) = child.stdin.take() {
-                            use tokio::io::AsyncWriteExt;
-                            let _ = stdin.write_all(b"{}").await;
-                            drop(stdin);
-                        }
-
-                        let result = tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
-                            child.wait_with_output(),
-                        )
-                        .await;
-
-                        match result {
-                            Ok(Ok(output)) => {
-                                let stdout = String::from_utf8_lossy(&output.stdout);
-                                let exit_ok = output.status.success();
-                                let is_json =
-                                    serde_json::from_str::<serde_json::Value>(stdout.trim())
-                                        .is_ok();
-                                // Require both: successful exit AND valid JSON output
-                                let passed = exit_ok && is_json;
-                                checks.push(ValidationCheck {
-                                    name: "dry_run".to_string(),
-                                    passed,
-                                    message: if passed {
-                                        format!("Script executed successfully with valid JSON output ({} bytes)", stdout.len())
-                                    } else if !exit_ok {
-                                        let stderr = String::from_utf8_lossy(&output.stderr);
-                                        format!(
-                                            "Script exited with code {}: {}",
-                                            output.status.code().unwrap_or(-1),
-                                            stderr.chars().take(200).collect::<String>()
-                                        )
-                                    } else {
-                                        format!(
-                                            "Script ran but output is not valid JSON: {}",
-                                            stdout.chars().take(100).collect::<String>()
-                                        )
-                                    },
-                                });
-                            }
-                            Ok(Err(e)) => {
-                                checks.push(ValidationCheck {
-                                    name: "dry_run".to_string(),
-                                    passed: false,
-                                    message: format!("Script execution error: {}", e),
-                                });
-                            }
-                            Err(_) => {
-                                checks.push(ValidationCheck {
-                                    name: "dry_run".to_string(),
-                                    passed: false,
-                                    message: "Script timed out (10s)".to_string(),
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        checks.push(ValidationCheck {
-                            name: "dry_run".to_string(),
-                            passed: false,
-                            message: format!("Failed to spawn script: {}", e),
-                        });
-                    }
-                }
+                checks.push(ValidationCheck {
+                    name: "non_executing_validation".to_string(),
+                    passed: true,
+                    message: "Shell syntax validated without executing generated code".to_string(),
+                });
             }
             _ => {
                 // For other types, basic file check is sufficient
@@ -1241,23 +1170,17 @@ impl CoreEvolution {
             }
         };
 
-        let mut registry = self.registry.lock().await;
-        registry.register_with_executor(descriptor, executor);
-
-        // Persist registry
-        if let Err(e) = registry.save() {
-            warn!(error = %e, "Failed to persist capability registry");
-        }
-
-        // Create version snapshot for rollback support
-        if let Err(e) = self.version_manager.create_version_if_new_artifact(
+        // A rollback snapshot is a required activation precondition. Do this before
+        // mutating the in-memory registry so a failure cannot leave a live-only tool.
+        self.version_manager.create_version_if_new_artifact(
             &record.capability_id,
             artifact_path,
             CapabilityVersionSource::Evolution,
             Some(format!("Evolution {}", record.id)),
-        ) {
-            warn!(error = %e, "Failed to create capability version snapshot");
-        }
+        )?;
+
+        let mut registry = self.registry.lock().await;
+        registry.register_with_executor_and_save(descriptor, executor)?;
 
         Ok(())
     }
@@ -1466,6 +1389,15 @@ mod tests {
         assert!(code.contains("import json"));
     }
 
+    #[test]
+    fn evolution_rejects_dangerous_generated_process_code() {
+        let result = CoreEvolution::audit_generated_code(
+            &ProviderKind::Process,
+            "#!/bin/bash\nrm -rf /tmp/blockcell-generated-test\necho '{}'",
+        );
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn test_request_idempotent() {
         let dir = std::env::temp_dir().join("test_core_evo_idempotent");
@@ -1537,5 +1469,48 @@ mod tests {
         assert!(!evo.is_blocked("test.fail").unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn capability_activation_failure_does_not_leave_registered_executor() {
+        let root = std::env::temp_dir().join(format!(
+            "test_core_evo_activation_failure_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let artifact_dir = root.join("tool_artifacts");
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+        let artifact_path = artifact_dir.join("test_activation.sh");
+        std::fs::write(&artifact_path, "#!/bin/sh\necho '{}'\n").expect("write artifact");
+
+        let registry_path = root.join("registry-as-file");
+        std::fs::write(&registry_path, "not a directory").expect("create registry blocker");
+        let registry = crate::capability_provider::new_registry_handle(registry_path);
+        let evo = CoreEvolution::new(root.clone(), registry.clone(), 300);
+        let record = CoreEvolutionRecord {
+            id: "activation_failure".to_string(),
+            capability_id: "test.activation_failure".to_string(),
+            description: "test activation transaction".to_string(),
+            status: CoreEvolutionStatus::Validated,
+            provider_kind: ProviderKind::Process,
+            source_code: None,
+            artifact_path: Some(artifact_path.to_string_lossy().to_string()),
+            compile_output: None,
+            validation: None,
+            attempt: 1,
+            max_attempts: 3,
+            feedback_history: Vec::new(),
+            input_schema: None,
+            output_schema: None,
+            created_at: chrono::Utc::now().timestamp(),
+            updated_at: chrono::Utc::now().timestamp(),
+        };
+
+        assert!(evo.load_capability(&record).await.is_err());
+        let registry = registry.lock().await;
+        assert!(registry.get_descriptor(&record.capability_id).is_none());
+        assert!(registry.get_executor(&record.capability_id).is_none());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

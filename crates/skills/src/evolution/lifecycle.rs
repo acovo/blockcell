@@ -103,6 +103,7 @@ impl SkillEvolution {
 
     /// 触发技能进化
     pub async fn trigger_evolution(&self, context: EvolutionContext) -> Result<String> {
+        validate_skill_name(&context.skill_name)?;
         // Use milliseconds + random suffix to guarantee uniqueness even within the same second
         let evolution_id = format!(
             "evo_{}_{:x}",

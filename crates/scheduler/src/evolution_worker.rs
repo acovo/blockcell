@@ -47,6 +47,28 @@ enum NextStepResult {
     QueryFailed,
 }
 
+pub(crate) async fn run_with_lease_guard<F, T>(
+    future: F,
+    mut lease_lost: tokio::sync::watch::Receiver<bool>,
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    if *lease_lost.borrow() {
+        return None;
+    }
+    tokio::select! {
+        result = future => Some(result),
+        changed = lease_lost.changed() => {
+            if changed.is_err() || *lease_lost.borrow() {
+                None
+            } else {
+                None
+            }
+        }
+    }
+}
+
 impl EvolutionWorker {
     pub fn new(store: EvolutionWorkflowStore, engine: Arc<Mutex<CoreEvolution>>) -> Self {
         let worker_id = uuid::Uuid::new_v4().to_string();
@@ -180,14 +202,19 @@ impl EvolutionWorker {
                 );
 
                 // 6. Run the step via the engine
-                let (heartbeat_stop, heartbeat_handle) = self.spawn_lease_heartbeat(&workflow.id);
-                let result = self.run_step(&workflow, step).await;
+                let (heartbeat_stop, lease_lost, heartbeat_handle) =
+                    self.spawn_lease_heartbeat(&workflow.id);
+                let result = run_with_lease_guard(self.run_step(&workflow, step), lease_lost).await;
                 let _ = heartbeat_stop.send(());
                 if let Err(e) = heartbeat_handle.await {
                     if !e.is_cancelled() {
                         warn!(workflow_id = %workflow.id, error = %e, "Lease heartbeat task failed");
                     }
                 }
+                let Some(result) = result else {
+                    warn!(workflow_id = %workflow.id, step = step.name(), "Lost workflow lease while step was running; cancelled step future");
+                    return;
+                };
 
                 // 7. Renew lease after step completes (keep lease alive for next tick)
                 match self.store.renew_lease(
@@ -436,13 +463,21 @@ impl EvolutionWorker {
         }
     }
 
-    fn spawn_lease_heartbeat(&self, workflow_id: &str) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    fn spawn_lease_heartbeat(
+        &self,
+        workflow_id: &str,
+    ) -> (
+        oneshot::Sender<()>,
+        tokio::sync::watch::Receiver<bool>,
+        JoinHandle<()>,
+    ) {
         let store = self.store.clone();
         let workflow_id = workflow_id.to_string();
         let worker_id = self.worker_id.clone();
         let lease_duration_secs = self.lease_duration_secs;
         let heartbeat_secs = (lease_duration_secs / 3).clamp(5, 60) as u64;
         let (stop_tx, mut stop_rx) = oneshot::channel();
+        let (lost_tx, lost_rx) = tokio::sync::watch::channel(false);
 
         let handle = tokio::spawn(async move {
             let mut interval =
@@ -464,6 +499,7 @@ impl EvolutionWorker {
                             }
                             Ok(false) => {
                                 warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Lost evolution workflow lease during heartbeat");
+                                let _ = lost_tx.send(true);
                                 break;
                             }
                             Err(e) => {
@@ -471,6 +507,7 @@ impl EvolutionWorker {
                                 warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, consecutive_failures = consecutive_failures, max_retries = MAX_CONSECUTIVE_FAILURES, "Failed to heartbeat evolution workflow lease (will retry)");
                                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                                     warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Too many consecutive heartbeat failures, giving up lease");
+                                    let _ = lost_tx.send(true);
                                     break;
                                 }
                             }
@@ -480,7 +517,7 @@ impl EvolutionWorker {
             }
         });
 
-        (stop_tx, handle)
+        (stop_tx, lost_rx, handle)
     }
 
     /// Check whether the workflow has a pending cancel event.
@@ -518,5 +555,19 @@ impl EvolutionWorker {
 impl EvolutionNotifier for EvolutionWorker {
     fn notify(&self) {
         self.wakeup.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn evolution_lease_loss_cancels_pending_step() {
+        let (lease_tx, lease_rx) = tokio::sync::watch::channel(false);
+        lease_tx.send(true).unwrap();
+
+        let result = run_with_lease_guard(std::future::pending::<u32>(), lease_rx).await;
+        assert!(result.is_none());
     }
 }

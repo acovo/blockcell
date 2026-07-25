@@ -1,6 +1,25 @@
 use super::*;
 
 impl SkillEvolution {
+    pub fn record_observation_call(&self, evolution_id: &str, is_error: bool) -> Result<()> {
+        let records_dir = self.records_dir();
+        let _guard = crate::file_owner_lock::FileOwnerLock::acquire(
+            &records_dir,
+            "evolution-record",
+            evolution_id,
+        )?;
+        let mut record = self.load_record(evolution_id)?;
+        if *record.status.normalize() != EvolutionStatus::Observing {
+            return Ok(());
+        }
+        record.observation_total_calls += 1;
+        if is_error {
+            record.observation_error_calls += 1;
+        }
+        record.updated_at = chrono::Utc::now().timestamp();
+        self.save_record(&record)
+    }
+
     /// P0-2: create_new_version 直接写入完整脚本（不再 apply diff）
     ///
     /// 原子性保证：先记录当前版本号，写入新内容后创建 v2 快照。

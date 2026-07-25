@@ -18,6 +18,7 @@ which = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 md5 = { workspace = true }
+sha2 = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 shellexpand = "3"

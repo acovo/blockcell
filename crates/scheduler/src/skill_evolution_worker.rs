@@ -18,6 +18,8 @@ use tokio::sync::{broadcast, oneshot, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::evolution_worker::run_with_lease_guard;
+
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
 const DEFAULT_LEASE_DURATION_SECS: i64 = 300;
 const SKILL_PIPELINE_STEP: &str = "SkillEvolutionPipeline";
@@ -40,6 +42,33 @@ pub struct SkillEvolutionWorker {
 }
 
 impl SkillEvolutionWorker {
+    fn workflow_status_for_evolution(status: &EvolutionStatus) -> Option<&'static str> {
+        match *status.normalize() {
+            EvolutionStatus::Completed => Some("Promoted"),
+            EvolutionStatus::RolledBack | EvolutionStatus::Failed => Some("Failed"),
+            _ => None,
+        }
+    }
+
+    fn finalize_observation_workflows(&self) -> Result<()> {
+        for workflow in self.store.list_workflows(Some("Observing"))? {
+            let Ok(record) = self.service.evolution().load_record(&workflow.description) else {
+                continue;
+            };
+            let Some(status) = Self::workflow_status_for_evolution(&record.status) else {
+                continue;
+            };
+            let detail = if status == "Failed" {
+                Some(format!("Skill evolution ended as {:?}", record.status))
+            } else {
+                None
+            };
+            self.store
+                .update_workflow_status(&workflow.id, status, detail.as_deref())?;
+        }
+        Ok(())
+    }
+
     pub fn new(
         store: EvolutionWorkflowStore,
         skills_dir: PathBuf,
@@ -121,6 +150,9 @@ impl SkillEvolutionWorker {
                 if let Err(e) = self.service.tick_observations().await {
                     warn!(error = %e, "Skill evolution observation tick failed");
                 }
+                if let Err(e) = self.finalize_observation_workflows() {
+                    warn!(error = %e, "Failed to finalize skill observation workflows");
+                }
                 return false;
             }
             Err(e) => {
@@ -175,14 +207,19 @@ impl SkillEvolutionWorker {
             }
         };
 
-        let (heartbeat_stop, heartbeat_handle) = self.spawn_lease_heartbeat(&workflow.id);
-        let result = self.run_skill_workflow(&workflow).await;
+        let (heartbeat_stop, lease_lost, heartbeat_handle) =
+            self.spawn_lease_heartbeat(&workflow.id);
+        let result = run_with_lease_guard(self.run_skill_workflow(&workflow), lease_lost).await;
         let _ = heartbeat_stop.send(());
         if let Err(e) = heartbeat_handle.await {
             if !e.is_cancelled() {
                 warn!(workflow_id = %workflow.id, error = %e, "Skill evolution lease heartbeat failed");
             }
         }
+        let Some(result) = result else {
+            warn!(workflow_id = %workflow.id, "Lost skill evolution lease while pipeline was running; cancelled pipeline future");
+            return true;
+        };
 
         match self
             .store
@@ -273,6 +310,9 @@ impl SkillEvolutionWorker {
 
         if let Err(e) = self.service.tick_observations().await {
             warn!(error = %e, "Skill evolution observation tick failed");
+        }
+        if let Err(e) = self.finalize_observation_workflows() {
+            warn!(error = %e, "Failed to finalize skill observation workflows");
         }
 
         true
@@ -452,13 +492,21 @@ impl SkillEvolutionWorker {
         }
     }
 
-    fn spawn_lease_heartbeat(&self, workflow_id: &str) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    fn spawn_lease_heartbeat(
+        &self,
+        workflow_id: &str,
+    ) -> (
+        oneshot::Sender<()>,
+        tokio::sync::watch::Receiver<bool>,
+        JoinHandle<()>,
+    ) {
         let store = self.store.clone();
         let workflow_id = workflow_id.to_string();
         let worker_id = self.worker_id.clone();
         let lease_duration_secs = self.lease_duration_secs;
         let heartbeat_secs = (lease_duration_secs / 3).clamp(5, 60) as u64;
         let (stop_tx, mut stop_rx) = oneshot::channel();
+        let (lost_tx, lost_rx) = tokio::sync::watch::channel(false);
 
         let handle = tokio::spawn(async move {
             let mut interval =
@@ -477,6 +525,7 @@ impl SkillEvolutionWorker {
                             }
                             Ok(false) => {
                                 warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Lost skill evolution lease during heartbeat");
+                                let _ = lost_tx.send(true);
                                 break;
                             }
                             Err(e) => {
@@ -484,6 +533,7 @@ impl SkillEvolutionWorker {
                                 warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, consecutive_failures = consecutive_failures, max_retries = MAX_CONSECUTIVE_FAILURES, "Failed to heartbeat skill evolution lease (will retry)");
                                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                                     warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Too many consecutive heartbeat failures, giving up lease");
+                                    let _ = lost_tx.send(true);
                                     break;
                                 }
                             }
@@ -493,7 +543,7 @@ impl SkillEvolutionWorker {
             }
         });
 
-        (stop_tx, handle)
+        (stop_tx, lost_rx, handle)
     }
 
     fn recover(&self) -> Result<()> {
@@ -512,5 +562,26 @@ impl SkillEvolutionWorker {
 impl EvolutionNotifier for SkillEvolutionWorker {
     fn notify(&self) {
         self.wakeup.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observation_workflow_maps_record_terminal_status() {
+        assert_eq!(
+            SkillEvolutionWorker::workflow_status_for_evolution(&EvolutionStatus::Completed),
+            Some("Promoted")
+        );
+        assert_eq!(
+            SkillEvolutionWorker::workflow_status_for_evolution(&EvolutionStatus::RolledBack),
+            Some("Failed")
+        );
+        assert_eq!(
+            SkillEvolutionWorker::workflow_status_for_evolution(&EvolutionStatus::Observing),
+            None
+        );
     }
 }
