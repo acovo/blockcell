@@ -77,7 +77,10 @@ impl MemoryStoreOps for MemoryStoreAdapter {
             top_k: params_json
                 .get("top_k")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(20) as usize,
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(20)
+                .min(blockcell_storage::memory::MAX_MEMORY_QUERY_RESULTS),
             include_deleted: params_json
                 .get("include_deleted")
                 .and_then(|v| v.as_bool())
@@ -92,6 +95,10 @@ impl MemoryStoreOps for MemoryStoreAdapter {
 
     fn soft_delete(&self, id: &str) -> Result<bool> {
         self.store.soft_delete(id)
+    }
+
+    fn soft_delete_in_session(&self, id: &str, session_key: &str) -> Result<bool> {
+        self.store.soft_delete_in_session(id, session_key)
     }
 
     fn batch_soft_delete_json(&self, params_json: Value) -> Result<usize> {
@@ -114,12 +121,44 @@ impl MemoryStoreOps for MemoryStoreAdapter {
             .batch_soft_delete(scope, item_type, tags_ref, time_before.as_deref())
     }
 
+    fn batch_soft_delete_in_session_json(&self, params_json: Value) -> Result<usize> {
+        let session_key = Self::get_string(&params_json, "session_key").ok_or_else(|| {
+            blockcell_core::Error::Validation(
+                "'session_key' is required for scoped batch delete".to_string(),
+            )
+        })?;
+        let scope = params_json.get("scope").and_then(|v| v.as_str());
+        let item_type = params_json.get("type").and_then(|v| v.as_str());
+        let tags = Self::parse_tags(&params_json, "tags");
+        let tags_ref = (!tags.is_empty()).then_some(tags.as_slice());
+        let time_before = params_json
+            .get("before_days")
+            .and_then(|v| v.as_i64())
+            .map(|days| (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339());
+
+        self.store.batch_soft_delete_in_session(
+            &session_key,
+            scope,
+            item_type,
+            tags_ref,
+            time_before.as_deref(),
+        )
+    }
+
     fn restore(&self, id: &str) -> Result<bool> {
         self.store.restore(id)
     }
 
+    fn restore_in_session(&self, id: &str, session_key: &str) -> Result<bool> {
+        self.store.restore_in_session(id, session_key)
+    }
+
     fn stats_json(&self) -> Result<Value> {
         self.store.stats()
+    }
+
+    fn stats_in_session_json(&self, session_key: &str) -> Result<Value> {
+        self.store.stats_in_session(session_key)
     }
 
     fn generate_brief(&self, long_term_max: usize, short_term_max: usize) -> Result<String> {
@@ -190,5 +229,97 @@ mod tests {
             .expect("upsert_json should succeed");
 
         assert!(item["expires_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn scoped_mutations_reject_other_sessions_and_global_rows() {
+        let adapter = MemoryStoreAdapter::new(test_store());
+        let private_a = adapter
+            .upsert_json(serde_json::json!({
+                "scope": "long_term",
+                "type": "fact",
+                "content": "private a",
+                "session_key": "ws:a"
+            }))
+            .unwrap();
+        let private_b = adapter
+            .upsert_json(serde_json::json!({
+                "scope": "long_term",
+                "type": "fact",
+                "content": "private b",
+                "session_key": "ws:b"
+            }))
+            .unwrap();
+        let global = adapter
+            .upsert_json(serde_json::json!({
+                "scope": "long_term",
+                "type": "fact",
+                "content": "global"
+            }))
+            .unwrap();
+
+        assert!(adapter
+            .soft_delete_in_session(private_a["id"].as_str().unwrap(), "ws:a")
+            .unwrap());
+        assert!(!adapter
+            .soft_delete_in_session(private_b["id"].as_str().unwrap(), "ws:a")
+            .unwrap());
+        assert!(!adapter
+            .soft_delete_in_session(global["id"].as_str().unwrap(), "ws:a")
+            .unwrap());
+        assert!(!adapter
+            .restore_in_session(private_a["id"].as_str().unwrap(), "ws:b")
+            .unwrap());
+        assert!(adapter
+            .restore_in_session(private_a["id"].as_str().unwrap(), "ws:a")
+            .unwrap());
+    }
+
+    #[test]
+    fn batch_delete_is_scoped_to_caller_session() {
+        let adapter = MemoryStoreAdapter::new(test_store());
+        for session_key in ["ws:a", "ws:b"] {
+            adapter
+                .upsert_json(serde_json::json!({
+                    "scope": "long_term",
+                    "type": "fact",
+                    "content": format!("private {session_key}"),
+                    "session_key": session_key
+                }))
+                .unwrap();
+        }
+
+        let deleted = adapter
+            .batch_soft_delete_in_session_json(serde_json::json!({
+                "scope": "long_term",
+                "session_key": "ws:a"
+            }))
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        let remaining = adapter
+            .query_json(serde_json::json!({"session_key": "ws:b"}))
+            .unwrap();
+        assert_eq!(remaining.as_array().unwrap().len(), 1);
+        assert_eq!(remaining[0]["item"]["content"], "private ws:b");
+    }
+
+    #[test]
+    fn negative_top_k_never_becomes_unbounded() {
+        let adapter = MemoryStoreAdapter::new(test_store());
+        for index in 0..60 {
+            adapter
+                .upsert_json(serde_json::json!({
+                    "scope": "long_term",
+                    "type": "fact",
+                    "content": format!("bounded item {index}")
+                }))
+                .unwrap();
+        }
+
+        let results = adapter
+            .query_json(serde_json::json!({"top_k": -1}))
+            .unwrap();
+        assert_eq!(results.as_array().unwrap().len(), 20);
     }
 }

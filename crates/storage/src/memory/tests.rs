@@ -1,5 +1,5 @@
 use super::*;
-use crate::vector::{Embedder, VectorHit, VectorIndex, VectorMeta, VectorRuntime};
+use crate::vector::{Embedder, VectorFilter, VectorHit, VectorIndex, VectorMeta, VectorRuntime};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,7 @@ struct FakeVectorIndexState {
     fail_search: bool,
     fail_upsert: bool,
     fail_delete: bool,
+    fail_reset: bool,
     health_error: Option<String>,
     reset_calls: usize,
 }
@@ -110,6 +111,16 @@ impl FakeVectorIndex {
             state: Arc::new(Mutex::new(state)),
         }
     }
+
+    fn with_reset_failure() -> Self {
+        let state = FakeVectorIndexState {
+            fail_reset: true,
+            ..Default::default()
+        };
+        Self {
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
 }
 
 impl VectorIndex for FakeVectorIndex {
@@ -141,14 +152,30 @@ impl VectorIndex for FakeVectorIndex {
         Ok(())
     }
 
-    fn search(&self, _vector: &[f32], _top_k: usize) -> Result<Vec<VectorHit>> {
+    fn search(
+        &self,
+        _vector: &[f32],
+        top_k: usize,
+        filter: Option<&VectorFilter>,
+    ) -> Result<Vec<VectorHit>> {
         let state = self.state.lock().unwrap();
         if state.fail_search {
             return Err(blockcell_core::Error::Storage(
                 "forced vector search failure".to_string(),
             ));
         }
-        Ok(state.search_hits.clone())
+        let mut hits = state.search_hits.clone();
+        if let Some(filter) = filter {
+            hits.retain(|hit| {
+                state
+                    .upserts
+                    .iter()
+                    .find(|(id, _, _)| id == &hit.id)
+                    .is_some_and(|(_, _, meta)| filter.matches(meta))
+            });
+        }
+        hits.truncate(top_k);
+        Ok(hits)
     }
 
     fn health(&self) -> Result<()> {
@@ -171,6 +198,11 @@ impl VectorIndex for FakeVectorIndex {
     fn reset(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         state.reset_calls += 1;
+        if state.fail_reset {
+            return Err(blockcell_core::Error::Storage(
+                "forced vector reset failure".to_string(),
+            ));
+        }
         state.upserts.clear();
         state.deleted_ids.clear();
         Ok(())
@@ -196,6 +228,68 @@ struct QueueObservingVectorIndex {
     db_path: std::path::PathBuf,
     saw_upsert_intent: Arc<AtomicBool>,
     saw_delete_intent: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct DeleteDuringReindexVectorIndex {
+    db_path: std::path::PathBuf,
+    target_id: Arc<Mutex<Option<String>>>,
+    armed: Arc<AtomicBool>,
+    deleted_ids: Arc<Mutex<Vec<String>>>,
+}
+
+impl DeleteDuringReindexVectorIndex {
+    fn new(db_path: std::path::PathBuf) -> Self {
+        Self {
+            db_path,
+            target_id: Arc::new(Mutex::new(None)),
+            armed: Arc::new(AtomicBool::new(false)),
+            deleted_ids: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl VectorIndex for DeleteDuringReindexVectorIndex {
+    fn upsert(&self, id: &str, _vector: &[f32], _meta: &VectorMeta) -> Result<()> {
+        if self.armed.load(Ordering::SeqCst)
+            && self.target_id.lock().unwrap().as_deref() == Some(id)
+        {
+            self.armed.store(false, Ordering::SeqCst);
+            let conn = Connection::open(&self.db_path).unwrap();
+            conn.execute(
+                "UPDATE memory_items SET deleted_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), id],
+            )
+            .unwrap();
+        }
+        Ok(())
+    }
+
+    fn delete_ids(&self, ids: &[String]) -> Result<()> {
+        self.deleted_ids.lock().unwrap().extend_from_slice(ids);
+        Ok(())
+    }
+
+    fn search(
+        &self,
+        _vector: &[f32],
+        _top_k: usize,
+        _filter: Option<&VectorFilter>,
+    ) -> Result<Vec<VectorHit>> {
+        Ok(Vec::new())
+    }
+
+    fn health(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn stats(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({}))
+    }
+
+    fn reset(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl QueueObservingVectorIndex {
@@ -237,7 +331,12 @@ impl VectorIndex for QueueObservingVectorIndex {
         Ok(())
     }
 
-    fn search(&self, _vector: &[f32], _top_k: usize) -> Result<Vec<VectorHit>> {
+    fn search(
+        &self,
+        _vector: &[f32],
+        _top_k: usize,
+        _filter: Option<&VectorFilter>,
+    ) -> Result<Vec<VectorHit>> {
         Ok(Vec::new())
     }
 
@@ -698,6 +797,70 @@ fn test_batch_delete_tags_matches_any_tag() {
         .batch_soft_delete(None, None, Some(tags.as_slice()), None)
         .unwrap();
     assert_eq!(deleted, 2);
+}
+
+#[test]
+fn tag_query_requires_exact_membership() {
+    let (store, _dir) = test_store();
+    for tag in ["go", "mongodb"] {
+        store
+            .upsert(UpsertParams {
+                scope: "long_term".to_string(),
+                item_type: "fact".to_string(),
+                title: None,
+                content: format!("tagged {tag}"),
+                summary: None,
+                tags: vec![tag.to_string()],
+                source: "user".to_string(),
+                channel: None,
+                session_key: None,
+                importance: 0.5,
+                dedup_key: None,
+                expires_at: None,
+            })
+            .unwrap();
+    }
+
+    let results = store
+        .query(&QueryParams {
+            tags: Some(vec!["go".to_string()]),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].item.tags, vec!["go"]);
+}
+
+#[test]
+fn batch_delete_tag_requires_exact_membership() {
+    let (store, _dir) = test_store();
+    for tag in ["prod", "production"] {
+        store
+            .upsert(UpsertParams {
+                scope: "long_term".to_string(),
+                item_type: "fact".to_string(),
+                title: None,
+                content: format!("tagged {tag}"),
+                summary: None,
+                tags: vec![tag.to_string()],
+                source: "user".to_string(),
+                channel: None,
+                session_key: None,
+                importance: 0.5,
+                dedup_key: None,
+                expires_at: None,
+            })
+            .unwrap();
+    }
+
+    let deleted = store
+        .batch_soft_delete(None, None, Some(&["prod".to_string()]), None)
+        .unwrap();
+    assert_eq!(deleted, 1);
+
+    let remaining = store.query(&QueryParams::default()).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].item.tags, vec!["production"]);
 }
 
 #[test]
@@ -1162,6 +1325,78 @@ fn test_vector_consistency_reindex_resets_and_rebuilds_from_active_rows() {
 }
 
 #[test]
+fn reindex_seeds_durable_intents_before_reset() {
+    let embedder = FakeEmbedder::new(3);
+    let index = FakeVectorIndex::with_reset_failure();
+    let runtime = fake_vector_runtime(embedder, index);
+    let (store, _dir) = test_store_with_vector(Some(runtime));
+
+    for content in ["first durable row", "second durable row"] {
+        store
+            .upsert(UpsertParams {
+                scope: "long_term".to_string(),
+                item_type: "fact".to_string(),
+                title: None,
+                content: content.to_string(),
+                summary: None,
+                tags: vec![],
+                source: "user".to_string(),
+                channel: None,
+                session_key: None,
+                importance: 0.5,
+                dedup_key: None,
+                expires_at: None,
+            })
+            .unwrap();
+    }
+
+    assert!(store.reindex_vectors().is_err());
+    let stats = store.stats().unwrap();
+    assert_eq!(stats["vector"]["pending_upserts"], 2);
+}
+
+#[test]
+fn reindex_deletes_item_that_becomes_inactive_during_upsert() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("memory.db");
+    let index = DeleteDuringReindexVectorIndex::new(db_path.clone());
+    let runtime = Arc::new(VectorRuntime {
+        embedder: Arc::new(FakeEmbedder::new(3)),
+        index: Arc::new(index.clone()),
+    });
+    let store = MemoryStore::open_with_options(
+        &db_path,
+        MemoryStoreOptions {
+            vector: Some(runtime),
+        },
+    )
+    .unwrap();
+    let item = store
+        .upsert(UpsertParams {
+            scope: "long_term".to_string(),
+            item_type: "fact".to_string(),
+            title: None,
+            content: "delete during rebuild".to_string(),
+            summary: None,
+            tags: vec![],
+            source: "user".to_string(),
+            channel: None,
+            session_key: None,
+            importance: 0.5,
+            dedup_key: None,
+            expires_at: None,
+        })
+        .unwrap();
+    *index.target_id.lock().unwrap() = Some(item.id.clone());
+    index.armed.store(true, Ordering::SeqCst);
+
+    let result = store.reindex_vectors().unwrap();
+    assert_eq!(result.indexed, 1);
+    assert!(index.deleted_ids.lock().unwrap().contains(&item.id));
+    assert_eq!(store.stats().unwrap()["vector"]["pending_operations"], 0);
+}
+
+#[test]
 fn test_vector_consistency_stats_report_health_and_pending_queue() {
     let embedder = FakeEmbedder::new(3);
     let index = FakeVectorIndex::new();
@@ -1307,6 +1542,80 @@ fn fts_filters_deleted_candidates_before_applying_candidate_limit() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].item.id, active.id);
+}
+
+#[test]
+fn vector_candidates_are_session_filtered_before_limit() {
+    let embedder = FakeEmbedder::new(3);
+    let index = FakeVectorIndex::new();
+    let runtime = fake_vector_runtime(embedder, index.clone());
+    let (store, _dir) = test_store_with_vector(Some(runtime));
+
+    let mut hits = Vec::new();
+    for rank in 0..20 {
+        let item = store
+            .upsert(UpsertParams {
+                scope: "long_term".to_string(),
+                item_type: "fact".to_string(),
+                title: None,
+                content: format!("session b item {rank}"),
+                summary: None,
+                tags: vec![],
+                source: "user".to_string(),
+                channel: Some("ws".to_string()),
+                session_key: Some("ws:b".to_string()),
+                importance: 0.5,
+                dedup_key: None,
+                expires_at: None,
+            })
+            .unwrap();
+        hits.push(VectorHit {
+            id: item.id,
+            score: 1.0 - rank as f64 / 100.0,
+        });
+    }
+    let session_a = store
+        .upsert(UpsertParams {
+            scope: "long_term".to_string(),
+            item_type: "fact".to_string(),
+            title: None,
+            content: "session a semantic target".to_string(),
+            summary: None,
+            tags: vec![],
+            source: "user".to_string(),
+            channel: Some("ws".to_string()),
+            session_key: Some("ws:a".to_string()),
+            importance: 0.5,
+            dedup_key: None,
+            expires_at: None,
+        })
+        .unwrap();
+    hits.push(VectorHit {
+        id: session_a.id.clone(),
+        score: 0.5,
+    });
+    {
+        let mut state = index.state.lock().unwrap();
+        state.search_hits = hits;
+        for (_, _, meta) in &mut state.upserts {
+            if meta.session_key.as_deref() == Some("ws:b") {
+                // Simulate rows written before vector ownership metadata existed.
+                meta.session_key = None;
+            }
+        }
+    }
+
+    let results = store
+        .query(&QueryParams {
+            query: Some("semantic-only-needle".to_string()),
+            session_key: Some("ws:a".to_string()),
+            top_k: 5,
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].item.id, session_a.id);
 }
 
 #[test]

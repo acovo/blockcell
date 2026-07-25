@@ -7,7 +7,7 @@ use rabitq_rs::{IvfRabitqIndex, Metric, RotatorType, SearchParams};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
-use crate::vector::{VectorHit, VectorIndex, VectorMeta};
+use crate::vector::{VectorFilter, VectorHit, VectorIndex, VectorMeta};
 
 const DEFAULT_TOTAL_BITS: usize = 7;
 const MIN_TRAIN_SIZE: usize = 32;
@@ -30,6 +30,7 @@ struct StoredVector {
     id: String,
     vector: Vec<f32>,
     dimension: usize,
+    meta: VectorMeta,
 }
 
 pub struct RabitqIndex {
@@ -294,7 +295,7 @@ impl VectorIndex for RabitqIndex {
         let now = Utc::now().to_rfc3339();
         let table = self.layout.table_name.clone();
         let sql = format!(
-            "INSERT INTO \"{}\" (id, vector, scope, item_type, tags, dimension, updated_at)\n             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)\n             ON CONFLICT(id) DO UPDATE SET\n                vector = excluded.vector,\n                scope = excluded.scope,\n                item_type = excluded.item_type,\n                tags = excluded.tags,\n                dimension = excluded.dimension,\n                updated_at = excluded.updated_at",
+            "INSERT INTO \"{}\" (id, vector, scope, item_type, tags, session_key, dimension, updated_at)\n             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)\n             ON CONFLICT(id) DO UPDATE SET\n                vector = excluded.vector,\n                scope = excluded.scope,\n                item_type = excluded.item_type,\n                tags = excluded.tags,\n                session_key = excluded.session_key,\n                dimension = excluded.dimension,\n                updated_at = excluded.updated_at",
             table
         );
 
@@ -310,6 +311,7 @@ impl VectorIndex for RabitqIndex {
                 meta.scope.clone(),
                 meta.item_type.clone(),
                 meta.tags.join(","),
+                meta.session_key.clone(),
                 vector.len() as i64,
                 now,
             ],
@@ -344,7 +346,12 @@ impl VectorIndex for RabitqIndex {
         Ok(())
     }
 
-    fn search(&self, vector: &[f32], top_k: usize) -> Result<Vec<VectorHit>> {
+    fn search(
+        &self,
+        vector: &[f32],
+        top_k: usize,
+        filter: Option<&VectorFilter>,
+    ) -> Result<Vec<VectorHit>> {
         if top_k == 0 {
             return Ok(Vec::new());
         }
@@ -352,12 +359,18 @@ impl VectorIndex for RabitqIndex {
             return Err(Error::Storage("Query vector must not be empty".to_string()));
         }
 
-        let rows = self.load_rows()?;
+        let mut rows = self.load_rows()?;
+        if let Some(filter) = filter {
+            rows.retain(|row| filter.matches(&row.meta));
+        }
         if rows.is_empty() {
             return Ok(Vec::new());
         }
 
         self.ensure_query_dimensions(vector.len())?;
+        if filter.is_some() {
+            return self.exact_search(&rows, vector, top_k);
+        }
         let exact_only = self.ensure_index_ready(&rows)?;
         if exact_only {
             return self.exact_search(&rows, vector, top_k);
@@ -480,10 +493,25 @@ fn sanitize_identifier(input: &str) -> String {
 
 fn init_schema(conn: &Connection, table_name: &str) -> Result<()> {
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS \"{}\" (\n            id TEXT PRIMARY KEY,\n            vector BLOB NOT NULL,\n            scope TEXT NOT NULL DEFAULT '',\n            item_type TEXT NOT NULL DEFAULT '',\n            tags TEXT NOT NULL DEFAULT '',\n            dimension INTEGER NOT NULL,\n            updated_at TEXT NOT NULL\n        )",
+        "CREATE TABLE IF NOT EXISTS \"{}\" (\n            id TEXT PRIMARY KEY,\n            vector BLOB NOT NULL,\n            scope TEXT NOT NULL DEFAULT '',\n            item_type TEXT NOT NULL DEFAULT '',\n            tags TEXT NOT NULL DEFAULT '',\n            session_key TEXT,\n            dimension INTEGER NOT NULL,\n            updated_at TEXT NOT NULL\n        )",
         table_name
     );
     conn.execute_batch(&sql).map_err(map_sqlite_error)?;
+    let columns_sql = format!("PRAGMA table_info(\"{}\")", table_name);
+    let mut stmt = conn.prepare(&columns_sql).map_err(map_sqlite_error)?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(map_sqlite_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    drop(stmt);
+    if !columns.iter().any(|column| column == "session_key") {
+        conn.execute(
+            &format!("ALTER TABLE \"{}\" ADD COLUMN session_key TEXT", table_name),
+            [],
+        )
+        .map_err(map_sqlite_error)?;
+    }
     Ok(())
 }
 
@@ -510,7 +538,7 @@ fn count_vectors(conn: &Connection, table_name: &str) -> Result<usize> {
 
 fn load_rows_from_conn(conn: &Connection, table_name: &str) -> Result<Vec<StoredVector>> {
     let sql = format!(
-        "SELECT id, vector, dimension FROM \"{}\" ORDER BY rowid ASC",
+        "SELECT id, vector, dimension, scope, item_type, tags, session_key FROM \"{}\" ORDER BY rowid ASC",
         table_name
     );
     let mut stmt = conn.prepare(&sql).map_err(map_sqlite_error)?;
@@ -521,6 +549,10 @@ fn load_rows_from_conn(conn: &Connection, table_name: &str) -> Result<Vec<Stored
         let id: String = row.get(0).map_err(map_sqlite_error)?;
         let vector_blob: Vec<u8> = row.get(1).map_err(map_sqlite_error)?;
         let dimension = row.get::<_, i64>(2).map_err(map_sqlite_error)? as usize;
+        let scope: String = row.get(3).map_err(map_sqlite_error)?;
+        let item_type: String = row.get(4).map_err(map_sqlite_error)?;
+        let tags: String = row.get(5).map_err(map_sqlite_error)?;
+        let session_key: Option<String> = row.get(6).map_err(map_sqlite_error)?;
         let vector: Vec<f32> = serde_json::from_slice(&vector_blob)
             .map_err(|error| Error::Storage(format!("Failed to decode vector blob: {}", error)))?;
         if vector.len() != dimension {
@@ -535,6 +567,16 @@ fn load_rows_from_conn(conn: &Connection, table_name: &str) -> Result<Vec<Stored
             id,
             vector,
             dimension,
+            meta: VectorMeta {
+                scope,
+                item_type,
+                tags: tags
+                    .split(',')
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                session_key,
+            },
         });
     }
 
@@ -594,6 +636,7 @@ mod tests {
             scope: "long_term".to_string(),
             item_type: "fact".to_string(),
             tags: vec!["vector".to_string()],
+            session_key: None,
         };
 
         for i in 0..48 {
@@ -604,7 +647,7 @@ mod tests {
                 .unwrap();
         }
 
-        let hits = index.search(&[1.0, 1.1, 1.2], 5).unwrap();
+        let hits = index.search(&[1.0, 1.1, 1.2], 5, None).unwrap();
         assert!(!hits.is_empty());
 
         index.delete_ids(&["memory-1".to_string()]).unwrap();
@@ -612,7 +655,7 @@ mod tests {
         assert_eq!(stats["backend"], "rabitq");
 
         index.reset().unwrap();
-        let hits = index.search(&[1.0, 1.1, 1.2], 5).unwrap();
+        let hits = index.search(&[1.0, 1.1, 1.2], 5, None).unwrap();
         assert!(hits.is_empty());
     }
 
@@ -624,6 +667,7 @@ mod tests {
             scope: "long_term".to_string(),
             item_type: "fact".to_string(),
             tags: vec!["vector".to_string()],
+            session_key: None,
         };
 
         {
@@ -640,7 +684,7 @@ mod tests {
                     .unwrap();
             }
 
-            index.search(&[1.0, 1.1, 1.2], 5).unwrap();
+            index.search(&[1.0, 1.1, 1.2], 5, None).unwrap();
             index
                 .upsert("memory-0", &[1000.0, 1000.1, 1000.2], &meta)
                 .unwrap();
@@ -648,7 +692,45 @@ mod tests {
 
         let reopened =
             RabitqIndex::open_or_create(uri.to_str().unwrap(), "memory_vectors").unwrap();
-        let hits = reopened.search(&[1000.0, 1000.1, 1000.2], 1).unwrap();
+        let hits = reopened.search(&[1000.0, 1000.1, 1000.2], 1, None).unwrap();
         assert_eq!(hits.first().map(|hit| hit.id.as_str()), Some("memory-0"));
+    }
+
+    #[test]
+    fn rabitq_filters_session_before_result_limit() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("vectors.rabitq");
+        let index = RabitqIndex::open_or_create(uri.to_str().unwrap(), "memory_vectors").unwrap();
+        for (id, session_key, value) in [
+            ("session-b", Some("ws:b"), 0.0_f32),
+            ("session-a", Some("ws:a"), 10.0_f32),
+            ("global", None, 20.0_f32),
+        ] {
+            index
+                .upsert(
+                    id,
+                    &[value, value, value],
+                    &VectorMeta {
+                        scope: "long_term".to_string(),
+                        item_type: "fact".to_string(),
+                        tags: vec![],
+                        session_key: session_key.map(str::to_string),
+                    },
+                )
+                .unwrap();
+        }
+
+        let hits = index
+            .search(
+                &[0.0, 0.0, 0.0],
+                2,
+                Some(&VectorFilter {
+                    session_key: Some("ws:a".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+        assert_eq!(ids, vec!["session-a", "global"]);
     }
 }

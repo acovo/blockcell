@@ -86,10 +86,10 @@
 - Inspect: `crates/agent/src/memory_system/**/*.rs`
 - Inspect: `crates/agent/src/auto_memory/**/*.rs`
 
-- [ ] Map schemas, migrations, identifiers, transaction boundaries, file locks, vector synchronization, and deletion/update behavior.
-- [ ] Trace memory writes and retrieval into prompt context, including scoring, limits, subject/session isolation, and fallback behavior.
-- [ ] Check crash consistency, partial failures, concurrent writers, duplicate records, stale vector entries, and accidental cross-user recall.
-- [ ] Run `cargo test -p blockcell-storage -- --nocapture` and focused agent memory tests; record results without changing code.
+- [x] Map schemas, migrations, identifiers, transaction boundaries, file locks, vector synchronization, and deletion/update behavior.
+- [x] Trace memory writes and retrieval into prompt context, including scoring, limits, subject/session isolation, and fallback behavior.
+- [x] Check crash consistency, partial failures, concurrent writers, duplicate records, stale vector entries, and accidental cross-user recall.
+- [x] Run `cargo test -p blockcell-storage -- --nocapture` and focused agent memory tests; record results without changing code.
 
 ### Task 5: Review Ghost learning decisions and guarded writes
 

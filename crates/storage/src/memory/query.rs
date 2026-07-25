@@ -58,7 +58,12 @@ impl MemoryStore {
                 let tag_conditions: Vec<String> = tags
                     .iter()
                     .enumerate()
-                    .map(|(offset, _)| format!("m.tags LIKE '%' || ?{} || '%'", bind_idx + offset))
+                    .map(|(offset, _)| {
+                        format!(
+                            "instr(',' || m.tags || ',', ',' || ?{} || ',') > 0",
+                            bind_idx + offset
+                        )
+                    })
                     .collect();
                 where_clauses.push(format!("({})", tag_conditions.join(" OR ")));
                 for tag in tags {
@@ -98,7 +103,7 @@ impl MemoryStore {
         } else {
             sql.push_str("m.importance DESC, m.updated_at DESC");
         }
-        sql.push_str(&format!(" LIMIT {}", params.top_k));
+        sql.push_str(&format!(" LIMIT {}", params.bounded_top_k()));
 
         let mut stmt = conn
             .prepare(&sql)
@@ -178,7 +183,12 @@ impl MemoryStore {
                 let conditions: Vec<String> = tags
                     .iter()
                     .enumerate()
-                    .map(|(offset, _)| format!("m.tags LIKE '%' || ?{} || '%'", bind_idx + offset))
+                    .map(|(offset, _)| {
+                        format!(
+                            "instr(',' || m.tags || ',', ',' || ?{} || ',') > 0",
+                            bind_idx + offset
+                        )
+                    })
                     .collect();
                 sql.push_str(&format!(" AND ({})", conditions.join(" OR ")));
                 for tag in tags {
@@ -285,11 +295,10 @@ impl MemoryStore {
 
         if let Some(ref wanted_tags) = params.tags {
             if !wanted_tags.is_empty()
-                && !item.tags.iter().any(|tag| {
-                    wanted_tags
-                        .iter()
-                        .any(|wanted| tag.contains(wanted.as_str()))
-                })
+                && !item
+                    .tags
+                    .iter()
+                    .any(|tag| wanted_tags.iter().any(|wanted| tag == wanted))
             {
                 return false;
             }

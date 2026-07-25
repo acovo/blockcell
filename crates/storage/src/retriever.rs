@@ -1,5 +1,5 @@
 use crate::memory::{sanitize_fts_query, MemoryResult, MemoryStore, QueryParams};
-use crate::vector::VectorHit;
+use crate::vector::{VectorFilter, VectorHit};
 use blockcell_core::Result;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -17,7 +17,8 @@ impl<'a> HybridMemoryRetriever<'a> {
     }
 
     pub fn search(&self, params: &QueryParams) -> Result<Vec<MemoryResult>> {
-        if params.top_k == 0 {
+        let top_k = params.bounded_top_k();
+        if top_k == 0 {
             return Ok(Vec::new());
         }
 
@@ -31,13 +32,13 @@ impl<'a> HybridMemoryRetriever<'a> {
             return self.store.query_sqlite_raw(params);
         }
 
-        let fts_window = candidate_window(params.top_k);
-        let vector_window = candidate_window(params.top_k);
+        let fts_window = candidate_window(top_k);
+        let vector_window = candidate_window(top_k);
 
         let fts_hits = self
             .store
             .search_fts_candidates(&fts_query, params, fts_window)?;
-        let vector_hits = self.search_vector_candidates(query, vector_window);
+        let vector_hits = self.search_vector_candidates(query, params, vector_window)?;
 
         let mut ranks: HashMap<String, (Option<usize>, Option<usize>)> = HashMap::new();
         let mut merged_ids = Vec::new();
@@ -78,29 +79,69 @@ impl<'a> HybridMemoryRetriever<'a> {
             .collect();
 
         results.sort_by(compare_results);
-        results.truncate(params.top_k);
+        results.truncate(top_k);
         Ok(results)
     }
 
-    fn search_vector_candidates(&self, query: &str, top_k: usize) -> Vec<VectorHit> {
+    fn search_vector_candidates(
+        &self,
+        query: &str,
+        params: &QueryParams,
+        top_k: usize,
+    ) -> Result<Vec<VectorHit>> {
         let Some(runtime) = self.store.vector.as_ref() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         let vector = match runtime.embedder.embed_query(query) {
             Ok(vector) => vector,
             Err(error) => {
                 warn!(error = %error, "Failed to embed query for vector retrieval");
-                return Vec::new();
+                return Ok(Vec::new());
             }
         };
 
-        match runtime.index.search(&vector, top_k) {
-            Ok(hits) => hits,
-            Err(error) => {
-                warn!(error = %error, "Vector search failed, falling back to FTS");
-                Vec::new()
+        let filter = VectorFilter {
+            session_key: params.session_key.clone(),
+            scope: params.scope.clone(),
+            item_type: params.item_type.clone(),
+            tags: params.tags.clone(),
+        };
+        let mut requested = top_k.max(1);
+        loop {
+            let hits = match runtime.index.search(&vector, requested, Some(&filter)) {
+                Ok(hits) => hits,
+                Err(error) => {
+                    warn!(error = %error, "Vector search failed, falling back to FTS");
+                    return Ok(Vec::new());
+                }
+            };
+            if hits.is_empty() {
+                return Ok(Vec::new());
             }
+
+            let ids: Vec<String> = hits.iter().map(|hit| hit.id.clone()).collect();
+            let allowed: HashSet<String> = self
+                .store
+                .load_items_by_ids(&ids)?
+                .into_iter()
+                .filter(|item| self.store.item_matches_query(item, params))
+                .map(|item| item.id)
+                .collect();
+            let valid: Vec<VectorHit> = hits
+                .iter()
+                .filter(|hit| allowed.contains(&hit.id))
+                .cloned()
+                .collect();
+            if valid.len() >= top_k || hits.len() < requested {
+                return Ok(valid);
+            }
+
+            let next = requested.saturating_mul(2);
+            if next == requested {
+                return Ok(valid);
+            }
+            requested = next;
         }
     }
 }

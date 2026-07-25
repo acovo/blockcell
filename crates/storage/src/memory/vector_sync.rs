@@ -89,15 +89,20 @@ impl MemoryStore {
         }
     }
 
-    pub(crate) fn clear_all_vector_sync(&self) -> Result<()> {
-        let conn = self
+    pub(crate) fn seed_reindex_vector_sync(&self, items: &[MemoryItem]) -> Result<()> {
+        let mut conn = self
             .inner
             .lock()
             .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
-        conn.execute("DELETE FROM memory_vector_queue", [])
-            .map_err(|e| {
-                blockcell_core::Error::Storage(format!("Failed to clear vector queue: {}", e))
-            })?;
+        let tx = conn.transaction().map_err(|e| {
+            blockcell_core::Error::Storage(format!("Begin reindex intent transaction error: {}", e))
+        })?;
+        for item in items {
+            Self::enqueue_vector_sync_on_conn(&tx, &item.id, VECTOR_SYNC_OP_UPSERT, 0, None)?;
+        }
+        tx.commit().map_err(|e| {
+            blockcell_core::Error::Storage(format!("Commit reindex intents error: {}", e))
+        })?;
         Ok(())
     }
 
@@ -208,6 +213,7 @@ impl MemoryStore {
             scope: item.scope.clone(),
             item_type: item.item_type.clone(),
             tags: item.tags.clone(),
+            session_key: item.session_key.clone(),
         };
         runtime.index.upsert(&item.id, &vector, &meta)
     }

@@ -25,6 +25,13 @@ Final remediation verification:
 - `cargo test -p blockcell --bin blockcell websocket -- --nocapture`: 14 passed, 0 failed.
 - `cargo fmt --all -- --check`: passed.
 
+Module 5 Task 4 review verification (review-only; no implementation changes):
+
+- `cargo test -p blockcell-storage -- --nocapture`: 68 passed, 0 failed after the M4-M8 fixes.
+- `cargo test -p blockcell-agent memory -- --nocapture`: 150 focused unit tests and 10 memory integration tests passed, 0 failed.
+- `cargo test -p blockcell-tools memory -- --nocapture`: 24 passed, 0 failed.
+- `cargo test -p blockcell --bin blockcell memory -- --nocapture`: 7 passed, 0 failed.
+
 ## Runtime lifecycle map
 
 ```text
@@ -522,6 +529,133 @@ tools receive the current runtime abort token and origin session through `Runtim
 
 **Resolution:** Fixed. Memory and skill stores now share `OwnerAwareFileLock`, which records PID plus a unique owner token, recovers only dead-owner directories, waits for live owners, and removes a lock only when the token still matches. Regression tests: `recovers_lock_directory_owned_by_dead_pid` and `refuses_to_steal_lock_directory_owned_by_live_pid`.
 
+### M4 — High in multi-conversation deployments: Memory mutation operations do not enforce session ownership
+
+**Locations:**
+
+- `crates/tools/src/memory.rs:571-618`
+- `crates/tools/src/lib.rs:275-289`
+- `crates/agent/src/memory_adapter.rs:93-123`
+- `crates/storage/src/memory/maintenance.rs:5-40`
+- `crates/storage/src/memory/maintenance.rs:43-165`
+- `crates/storage/src/memory/maintenance.rs:168-213`
+
+**Trigger:** One Agent serves multiple conversations. A caller invokes `memory_forget` with another session's memory UUID, invokes `restore` with that UUID, or invokes `batch_delete` with broad or empty filters.
+
+**Control flow:** Query and upsert tools pass `ctx.session_key`, but the mutation trait exposes single-item delete/restore by ID only and batch deletion without caller ownership. The adapter drops session identity, and the storage SQL has no `session_key` predicate. An empty `batch_delete` filter is explicitly accepted and selects every active row in the Agent-wide store. Explicit global rows are equally mutable by any session that can address them. Stats mode also returns Agent-wide counts without session scoping.
+
+**Impact:** A conversation can soft-delete or restore another conversation's private structured memory, and an unfiltered call can delete all active structured memories for the Agent. This violates the session-private ownership contract introduced for M1 and creates cross-conversation integrity and availability loss.
+
+**Repair direction:** Carry the caller session and an explicit global-memory administration capability through every mutation API. Apply ownership predicates inside the same SQL statement that mutates the row; do not rely on a prior read. Reject empty batch filters for ordinary tool callers and scope every batch operation to the caller. Apply the same policy to restore and expose session-scoped stats to non-administrative callers.
+
+**Evidence:** Direct end-to-end control-flow proof. Existing tests cover unscoped delete/restore and accept an empty `batch_delete`, but do not exercise cross-session mutation denial.
+
+**Resolution:** Fixed. Ordinary memory tools now call session-scoped delete, restore, batch-delete, and stats APIs whose safe defaults reject unsupported scoped access. The adapter applies ownership predicates in the mutation SQL, excludes explicit global rows from ordinary mutation, and rejects empty batch filters. Administrative CLI/maintenance APIs remain explicitly unscoped. Regression tests: `scoped_mutations_reject_other_sessions_and_global_rows`, `batch_delete_is_scoped_to_caller_session`, and `memory_forget_batch_delete_forwards_caller_session`.
+
+### M5 — Medium: Negative `top_k` bypasses the documented 50-result limit
+
+**Locations:**
+
+- `crates/tools/src/memory.rs:267-290`
+- `crates/tools/src/memory.rs:305-316`
+- `crates/agent/src/memory_adapter.rs:66-87`
+- `crates/storage/src/retriever.rs:19-81`
+- `crates/storage/src/memory/query.rs:101`
+- `crates/storage/src/memory/query.rs:205-209`
+
+**Trigger:** A model or caller supplies a negative integer such as `top_k: -1` to `memory_query`.
+
+**Control flow:** Tool validation accepts every value. `.min(50)` preserves negative integers, after which the adapter casts the `i64` directly to `usize`, turning `-1` into `usize::MAX`. Hybrid retrieval then requests a saturated candidate window, binds `top_k as i64` as `-1` to SQLite FTS (`LIMIT -1` means no limit), requests an effectively unbounded vector result count, and truncates final results at `usize::MAX`.
+
+**Impact:** The caller bypasses the documented maximum of 50 and can scan/return the entire structured-memory corpus, increasing database, vector-search, serialization, prompt, and memory costs. The empty-query raw-SQL path may instead fail on an out-of-range LIMIT literal, making behavior inconsistent by query shape.
+
+**Repair direction:** Validate `top_k` as `1..=50` at the tool boundary, use checked conversion in the adapter, and clamp or reject unsafe values again in the storage API so non-tool callers cannot bypass the contract.
+
+**Evidence:** Deterministic integer-conversion and SQLite LIMIT proof. No test covers zero/negative/over-limit values across tool, adapter, and storage boundaries.
+
+**Resolution:** Fixed. Tool validation accepts only `1..=50`; the adapter uses checked signed-to-unsigned conversion with a safe default; storage preserves explicit zero-result behavior and caps every raw/hybrid query at 50. Regression tests: `test_memory_query_validate` and `negative_top_k_never_becomes_unbounded`.
+
+### M6 — Medium: Global vector candidate truncation can hide valid session memories
+
+**Locations:**
+
+- `crates/storage/src/retriever.rs:34-81`
+- `crates/storage/src/retriever.rs:85-109`
+- `crates/storage/src/vector.rs:5-31`
+- `crates/storage/src/memory/vector_sync.rs:200-212`
+- `crates/storage/src/rabitq_index.rs:283-319`
+- `crates/storage/src/rabitq_index.rs:347-389`
+
+**Trigger:** A shared Agent store contains more than the finite vector candidate window of highly similar rows owned by other sessions, while the current session has a lower-ranked semantic-only match.
+
+**Control flow:** `VectorMeta` and the RabitQ row contain scope, type, and tags, but not `session_key`. Vector search therefore ranks and truncates globally at `max(top_k * 4, 20)`. Only after this truncation are canonical rows loaded and filtered by `item_matches_query`. FTS can recover lexical matches, but a semantic-only current-session row outside the global vector window is never considered.
+
+**Impact:** Relevant private memories can deterministically disappear from `memory_query` and automatic prompt briefs because unrelated sessions crowd the vector candidate window. The final canonical filter prevents direct disclosure, but retrieval correctness degrades as other sessions accumulate similar content.
+
+**Repair direction:** Persist ownership metadata in the vector index and filter before candidate truncation, or iteratively over-fetch until enough ownership-valid candidates are collected. Cover private plus explicit-global semantics in the vector contract and migrations.
+
+**Evidence:** Direct ranking/filter-order proof. Existing session-isolation coverage exercises canonical/FTS retrieval but not a vector window dominated by other sessions.
+
+**Resolution:** Fixed. Vector metadata and RabitQ rows now carry `session_key`; `VectorFilter` applies session/global ownership plus scope/type/tag filters before truncation. Hybrid retrieval also iteratively over-fetches and validates canonical rows, preserving correctness for legacy vectors that lack ownership metadata and for stale entries. Regression tests: `vector_candidates_are_session_filtered_before_limit` and `rabitq_filters_session_before_result_limit`.
+
+### M7 — Medium: Vector reindex is not a crash-recoverable or concurrency-safe state transition
+
+**Locations:**
+
+- `crates/storage/src/memory/maintenance.rs:350-397`
+- `crates/storage/src/memory/maintenance.rs:400-428`
+- `crates/storage/src/memory/vector_sync.rs:173-213`
+
+**Trigger:** The process exits after `reindex_vectors` resets the external index and clears the durable sync queue, or a memory is deleted after the reindex snapshot is loaded but before that row is upserted.
+
+**Control flow:** Reindex resets the live index in place, clears every pending vector intent, snapshots active canonical rows, and then rebuilds one row at a time. There is no durable rebuild epoch or complete per-row intent before reset. A crash after queue clearing leaves unprocessed canonical rows with no recovery work. During a concurrent delete, the delete path can remove the vector and clear its queue entry before reindex later upserts the stale snapshot, leaving a deleted vector with no pending delete.
+
+**Impact:** After interruption, semantic retrieval can remain empty or incomplete until an operator runs another full reindex. Concurrent mutations can also leave stale vectors that consume finite candidate slots and amplify M6, even though canonical filtering prevents deleted rows from being returned directly.
+
+**Repair direction:** Model rebuild as a durable epoch/state machine: record rebuild intent before reset, retain recoverable work for every canonical row, re-read each row immediately before indexing, coordinate mutations by generation/lock, and preferably build a new index before atomically switching it live.
+
+**Evidence:** Deterministic operation-order and snapshot-race proof. Current tests cover successful rebuild and per-item upsert failure, but not crash points or concurrent delete/update.
+
+**Resolution:** Fixed. Reindex now loads active canonical rows, transactionally seeds a durable upsert intent for every row before reset, retains the queue throughout rebuild, and re-reads canonical state before and after external upsert. Rows deleted/expired during rebuild are deleted from the vector index, while repeatedly changing rows retain retryable intent. Regression tests: `reindex_seeds_durable_intents_before_reset` and `reindex_deletes_item_that_becomes_inactive_during_upsert`.
+
+### M8 — Medium: Substring tag matching can batch-delete memories with different tags
+
+**Locations:**
+
+- `crates/storage/src/memory/query.rs:56-68`
+- `crates/storage/src/memory/query.rs:176-189`
+- `crates/storage/src/memory/query.rs:286-295`
+- `crates/storage/src/memory/maintenance.rs:77-86`
+
+**Trigger:** A caller queries or batch-deletes tag `go` while a memory is tagged `mongodb`, or uses another tag that is a substring of a stored tag or the serialized JSON text.
+
+**Control flow:** Tags are stored as serialized text. SQL filtering uses `tags LIKE '%' || ? || '%'`, and post-vector filtering uses `tag.contains(wanted)`, so neither path compares complete tag values. The same substring predicate selects rows for destructive batch deletion.
+
+**Impact:** Queries return incorrectly tagged rows, and `memory_forget` batch deletion can soft-delete memories that do not carry any requested tag. The destructive effect makes this more than a ranking-quality issue.
+
+**Repair direction:** Normalize tags into a relation or use a queryable JSON array with exact element comparison. Keep query and mutation semantics identical and add overlapping-tag regression cases such as `go` versus `mongodb` and `prod` versus `production`.
+
+**Evidence:** Direct predicate proof. The only batch-tag test verifies that either of two distinct exact tags is selected; it does not test overlapping values.
+
+**Resolution:** Fixed. SQLite query and batch-delete predicates now compare comma-delimited complete tokens with `instr`, and canonical/vector post-filters use string equality. Regression tests: `tag_query_requires_exact_membership` and `batch_delete_tag_requires_exact_membership`.
+
+## Module 5 Task 4 architecture risks and missing coverage
+
+- `restore` immediately enqueues and performs a vector upsert without checking whether `expires_at` is already in the past. Canonical retrieval filters the row, but the stale vector can occupy finite candidate windows until maintenance.
+- `SessionStore::append` appends a message without refreshing the outer metadata `updated_at`. Its production caller persists background subagent results this way, while Layer 2 inactivity compaction relies on that timestamp. Add a contract test before deciding whether background delivery should count as session activity.
+- Vector coverage still lacks restore-of-expired-row behavior and a real process-termination test in the middle of reindex; durable reset-failure and mutation-during-upsert cases now cover the corresponding state transitions deterministically.
+
+## Module 5 Task 4 reviewed areas with no confirmed defect
+
+- SQLite `memory_items` remains canonical; FTS triggers update inside the canonical transaction.
+- Upsert uses a write transaction, and canonical row changes plus vector-sync intent are committed together before external vector mutation.
+- Soft delete, batch delete, maintenance, and normal restore persist retryable vector intent before best-effort external synchronization.
+- Failed vector upserts/deletes remain in `memory_vector_queue`, and retry re-reads canonical state before choosing upsert versus delete.
+- Active deduplication is isolated by `dedup_key + COALESCE(session_key, '')`, including concurrent store handles.
+- RabitQ SQLite rows are the vector source of truth; reopening marks non-empty indexes dirty and lazily rebuilds the binary cache.
+- Session filenames use reversible safe encoding, and session save uses file locking, unique temporary files, fsync, and atomic replacement.
+- Auto Memory cursor writes use process-local serialization, a cross-process owner lock, and atomic replacement; detached extraction markers now clean up during panic unwinding.
+
 ## Closed regression gaps
 
 - Same raw `chat_id` across two channels.
@@ -551,4 +685,5 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Module 2 Task 3 context ordering, truncation, compact recovery budgets, summaries, and file/skill tracking review: complete; R10-R12 fixed and regression-tested.
 - Module 2 Task 3 task state, restart recovery, event emission, notification routing, shared state, spawned-task ownership, shutdown, and cache-key review: complete. R13-R19 are fixed and regression-tested.
 - Module 5 structured-memory and learning-lock findings M1-M3: reviewed, fixed, and regression-tested.
+- Module 5 Task 4 persistence, retrieval, session isolation, vector synchronization, crash consistency, and mutation-contract review: complete. M4-M8 are fixed and regression-tested.
 - The implementation and verification record is in `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review-fixes.md`.

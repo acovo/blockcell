@@ -286,7 +286,17 @@ impl Tool for MemoryQueryTool {
         Some("- Search `memory_query` before asking the user for information you might already know.".to_string())
     }
 
-    fn validate(&self, _params: &Value) -> Result<()> {
+    fn validate(&self, params: &Value) -> Result<()> {
+        if let Some(top_k) = params.get("top_k") {
+            let Some(top_k) = top_k.as_i64() else {
+                return Err(Error::Validation("'top_k' must be an integer".to_string()));
+            };
+            if !(1..=50).contains(&top_k) {
+                return Err(Error::Validation(
+                    "'top_k' must be between 1 and 50".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -299,7 +309,8 @@ impl Tool for MemoryQueryTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
-            return run_store_blocking(move || store.stats_json()).await;
+            let session_key = ctx.session_key.clone();
+            return run_store_blocking(move || store.stats_in_session_json(&session_key)).await;
         }
 
         let query_params = json!({
@@ -558,7 +569,17 @@ impl Tool for MemoryForgetTool {
                     ));
                 }
             }
-            Some("batch_delete") => {}
+            Some("batch_delete") => {
+                let has_filter = params.get("scope").and_then(|v| v.as_str()).is_some()
+                    || params.get("type").and_then(|v| v.as_str()).is_some()
+                    || params.get("tags").and_then(|v| v.as_str()).is_some()
+                    || params.get("before_days").and_then(|v| v.as_i64()).is_some();
+                if !has_filter {
+                    return Err(Error::Validation(
+                        "batch_delete requires at least one filter".to_string(),
+                    ));
+                }
+            }
             _ => {
                 return Err(Error::Validation(
                     "'action' must be 'delete', 'batch_delete', or 'restore'".to_string(),
@@ -583,7 +604,9 @@ impl Tool for MemoryForgetTool {
                 let id = id.to_string();
                 let deleted = {
                     let id = id.clone();
-                    run_store_blocking(move || store.soft_delete(&id)).await?
+                    let session_key = ctx.session_key.clone();
+                    run_store_blocking(move || store.soft_delete_in_session(&id, &session_key))
+                        .await?
                 };
                 Ok(json!({
                     "action": "delete",
@@ -598,9 +621,12 @@ impl Tool for MemoryForgetTool {
                     "type": params.get("type").and_then(|v| v.as_str()),
                     "tags": params.get("tags").and_then(|v| v.as_str()),
                     "before_days": params.get("before_days").and_then(|v| v.as_i64()),
+                    "session_key": ctx.session_key,
                 });
-                let count =
-                    run_store_blocking(move || store.batch_soft_delete_json(batch_params)).await?;
+                let count = run_store_blocking(move || {
+                    store.batch_soft_delete_in_session_json(batch_params)
+                })
+                .await?;
                 Ok(json!({
                     "action": "batch_delete",
                     "deleted_count": count,
@@ -614,7 +640,8 @@ impl Tool for MemoryForgetTool {
                 let id = id.to_string();
                 let restored = {
                     let id = id.clone();
-                    run_store_blocking(move || store.restore(&id)).await?
+                    let session_key = ctx.session_key.clone();
+                    run_store_blocking(move || store.restore_in_session(&id, &session_key)).await?
                 };
                 Ok(json!({
                     "action": "restore",
@@ -638,12 +665,14 @@ mod tests {
 
     struct CaptureMemoryStore {
         last_upsert: Mutex<Option<Value>>,
+        last_batch_delete: Mutex<Option<Value>>,
     }
 
     impl CaptureMemoryStore {
         fn new() -> Self {
             Self {
                 last_upsert: Mutex::new(None),
+                last_batch_delete: Mutex::new(None),
             }
         }
 
@@ -653,6 +682,14 @@ mod tests {
                 .expect("last_upsert lock")
                 .clone()
                 .expect("captured upsert params")
+        }
+
+        fn last_batch_delete(&self) -> Value {
+            self.last_batch_delete
+                .lock()
+                .expect("last_batch_delete lock")
+                .clone()
+                .expect("captured batch delete params")
         }
     }
 
@@ -688,8 +725,28 @@ mod tests {
             Ok(false)
         }
 
-        fn batch_soft_delete_json(&self, _params_json: Value) -> Result<usize> {
+        fn batch_soft_delete_json(&self, params_json: Value) -> Result<usize> {
+            *self
+                .last_batch_delete
+                .lock()
+                .expect("last_batch_delete lock") = Some(params_json);
             Ok(0)
+        }
+
+        fn batch_soft_delete_in_session_json(&self, params_json: Value) -> Result<usize> {
+            self.batch_soft_delete_json(params_json)
+        }
+
+        fn soft_delete_in_session(&self, _id: &str, _session_key: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn restore_in_session(&self, _id: &str, _session_key: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn stats_in_session_json(&self, _session_key: &str) -> Result<Value> {
+            Ok(json!({}))
         }
 
         fn restore(&self, _id: &str) -> Result<bool> {
@@ -1057,6 +1114,10 @@ mod tests {
         let tool = MemoryQueryTool;
         assert!(tool.validate(&json!({})).is_ok());
         assert!(tool.validate(&json!({"query": "test"})).is_ok());
+        assert!(tool.validate(&json!({"top_k": -1})).is_err());
+        assert!(tool.validate(&json!({"top_k": 0})).is_err());
+        assert!(tool.validate(&json!({"top_k": 51})).is_err());
+        assert!(tool.validate(&json!({"top_k": 50})).is_ok());
     }
 
     #[test]
@@ -1129,8 +1190,26 @@ mod tests {
         assert!(tool
             .validate(&json!({"action": "restore", "id": "abc"}))
             .is_ok());
-        assert!(tool.validate(&json!({"action": "batch_delete"})).is_ok());
+        assert!(tool.validate(&json!({"action": "batch_delete"})).is_err());
+        assert!(tool
+            .validate(&json!({"action": "batch_delete", "scope": "short_term"}))
+            .is_ok());
         assert!(tool.validate(&json!({"action": "delete"})).is_err());
         assert!(tool.validate(&json!({"action": "invalid"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_forget_batch_delete_forwards_caller_session() {
+        let store = Arc::new(CaptureMemoryStore::new());
+
+        MemoryForgetTool
+            .execute(
+                test_context(store.clone()),
+                json!({"action": "batch_delete", "scope": "short_term"}),
+            )
+            .await
+            .expect("batch delete should execute");
+
+        assert_eq!(store.last_batch_delete()["session_key"], "cli:test");
     }
 }

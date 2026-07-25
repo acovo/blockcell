@@ -281,12 +281,36 @@ pub trait MemoryStoreOps: Send + Sync {
     fn query_json(&self, params_json: Value) -> Result<Value>;
     /// Soft-delete a memory item by ID. Returns success boolean.
     fn soft_delete(&self, id: &str) -> Result<bool>;
+    /// Soft-delete a memory item owned by the caller session.
+    fn soft_delete_in_session(&self, _id: &str, _session_key: &str) -> Result<bool> {
+        Err(blockcell_core::Error::Validation(
+            "Session-scoped memory deletion is not supported by this store".to_string(),
+        ))
+    }
     /// Batch soft-delete by filter. Returns count of deleted items.
     fn batch_soft_delete_json(&self, params_json: Value) -> Result<usize>;
+    /// Batch soft-delete caller-owned memory items only.
+    fn batch_soft_delete_in_session_json(&self, _params_json: Value) -> Result<usize> {
+        Err(blockcell_core::Error::Validation(
+            "Session-scoped batch memory deletion is not supported by this store".to_string(),
+        ))
+    }
     /// Restore a soft-deleted item. Returns success boolean.
     fn restore(&self, id: &str) -> Result<bool>;
+    /// Restore a memory item owned by the caller session.
+    fn restore_in_session(&self, _id: &str, _session_key: &str) -> Result<bool> {
+        Err(blockcell_core::Error::Validation(
+            "Session-scoped memory restore is not supported by this store".to_string(),
+        ))
+    }
     /// Get memory stats as JSON.
     fn stats_json(&self) -> Result<Value>;
+    /// Get statistics for caller-owned memory items only.
+    fn stats_in_session_json(&self, _session_key: &str) -> Result<Value> {
+        Err(blockcell_core::Error::Validation(
+            "Session-scoped memory statistics are not supported by this store".to_string(),
+        ))
+    }
     /// Generate brief for prompt injection.
     fn generate_brief(&self, long_term_max: usize, short_term_max: usize) -> Result<String>;
     fn generate_brief_in_session(

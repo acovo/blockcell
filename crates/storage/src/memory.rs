@@ -28,6 +28,7 @@ static FTS_SPECIAL_CHARS: Lazy<Regex> =
 
 const VECTOR_SYNC_OP_UPSERT: &str = "upsert";
 const VECTOR_SYNC_OP_DELETE: &str = "delete";
+pub const MAX_MEMORY_QUERY_RESULTS: usize = 50;
 
 /// Scope of a memory item.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,6 +123,12 @@ impl Default for QueryParams {
             top_k: 20,
             include_deleted: false,
         }
+    }
+}
+
+impl QueryParams {
+    pub fn bounded_top_k(&self) -> usize {
+        self.top_k.min(MAX_MEMORY_QUERY_RESULTS)
     }
 }
 

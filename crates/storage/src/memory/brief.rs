@@ -304,4 +304,33 @@ impl MemoryStore {
             }
         }))
     }
+
+    pub fn stats_in_session(&self, session_key: &str) -> Result<serde_json::Value> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
+        let count = |predicate: &str| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM memory_items WHERE session_key = ?1 AND {}",
+                    predicate
+                ),
+                params![session_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+        };
+
+        Ok(serde_json::json!({
+            "total_active": count("deleted_at IS NULL"),
+            "long_term": count("scope = 'long_term' AND deleted_at IS NULL"),
+            "short_term": count("scope = 'short_term' AND deleted_at IS NULL"),
+            "deleted_in_recycle_bin": count("deleted_at IS NOT NULL"),
+            "vector": {
+                "enabled": self.vector.is_some(),
+                "healthy": self.vector.as_ref().map(|runtime| runtime.index.health().is_ok()),
+            }
+        }))
+    }
 }

@@ -3,6 +3,14 @@ use super::*;
 impl MemoryStore {
     /// Soft-delete a memory item.
     pub fn soft_delete(&self, id: &str) -> Result<bool> {
+        self.soft_delete_with_owner(id, None)
+    }
+
+    pub fn soft_delete_in_session(&self, id: &str, session_key: &str) -> Result<bool> {
+        self.soft_delete_with_owner(id, Some(session_key))
+    }
+
+    fn soft_delete_with_owner(&self, id: &str, session_key: Option<&str>) -> Result<bool> {
         let deleted = {
             let mut conn = self
                 .inner
@@ -17,8 +25,12 @@ impl MemoryStore {
             let now = Utc::now().to_rfc3339();
             let affected = tx
                 .execute(
-                    "UPDATE memory_items SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
-                    params![now, id],
+                    "UPDATE memory_items
+                     SET deleted_at = ?1
+                     WHERE id = ?2
+                       AND deleted_at IS NULL
+                       AND (?3 IS NULL OR session_key = ?3)",
+                    params![now, id, session_key],
                 )
                 .map_err(|e| blockcell_core::Error::Storage(format!("Soft delete error: {}", e)))?;
             if affected > 0 && self.vector.is_some() {
@@ -48,6 +60,28 @@ impl MemoryStore {
         tags: Option<&[String]>,
         time_before: Option<&str>,
     ) -> Result<usize> {
+        self.batch_soft_delete_with_owner(None, scope, item_type, tags, time_before)
+    }
+
+    pub fn batch_soft_delete_in_session(
+        &self,
+        session_key: &str,
+        scope: Option<&str>,
+        item_type: Option<&str>,
+        tags: Option<&[String]>,
+        time_before: Option<&str>,
+    ) -> Result<usize> {
+        self.batch_soft_delete_with_owner(Some(session_key), scope, item_type, tags, time_before)
+    }
+
+    fn batch_soft_delete_with_owner(
+        &self,
+        session_key: Option<&str>,
+        scope: Option<&str>,
+        item_type: Option<&str>,
+        tags: Option<&[String]>,
+        time_before: Option<&str>,
+    ) -> Result<usize> {
         let ids = {
             let mut conn = self
                 .inner
@@ -64,6 +98,12 @@ impl MemoryStore {
             let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             let mut idx = 1;
 
+            if let Some(session_key) = session_key {
+                sql.push_str(&format!(" AND session_key = ?{}", idx));
+                bind_values.push(Box::new(session_key.to_string()));
+                idx += 1;
+            }
+
             if let Some(s) = scope {
                 sql.push_str(&format!(" AND scope = ?{}", idx));
                 bind_values.push(Box::new(s.to_string()));
@@ -78,7 +118,10 @@ impl MemoryStore {
                 if !tag_list.is_empty() {
                     let mut tag_conditions = Vec::new();
                     for tag in tag_list {
-                        tag_conditions.push(format!("tags LIKE '%' || ?{} || '%'", idx));
+                        tag_conditions.push(format!(
+                            "instr(',' || memory_items.tags || ',', ',' || ?{} || ',') > 0",
+                            idx
+                        ));
                         bind_values.push(Box::new(tag.clone()));
                         idx += 1;
                     }
@@ -167,6 +210,14 @@ impl MemoryStore {
 
     /// Restore a soft-deleted item.
     pub fn restore(&self, id: &str) -> Result<bool> {
+        self.restore_with_owner(id, None)
+    }
+
+    pub fn restore_in_session(&self, id: &str, session_key: &str) -> Result<bool> {
+        self.restore_with_owner(id, Some(session_key))
+    }
+
+    fn restore_with_owner(&self, id: &str, session_key: Option<&str>) -> Result<bool> {
         let restored_item = {
             let mut conn = self
                 .inner
@@ -177,8 +228,12 @@ impl MemoryStore {
             })?;
             let affected = tx
                 .execute(
-                    "UPDATE memory_items SET deleted_at = NULL WHERE id = ?1 AND deleted_at IS NOT NULL",
-                    params![id],
+                    "UPDATE memory_items
+                     SET deleted_at = NULL
+                     WHERE id = ?1
+                       AND deleted_at IS NOT NULL
+                       AND (?2 IS NULL OR session_key = ?2)",
+                    params![id, session_key],
                 )
                 .map_err(|e| blockcell_core::Error::Storage(format!("Restore error: {}", e)))?;
 
@@ -402,17 +457,16 @@ impl MemoryStore {
             blockcell_core::Error::Storage("Vector runtime is not enabled".to_string())
         })?;
 
-        runtime.index.reset()?;
-        self.clear_all_vector_sync()?;
-
         let items = self.load_reindexable_items()?;
+        self.seed_reindex_vector_sync(&items)?;
+        runtime.index.reset()?;
         let mut result = VectorReindexResult {
             indexed: 0,
             failed: 0,
         };
 
         for item in items {
-            match self.try_vector_upsert(&item) {
+            match self.reindex_vector_item(&item.id) {
                 Ok(()) => {
                     self.clear_vector_sync(&item.id);
                     result.indexed += 1;
@@ -426,5 +480,38 @@ impl MemoryStore {
         }
 
         Ok(result)
+    }
+
+    fn reindex_vector_item(&self, id: &str) -> Result<()> {
+        for _ in 0..3 {
+            let Some(item) = self.get_by_id(id)? else {
+                self.try_vector_delete_ids(&[id.to_string()])?;
+                return Ok(());
+            };
+            if !is_item_active_for_vector(&item) {
+                self.try_vector_delete_ids(&[id.to_string()])?;
+                return Ok(());
+            }
+
+            self.try_vector_upsert(&item)?;
+            match self.get_by_id(id)? {
+                Some(current)
+                    if is_item_active_for_vector(&current)
+                        && current.updated_at == item.updated_at =>
+                {
+                    return Ok(())
+                }
+                Some(current) if is_item_active_for_vector(&current) => continue,
+                _ => {
+                    self.try_vector_delete_ids(&[id.to_string()])?;
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(blockcell_core::Error::Storage(format!(
+            "Memory item {} kept changing during vector reindex",
+            id
+        )))
     }
 }
