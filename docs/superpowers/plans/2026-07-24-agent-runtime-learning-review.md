@@ -135,8 +135,8 @@
 - Update: `docs/reviews/2026-07-24-agent-runtime-learning-review.md`
 - Re-inspect: call sites identified in Tasks 1-6
 
-- [ ] Reproduce or prove each high/medium finding with a focused existing test, a read-only command, or explicit control-flow analysis.
-- [ ] Remove speculative findings that lack a concrete trigger and consequence.
-- [ ] Rank findings by severity and include repair direction without implementing the repair.
-- [ ] Add separate sections for architecture risks, test gaps, and reviewed areas with no confirmed defect.
-- [ ] Run `cargo test -p blockcell-storage -p blockcell-agent -p blockcell-skills -p blockcell-scheduler --all-targets` and record the final baseline.
+- [x] Reproduce or prove each high/medium finding with a focused existing test, a read-only command, or explicit control-flow analysis.
+- [x] Remove speculative findings that lack a concrete trigger and consequence.
+- [x] Rank findings by severity and include repair direction without implementing the repair.
+- [x] Add separate sections for architecture risks, test gaps, and reviewed areas with no confirmed defect.
+- [x] Run `cargo test -p blockcell-storage -p blockcell-agent -p blockcell-skills -p blockcell-scheduler --all-targets` and record the final baseline.

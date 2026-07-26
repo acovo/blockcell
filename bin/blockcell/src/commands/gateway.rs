@@ -431,7 +431,7 @@ async fn spawn_agent_runtime(
     let core_evo_raw = Arc::new(Mutex::new(core_evo));
 
     let cap_registry_adapter = CapabilityRegistryAdapter::new(cap_registry_raw.clone());
-    let cap_registry_handle: CapabilityRegistryHandle = Arc::new(Mutex::new(cap_registry_adapter));
+    let cap_registry_handle: CapabilityRegistryHandle = Arc::new(cap_registry_adapter);
 
     let core_evo_adapter = CoreEvolutionAdapter::new(core_evo_raw.clone());
     let core_evo_handle: CoreEvolutionHandle = Arc::new(Mutex::new(core_evo_adapter));

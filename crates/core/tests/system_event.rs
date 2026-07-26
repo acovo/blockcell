@@ -66,6 +66,7 @@ fn summary_models_serialize_for_main_session() {
         created_at_ms: 1_700_000_000_000,
         priority: EventPriority::Normal,
         merge_key: Some("task:report".to_string()),
+        persist: true,
     };
     let summary = SessionSummary {
         title: "System updates".to_string(),

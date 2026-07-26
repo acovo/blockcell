@@ -498,9 +498,8 @@ impl Tool for CapabilityEvolveTool {
             "list" => {
                 // List evolved tools from the registry
                 if let Some(ref registry_handle) = ctx.capability_registry {
-                    let registry = registry_handle.lock().await;
-                    let caps = registry.list_all_json().await;
-                    let stats = registry.stats_json().await;
+                    let caps = registry_handle.list_all_json().await;
+                    let stats = registry_handle.stats_json().await;
 
                     Ok(json!({
                         "tools": caps,
@@ -516,8 +515,7 @@ impl Tool for CapabilityEvolveTool {
             "status" => {
                 let cap_id = params["capability_id"].as_str().unwrap_or("");
                 if let Some(ref registry_handle) = ctx.capability_registry {
-                    let registry = registry_handle.lock().await;
-                    if let Some(desc) = registry.get_descriptor_json(cap_id).await {
+                    if let Some(desc) = registry_handle.get_descriptor_json(cap_id).await {
                         Ok(desc)
                     } else {
                         Ok(json!({"error": format!("Evolved tool '{}' not found", cap_id)}))
@@ -531,8 +529,7 @@ impl Tool for CapabilityEvolveTool {
                 let input = params.get("input").cloned().unwrap_or(json!({}));
 
                 if let Some(ref registry_handle) = ctx.capability_registry {
-                    let registry = registry_handle.lock().await;
-                    match registry.execute_capability(cap_id, input).await {
+                    match registry_handle.execute_capability(cap_id, input).await {
                         Ok(output) => Ok(json!({
                             "capability_id": cap_id,
                             "status": "success",

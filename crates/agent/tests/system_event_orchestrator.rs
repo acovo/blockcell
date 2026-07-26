@@ -84,3 +84,45 @@ fn orchestrator_only_returns_immediately_ackable_event_ids() {
 
     assert!(decision.ack_event_ids.is_empty());
 }
+
+#[test]
+fn orchestrator_forces_notification_at_event_max_delay() {
+    let store = InMemorySystemEventStore::default();
+    let queue = MainSessionSummaryQueue::with_policy(5, 30_000);
+    let orchestrator = SystemEventOrchestrator::new(store.clone(), queue);
+
+    let mut event = build_event("deadline", EventPriority::Normal);
+    event.created_at_ms = 1_000;
+    event.delivery.max_delay_seconds = Some(1);
+    store.emit(event);
+
+    assert!(orchestrator
+        .process_tick(1_999)
+        .immediate_notifications
+        .is_empty());
+    assert_eq!(
+        orchestrator
+            .process_tick(2_000)
+            .immediate_notifications
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn orchestrator_does_not_persist_summary_for_transient_event() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("summary_queue.json");
+    let store = InMemorySystemEventStore::default();
+    let queue = MainSessionSummaryQueue::with_persistence(5, 30_000, path.clone()).unwrap();
+    let orchestrator = SystemEventOrchestrator::new(store.clone(), queue);
+
+    let mut event = build_event("transient", EventPriority::Normal);
+    event.delivery.persist = false;
+    store.emit(event);
+    orchestrator.process_tick(1_000);
+    drop(orchestrator);
+
+    let restored = MainSessionSummaryQueue::with_persistence(5, 30_000, path).unwrap();
+    assert_eq!(restored.snapshot().pending_count, 0);
+}

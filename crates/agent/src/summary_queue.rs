@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use blockcell_core::system_event::{
@@ -30,6 +31,7 @@ pub struct MainSessionSummaryQueue {
     items: Arc<Mutex<Vec<SummaryItem>>>,
     max_items_before_flush: usize,
     max_age_ms: i64,
+    persistence_path: Option<Arc<PathBuf>>,
 }
 
 impl MainSessionSummaryQueue {
@@ -38,6 +40,41 @@ impl MainSessionSummaryQueue {
             items: Arc::new(Mutex::new(Vec::new())),
             max_items_before_flush,
             max_age_ms,
+            persistence_path: None,
+        }
+    }
+
+    pub fn with_persistence(
+        max_items_before_flush: usize,
+        max_age_ms: i64,
+        path: PathBuf,
+    ) -> std::io::Result<Self> {
+        let items = if path.exists() {
+            let content = std::fs::read(&path)?;
+            serde_json::from_slice(&content).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            items: Arc::new(Mutex::new(items)),
+            max_items_before_flush,
+            max_age_ms,
+            persistence_path: Some(Arc::new(path)),
+        })
+    }
+
+    fn persist_locked(&self, items: &[SummaryItem]) {
+        let Some(path) = self.persistence_path.as_deref() else {
+            return;
+        };
+        let persistent: Vec<&SummaryItem> = items.iter().filter(|item| item.persist).collect();
+        let result = serde_json::to_vec_pretty(&persistent)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| blockcell_core::file_store::atomic_write(path, &bytes));
+        if let Err(error) = result {
+            tracing::warn!(path = %path.display(), error = %error, "Failed to persist summary queue");
         }
     }
 
@@ -65,10 +102,13 @@ impl MainSessionSummaryQueue {
                 existing.created_at_ms = item.created_at_ms;
                 existing.priority = existing.priority.max(item.priority);
                 existing.category = item.category;
+                existing.persist |= item.persist;
+                self.persist_locked(&items);
                 return;
             }
         }
         items.push(item);
+        self.persist_locked(&items);
     }
 
     pub fn enqueue_event_as_summary_item(&self, event: &SystemEvent) -> SummaryItem {
@@ -104,6 +144,7 @@ impl MainSessionSummaryQueue {
             created_at_ms: event.created_at_ms,
             priority: event.priority,
             merge_key: event.dedup_key.clone(),
+            persist: event.delivery.persist,
         };
         self.enqueue(item.clone());
         item
@@ -135,6 +176,7 @@ impl MainSessionSummaryQueue {
     pub fn acknowledge_items(&self, item_ids: &[String]) {
         let mut items = get_lock(&self.items);
         items.retain(|item| !item_ids.iter().any(|item_id| item_id == &item.id));
+        self.persist_locked(&items);
     }
 
     pub fn snapshot(&self) -> SummaryQueueSnapshot {

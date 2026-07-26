@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use blockcell_core::system_event::{EventScope, SystemEvent};
@@ -27,12 +28,53 @@ fn get_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct InMemorySystemEventStore {
     events: Arc<Mutex<Vec<SystemEvent>>>,
+    persistence_path: Option<Arc<PathBuf>>,
+}
+
+impl Default for InMemorySystemEventStore {
+    fn default() -> Self {
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+            persistence_path: None,
+        }
+    }
 }
 
 impl InMemorySystemEventStore {
+    pub fn with_persistence(path: PathBuf) -> std::io::Result<Self> {
+        let events = if path.exists() {
+            let content = std::fs::read(&path)?;
+            serde_json::from_slice(&content).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            events: Arc::new(Mutex::new(events)),
+            persistence_path: Some(Arc::new(path)),
+        })
+    }
+
+    fn persist_locked(&self, events: &[SystemEvent]) {
+        let Some(path) = self.persistence_path.as_deref() else {
+            return;
+        };
+        let persistent: Vec<&SystemEvent> = events
+            .iter()
+            .filter(|event| event.delivery.persist)
+            .collect();
+        let result = serde_json::to_vec_pretty(&persistent)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| blockcell_core::file_store::atomic_write(path, &bytes));
+        if let Err(error) = result {
+            tracing::warn!(path = %path.display(), error = %error, "Failed to persist system events");
+        }
+    }
+
     pub fn dedup_or_merge(&self, event: SystemEvent) {
         let mut events = get_lock(&self.events);
         if let Some(dedup_key) = event.dedup_key.as_deref() {
@@ -42,10 +84,12 @@ impl InMemorySystemEventStore {
                     && existing.dedup_key.as_deref() == Some(dedup_key)
             }) {
                 *existing = event;
+                self.persist_locked(&events);
                 return;
             }
         }
         events.push(event);
+        self.persist_locked(&events);
     }
 }
 
@@ -85,6 +129,7 @@ impl SystemEventStoreOps for InMemorySystemEventStore {
                 event.delivered = true;
             }
         }
+        self.persist_locked(&events);
     }
 
     fn mark_acked(&self, event_ids: &[String]) {
@@ -94,6 +139,7 @@ impl SystemEventStoreOps for InMemorySystemEventStore {
                 event.acked = true;
             }
         }
+        self.persist_locked(&events);
     }
 
     fn count_pending(&self) -> usize {
@@ -115,7 +161,9 @@ impl SystemEventStoreOps for InMemorySystemEventStore {
         // 然后移除已过期且已 delivered 或已 acked 的事件
         // 保留条件：未过期，或过期但仍未投递（需要继续投递）
         events.retain(|event| event.created_at_ms >= cutoff || !event.delivered);
-        before.saturating_sub(events.len())
+        let removed = before.saturating_sub(events.len());
+        self.persist_locked(&events);
+        removed
     }
 }
 

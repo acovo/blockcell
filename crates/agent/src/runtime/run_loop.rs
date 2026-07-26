@@ -527,11 +527,10 @@ impl AgentRuntime {
 
                     // Refresh capability brief for prompt injection + sync capability IDs to SkillManager
                     if let Some(ref registry_handle) = self.capability_registry {
-                        let registry = registry_handle.lock().await;
-                        let brief = registry.generate_brief().await;
+                        let brief = registry_handle.generate_brief().await;
                         self.context_builder.set_capability_brief(brief);
                         // Sync available capability IDs so SkillManager can validate skill dependencies
-                        let cap_ids = registry.list_available_ids().await;
+                        let cap_ids = registry_handle.list_available_ids().await;
                         self.context_builder.sync_capabilities(cap_ids);
                     }
 

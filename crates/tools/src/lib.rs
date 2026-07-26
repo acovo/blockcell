@@ -171,7 +171,7 @@ pub type SessionSearchHandle = Arc<dyn SessionSearchOps + Send + Sync>;
 pub type ResponseCacheHandle = Arc<dyn ResponseCacheOps + Send + Sync>;
 
 /// Opaque handle to the capability registry, passed through ToolContext.
-pub type CapabilityRegistryHandle = Arc<Mutex<dyn CapabilityRegistryOps + Send + Sync>>;
+pub type CapabilityRegistryHandle = Arc<dyn CapabilityRegistryOps + Send + Sync>;
 
 /// Opaque handle to the core evolution engine, passed through ToolContext.
 pub type CoreEvolutionHandle = Arc<Mutex<dyn CoreEvolutionOps + Send + Sync>>;

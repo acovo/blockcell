@@ -12,6 +12,7 @@ fn build_item(id: &str, created_at_ms: i64, merge_key: Option<&str>, title: &str
         created_at_ms,
         priority: EventPriority::Normal,
         merge_key: merge_key.map(str::to_string),
+        persist: true,
     }
 }
 
@@ -95,4 +96,18 @@ fn summary_queue_flushes_due_items_by_count_or_age() {
     let flushed = by_age.flush_due_items(1_500);
     assert_eq!(flushed.len(), 1);
     assert_eq!(flushed[0].title, "Old");
+}
+
+#[test]
+fn summary_queue_restores_pending_items_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("summary_queue.json");
+    let queue = MainSessionSummaryQueue::with_persistence(5, 30_000, path.clone()).unwrap();
+    queue.enqueue(build_item("persistent", 100, None, "Persistent summary"));
+    drop(queue);
+
+    let restored = MainSessionSummaryQueue::with_persistence(5, 30_000, path).unwrap();
+    let snapshot = restored.snapshot();
+    assert_eq!(snapshot.pending_count, 1);
+    assert_eq!(snapshot.items[0].title, "Persistent summary");
 }

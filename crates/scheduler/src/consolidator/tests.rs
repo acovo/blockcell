@@ -447,7 +447,10 @@ async fn test_dream_releases_lock_when_commit_backup_recovery_fails() {
     let err = consolidator.dream(5).await.unwrap_err();
 
     assert!(matches!(err, DreamError::Io(_)));
-    assert!(!root.join(LOCK_FILE_NAME).exists());
+    let lock_path = root.join(LOCK_FILE_NAME);
+    let reacquired = ExclusiveFileLock::try_acquire(&lock_path)
+        .expect("dream lock must be reacquirable after recovery failure");
+    drop(reacquired);
     let _ = tokio::fs::remove_dir_all(&root).await;
 }
 
@@ -528,7 +531,10 @@ async fn test_dream_cleans_state_and_lock_when_staging_prepare_fails() {
     let err = consolidator.dream(5).await.unwrap_err();
 
     assert!(err.to_string().contains("symlink is not allowed"));
-    assert!(!root.join(LOCK_FILE_NAME).exists());
+    let lock_path = root.join(LOCK_FILE_NAME);
+    let reacquired = ExclusiveFileLock::try_acquire(&lock_path)
+        .expect("dream lock must be reacquirable after staging failure");
+    drop(reacquired);
     let persisted = DreamState::load(&root).await.unwrap();
     assert!(!persisted.is_consolidating);
     assert!(persisted.consolidating_started_at.is_none());

@@ -4,7 +4,9 @@ use blockcell_core::{Error, ProviderKind, Result};
 use blockcell_providers::Provider;
 use blockcell_skills::{CapabilityRegistry, CoreEvolution, LLMProvider};
 use blockcell_storage::EvolutionWorkflowStore;
-use blockcell_tools::{CapabilityRegistryOps, CoreEvolutionOps, EvolutionWorkflowStoreOps};
+use blockcell_tools::{
+    CapabilityRegistryHandle, CapabilityRegistryOps, CoreEvolutionOps, EvolutionWorkflowStoreOps,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -74,6 +76,12 @@ impl CapabilityRegistryAdapter {
     pub fn new(registry: Arc<Mutex<CapabilityRegistry>>) -> Self {
         Self { inner: registry }
     }
+}
+
+pub fn capability_registry_ops_handle(
+    adapter: CapabilityRegistryAdapter,
+) -> CapabilityRegistryHandle {
+    Arc::new(adapter)
 }
 
 #[async_trait]
@@ -307,5 +315,66 @@ impl EvolutionWorkflowStoreOps for EvolutionWorkflowStoreAdapter {
                 format!("Capability '{}' was not blocked.", capability_id)
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blockcell_core::{CapabilityDescriptor, CapabilityStatus, CapabilityType, PrivilegeLevel};
+    use blockcell_skills::CapabilityExecutor;
+    use std::time::Duration;
+
+    struct SlowExecutor;
+
+    #[async_trait]
+    impl CapabilityExecutor for SlowExecutor {
+        async fn execute(&self, input: Value) -> Result<Value> {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(input)
+        }
+
+        async fn health_check(&self) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_adapter_does_not_block_registry_reads_during_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = blockcell_skills::new_registry_handle(temp.path().to_path_buf());
+        let descriptor = CapabilityDescriptor::new(
+            "test.slow_adapter",
+            "Slow adapter",
+            "Slow adapter concurrency test",
+            CapabilityType::Internal,
+            ProviderKind::BuiltIn,
+        )
+        .with_privilege(PrivilegeLevel::Limited)
+        .with_status(CapabilityStatus::Available);
+        registry
+            .lock()
+            .await
+            .register_with_executor(descriptor, Arc::new(SlowExecutor));
+
+        let handle = capability_registry_ops_handle(CapabilityRegistryAdapter::new(registry));
+        let execution_handle = handle.clone();
+        let execution = tokio::spawn(async move {
+            execution_handle
+                .execute_capability("test.slow_adapter", json!({}))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let listed = tokio::time::timeout(Duration::from_millis(200), handle.list_all_json()).await;
+        assert!(
+            listed.is_ok(),
+            "outer registry handle blocked list operation"
+        );
+        execution.await.unwrap().unwrap();
     }
 }

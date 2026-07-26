@@ -68,3 +68,22 @@ fn system_event_store_dedups_matching_pending_keys() {
     assert_eq!(pending[0].id, "evt-2");
     assert_eq!(pending[0].dedup_key.as_deref(), Some("task:alpha"));
 }
+
+#[test]
+fn system_event_store_restores_only_persistent_events_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("system_events.json");
+    let store = InMemorySystemEventStore::with_persistence(path.clone()).unwrap();
+    let persistent = build_event("persistent", 100, None);
+    let mut transient = build_event("transient", 200, None);
+    transient.delivery.persist = false;
+
+    store.emit(persistent);
+    store.emit(transient);
+    drop(store);
+
+    let restored = InMemorySystemEventStore::with_persistence(path).unwrap();
+    let pending = restored.list_pending(10);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "persistent");
+}

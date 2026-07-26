@@ -73,7 +73,14 @@ impl SystemEventOrchestrator {
                 continue;
             }
 
-            if event.priority == EventPriority::Critical || event.delivery.immediate {
+            let deadline_due = event.delivery.max_delay_seconds.is_some_and(|seconds| {
+                now_ms
+                    >= event
+                        .created_at_ms
+                        .saturating_add((seconds as i64).saturating_mul(1000))
+            });
+            if event.priority == EventPriority::Critical || event.delivery.immediate || deadline_due
+            {
                 decision.immediate_notifications.push(NotificationRequest {
                     event_id: event.id.clone(),
                     scope: event.scope.clone(),

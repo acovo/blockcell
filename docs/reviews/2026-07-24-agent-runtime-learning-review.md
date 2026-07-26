@@ -1,7 +1,7 @@
 # Agent Runtime and Learning Systems Review
 
 **Date:** 2026-07-24
-**Status:** Module 5 Task 6 skill-evolution lifecycle review complete; M16-M25 remediated
+**Status:** Task 7 cross-boundary synthesis complete; X1-X2 fixed and regression-tested
 **Plan:** `docs/superpowers/plans/2026-07-24-agent-runtime-learning-review.md`
 
 ## Verification baseline
@@ -52,6 +52,21 @@ Module 5 Task 6 remediation verification:
 - `cargo test -p blockcell-skills -- --nocapture`: 123 unit tests and 6 integration tests passed, 0 failed.
 - `cargo test -p blockcell-storage evolution_workflow -- --nocapture`: 5 passed, 0 failed.
 - `cargo test -p blockcell-scheduler -- --nocapture`: 55 passed, with the same 2 pre-existing `consolidator` lock-cleanup failures outside Task 6.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+Task 7 final cross-module baseline:
+
+- `cargo test -p blockcell-storage -p blockcell-agent -p blockcell-skills -p blockcell-scheduler --all-targets`: Agent completed with 643 unit tests and 56 integration tests passed; Scheduler completed with 55 passed and 2 failed; the command exited on those Scheduler failures.
+- `cargo test -p blockcell-storage --all-targets`: 68 passed, 0 failed.
+- `cargo test -p blockcell-skills --all-targets`: 123 unit tests and 6 integration tests passed, 0 failed.
+- The two Scheduler failures are stale test-contract assertions, not evidence that the advisory lock remains held: both tests require the lock pathname to disappear, while `ExclusiveFileLock::release` intentionally unlocks without unlinking and the core regression test proves the same pathname can be reacquired after release.
+
+Task 7 remediation verification:
+
+- `cargo test -p blockcell-agent --all-targets`: all unit and integration targets passed, including 644 Agent unit tests.
+- `cargo test -p blockcell-tools --all-targets`: 406 unit tests and 8 MCP integration tests passed, 0 failed.
+- `cargo test -p blockcell-scheduler --all-targets`: 57 passed, 0 failed; both advisory-lock cleanup regressions now pass.
+- `cargo test -p blockcell --bin blockcell --no-run`: passed, verifying Agent and Gateway capability-handle construction.
 - `cargo fmt --all -- --check` and `git diff --check`: passed.
 
 ## Runtime lifecycle map
@@ -1087,10 +1102,54 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Idempotent notification of tasks interrupted by restart.
 - Startup cleanup of terminal task records without consuming the unfinished-task recovery limit.
 
+## Task 7 cross-boundary findings
+
+### X1 — Medium: DeliveryPolicy persistence and maximum-delay contracts are ignored
+
+**Locations:**
+
+- `crates/core/src/system_event.rs:35-50`
+- `crates/agent/src/system_event_store.rs:30-118`
+- `crates/agent/src/system_event_orchestrator.rs:58-115`
+- `crates/agent/src/summary_queue.rs:29-146`
+
+**Trigger:** An event is emitted with `delivery.persist = true` and remains pending when the process exits, or a normal event sets `max_delay_seconds` shorter than the global summary queue's count/age flush threshold.
+
+**Control flow:** `DeliveryPolicy::default` promises persistence, but Runtime constructs only `InMemorySystemEventStore` and `MainSessionSummaryQueue`; neither has a disk load/save path. `emit`, deduplication, pending state, and summary items live only in process memory. Repository-wide search finds no consumer of `delivery.persist` or `max_delay_seconds`. `process_tick` sends only Critical/`immediate` events immediately and otherwise relies exclusively on the queue's global count/age policy, so an event-specific maximum delay has no effect.
+
+**Impact:** Restart silently drops pending notifications and unflushed summaries even when their policy explicitly requires persistence. A caller that sets a delivery deadline can observe notification latency beyond that contract, potentially indefinitely when ticks or queue flush conditions do not occur as expected.
+
+**Repair direction:** Introduce a durable event/summary store with atomic enqueue, delivered/acked state, and startup replay for `persist = true`; explicitly exclude non-persistent events. Calculate each event's deadline from `created_at_ms + max_delay_seconds`, force notification or summary flush at that deadline, and add restart/deadline regression tests.
+
+**Evidence:** Direct contract and repository-wide usage proof. The only production fields are defined in `DeliveryPolicy`; the event store is an `Arc<Mutex<Vec<_>>>`, and neither policy field is read by the Agent event pipeline.
+
+**Resolution:** Fixed. Runtime now uses JSON-backed event and summary stores below the workspace, atomically persists only records whose policy requests persistence, and reloads pending records at startup. The orchestrator also forces notification once `created_at_ms + max_delay_seconds` is reached while preserving transient-event behavior. Regression tests: `system_event_store_restores_only_persistent_events_after_restart`, `summary_queue_restores_pending_items_after_restart`, `orchestrator_forces_notification_at_event_max_delay`, and `orchestrator_does_not_persist_summary_for_transient_event`.
+
+### X2 — Medium: The outer capability-registry mutex serializes all operations across capability execution
+
+**Locations:**
+
+- `crates/tools/src/lib.rs:173-177`
+- `crates/tools/src/system_info.rs:498-535`
+- `crates/agent/src/capability_adapter.rs:80-135`
+- `crates/skills/src/capability_provider.rs:908-925`
+
+**Trigger:** One evolved capability is slow, hung until its timeout, or awaiting an external API while another request lists capabilities, checks status, or executes a different capability.
+
+**Control flow:** The tools-layer handle is `Arc<Mutex<dyn CapabilityRegistryOps>>`. `system_info` acquires this outer mutex and keeps its guard while awaiting `execute_capability`. The adapter delegates to `execute_registered_capability`, which correctly releases the inner concrete registry lock before awaiting the executor, but the tools-layer outer guard remains held for the entire await. Every list/status/execute action must acquire that same outer mutex first.
+
+**Impact:** One slow evolved capability blocks unrelated registry reads and all other evolved capability executions. A capability that reaches its execution timeout turns the registry into a global head-of-line bottleneck and can be used as an availability denial against otherwise independent capabilities.
+
+**Repair direction:** Make the opaque handle `Arc<dyn CapabilityRegistryOps + Send + Sync>` and require implementations to own their internal synchronization, matching the other tools handles. Alternatively expose a lock-free prepared executor handle before awaiting. Add an adapter-level concurrent test proving a slow execution does not block list/status or a second capability.
+
+**Evidence:** Direct lock-lifetime proof. The existing `test_shared_execution_does_not_hold_registry_lock` covers only the inner Skills registry mutex and therefore does not exercise the outer tools-layer mutex responsible for this serialization.
+
+**Resolution:** Fixed. `CapabilityRegistryHandle` is now an `Arc<dyn CapabilityRegistryOps + Send + Sync>` and synchronization is owned by the concrete adapter. Registry reads and unrelated executions no longer wait on an outer mutex held across capability execution. Regression test: `capability_adapter_does_not_block_registry_reads_during_execution`.
+
 ## Open architecture risks and missing coverage
 
-- `DeliveryPolicy.persist` and `max_delay_seconds` remain unenforced by the in-memory event store. Pending events and summary items can still disappear on process restart even though the default policy requests persistence.
-- `CapabilityRegistryHandle` is an outer `Arc<tokio::Mutex<dyn CapabilityRegistryOps>>`. Callers hold that mutex while awaiting `execute_capability`, and the adapter then awaits an external capability executor after releasing only its inner concrete-registry lock. This serializes all capability-registry operations behind the full duration of one capability execution. No lock cycle was found, so this is recorded as a head-of-line blocking risk rather than a confirmed deadlock.
+- The stale Scheduler pathname assertions were replaced with advisory-lock reacquisition checks; the full Scheduler baseline is green.
+- X1 restart/deadline behavior and X2 adapter concurrency now have focused regression coverage.
 
 ## Review progress
 
@@ -1105,4 +1164,5 @@ tools receive the current runtime abort token and origin session through `Runtim
 - Module 5 Task 4 persistence, retrieval, session isolation, vector synchronization, crash consistency, and mutation-contract review: complete. M4-M8 are fixed and regression-tested.
 - Module 5 Task 5 Ghost decisions, background review, ledger leases, dedup/throttle lifetime, guarded file writes, snapshots, rollback, traversal, and security scanning: complete. M9-M15 are fixed and regression-tested.
 - Module 5 Task 6 skill/core evolution generation, audit, compilation, versioning, deployment, canary, restart recovery, rollback, worker leases, and scheduled Ghost review: complete. M16-M25 are fixed and regression-tested.
+- Task 7 cross-boundary synthesis and remediation: complete. X1-X2 are fixed and regression-tested, and the Scheduler advisory-lock baseline is green.
 - The implementation and verification record is in `docs/superpowers/plans/2026-07-25-skill-evolution-lifecycle-fixes.md`.

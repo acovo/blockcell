@@ -129,7 +129,7 @@ pub async fn run(
 
     // Create adapter handles for the tools crate trait objects
     let cap_registry_adapter = CapabilityRegistryAdapter::new(cap_registry_raw.clone());
-    let cap_registry_handle: CapabilityRegistryHandle = Arc::new(Mutex::new(cap_registry_adapter));
+    let cap_registry_handle: CapabilityRegistryHandle = Arc::new(cap_registry_adapter);
 
     let core_evo_adapter = CoreEvolutionAdapter::new(core_evo_raw.clone());
     let core_evo_handle: CoreEvolutionHandle = Arc::new(Mutex::new(core_evo_adapter));

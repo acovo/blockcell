@@ -2194,11 +2194,14 @@ impl AgentRuntime {
         let path_policy = load_path_policy(&config, &paths);
         let tool_policy = ToolPolicy::load(&paths.base.join("tool_policy.yaml"));
         let hook_manager = HookManager::load(&paths.base.join("hooks.yaml"));
-        let system_event_store = InMemorySystemEventStore::default();
-        let summary_queue = MainSessionSummaryQueue::with_policy(
+        let system_event_store = InMemorySystemEventStore::with_persistence(
+            paths.workspace().join(".system_events.json"),
+        )?;
+        let summary_queue = MainSessionSummaryQueue::with_persistence(
             5,
             config.tools.tick_interval_secs.clamp(10, 300) as i64 * 1000,
-        );
+            paths.workspace().join(".system_summary_queue.json"),
+        )?;
         let system_event_orchestrator =
             SystemEventOrchestrator::new(system_event_store.clone(), summary_queue.clone());
         let system_event_emitter: EventEmitterHandle = Arc::new(RuntimeSystemEventEmitter {

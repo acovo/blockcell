@@ -158,6 +158,12 @@ pub struct SummaryItem {
     pub created_at_ms: i64,
     pub priority: EventPriority,
     pub merge_key: Option<String>,
+    #[serde(default = "default_summary_persist")]
+    pub persist: bool,
+}
+
+fn default_summary_persist() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
