@@ -1307,7 +1307,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             "cli",
-            "How should I deploy?",
+            "canary-first",
             &[],
             &[],
             Some("cli:new-session"),

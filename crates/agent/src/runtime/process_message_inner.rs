@@ -606,21 +606,27 @@ impl AgentRuntime {
             }
         }
 
-        let ghost_recall_context_block = if should_inject_ghost_recall(&self.config, &msg) {
-            if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
-                let learning = &self.config.agents.ghost.learning;
-                manager.prefetch_all_as_context_block(
-                    &msg.content,
-                    &session_key,
-                    learning.recall_max_items as usize,
-                    learning.recall_token_budget as usize,
-                )
+        let recall_mode = match decision.mode {
+            InteractionMode::Chat => blockcell_core::config::MemoryRecallMode::Chat,
+            InteractionMode::General => blockcell_core::config::MemoryRecallMode::General,
+            InteractionMode::Skill => blockcell_core::config::MemoryRecallMode::Skill,
+        };
+        let ghost_recall_context_block =
+            if should_inject_ghost_recall(&self.config, &msg, recall_mode) {
+                if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+                    let learning = &self.config.agents.ghost.learning;
+                    manager.prefetch_all_as_context_block(
+                        &msg.content,
+                        &session_key,
+                        learning.recall_max_items as usize,
+                        learning.recall_token_budget as usize,
+                    )
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         let mut final_response = String::new();
         let mut llm_failed_after_retries = false;

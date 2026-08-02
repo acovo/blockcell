@@ -1,15 +1,18 @@
+use blockcell_core::config::MemoryRecallMode;
 use blockcell_core::{Config, InboundMessage, Paths, Result};
 use std::collections::HashSet;
 use tracing::warn;
 
 use crate::token::estimate_tokens;
 
-const GHOST_RECALL_CHANNELS_DENYLIST: [&str; 4] = ["ghost", "cron", "system", "subagent"];
-
-pub(crate) fn should_inject_ghost_recall(config: &Config, msg: &InboundMessage) -> bool {
+pub(crate) fn should_inject_ghost_recall(
+    config: &Config,
+    msg: &InboundMessage,
+    mode: MemoryRecallMode,
+) -> bool {
     config.agents.ghost.learning.recall_enabled()
         && config.agents.ghost.learning.recall_max_items > 0
-        && !GHOST_RECALL_CHANNELS_DENYLIST.contains(&msg.channel.as_str())
+        && config.memory.memory_recall.allows(mode, &msg.channel)
 }
 
 pub fn build_ghost_recall_context_block(
@@ -17,7 +20,7 @@ pub fn build_ghost_recall_context_block(
     config: &Config,
     msg: &InboundMessage,
 ) -> Result<Option<String>> {
-    if !should_inject_ghost_recall(config, msg) {
+    if !should_inject_ghost_recall(config, msg, MemoryRecallMode::General) {
         return Ok(None);
     }
 
@@ -271,6 +274,39 @@ mod tests {
             metadata: serde_json::Value::Null,
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
         }
+    }
+
+    #[test]
+    fn runtime_recall_respects_mode_and_internal_policy() {
+        let mut config = Config::default();
+        config.agents.ghost.learning.recall_enabled = Some(true);
+        config.memory.memory_recall.chat = false;
+        let cli = test_msg("release");
+
+        assert!(!should_inject_ghost_recall(
+            &config,
+            &cli,
+            MemoryRecallMode::Chat
+        ));
+        assert!(should_inject_ghost_recall(
+            &config,
+            &cli,
+            MemoryRecallMode::General
+        ));
+
+        let mut system = test_msg("release");
+        system.channel = "system".to_string();
+        assert!(!should_inject_ghost_recall(
+            &config,
+            &system,
+            MemoryRecallMode::General
+        ));
+        config.memory.memory_recall.internal = true;
+        assert!(should_inject_ghost_recall(
+            &config,
+            &system,
+            MemoryRecallMode::General
+        ));
     }
 
     #[test]

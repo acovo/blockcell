@@ -716,6 +716,51 @@ impl Default for PromptBudgetConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryRecallMode {
+    Chat,
+    General,
+    Skill,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRecallConfig {
+    #[serde(default = "super::default_true")]
+    pub chat: bool,
+    #[serde(default = "super::default_true")]
+    pub general: bool,
+    #[serde(default = "super::default_true")]
+    pub skill: bool,
+    #[serde(default)]
+    pub internal: bool,
+}
+
+impl MemoryRecallConfig {
+    pub fn allows(&self, mode: MemoryRecallMode, channel: &str) -> bool {
+        const INTERNAL_CHANNELS: [&str; 4] = ["ghost", "cron", "system", "subagent"];
+        if INTERNAL_CHANNELS.contains(&channel) && !self.internal {
+            return false;
+        }
+        match mode {
+            MemoryRecallMode::Chat => self.chat,
+            MemoryRecallMode::General => self.general,
+            MemoryRecallMode::Skill => self.skill,
+        }
+    }
+}
+
+impl Default for MemoryRecallConfig {
+    fn default() -> Self {
+        Self {
+            chat: true,
+            general: true,
+            skill: true,
+            internal: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryConfig {
@@ -727,6 +772,9 @@ pub struct MemoryConfig {
     /// Global prompt allocation for fixed rules and retrieved context.
     #[serde(default)]
     pub prompt_budget: PromptBudgetConfig,
+    /// Recall policy by interaction mode and internal channel.
+    #[serde(default)]
+    pub memory_recall: MemoryRecallConfig,
 }
 
 /// Self-Improve 配置 — Nudge + Review 子系统

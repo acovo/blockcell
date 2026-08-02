@@ -2,6 +2,7 @@ use crate::auto_memory::MemoryInjector;
 use crate::retrieval::{
     PromptBudgetAllocator, PromptSections, RetrievalOrchestrator, RetrievalSource,
 };
+use blockcell_core::config::{MemoryRecallConfig, MemoryRecallMode};
 use blockcell_core::types::ChatMessage;
 use blockcell_core::{Config, Paths};
 use blockcell_skills::manager::SkillSource;
@@ -88,6 +89,7 @@ pub struct ContextBuilder {
     skill_manager: Option<SkillManager>,
     ghost_learning_enabled: bool,
     memory_recall_enabled: bool,
+    memory_recall_policy: MemoryRecallConfig,
     prompt_budget: blockcell_core::config::PromptBudgetConfig,
     file_memory_snapshots: Mutex<HashMap<String, FrozenFileMemorySnapshot>>,
     memory_store: Option<MemoryStoreHandle>,
@@ -132,6 +134,7 @@ impl ContextBuilder {
             skill_manager: Some(skill_manager),
             ghost_learning_enabled: config.agents.ghost.learning.capture_enabled(),
             memory_recall_enabled: config.agents.ghost.learning.recall_enabled(),
+            memory_recall_policy: config.memory.memory_recall.clone(),
             prompt_budget: config.memory.prompt_budget.clone(),
             file_memory_snapshots: Mutex::new(HashMap::new()),
             memory_store: None,
@@ -350,7 +353,7 @@ impl ContextBuilder {
         active_skill: Option<&ActiveSkillContext>,
         disabled_skills: &HashSet<String>,
         disabled_tools: &HashSet<String>,
-        _channel: &str,
+        channel: &str,
         user_query: &str,
         available_tool_names: &[String],
         tool_prompt_rules: &[String],
@@ -360,7 +363,7 @@ impl ContextBuilder {
             active_skill,
             disabled_skills,
             disabled_tools,
-            _channel,
+            channel,
             user_query,
             available_tool_names,
             tool_prompt_rules,
@@ -375,7 +378,7 @@ impl ContextBuilder {
         active_skill: Option<&ActiveSkillContext>,
         disabled_skills: &HashSet<String>,
         disabled_tools: &HashSet<String>,
-        _channel: &str,
+        channel: &str,
         user_query: &str,
         available_tool_names: &[String],
         tool_prompt_rules: &[String],
@@ -386,7 +389,7 @@ impl ContextBuilder {
             active_skill,
             disabled_skills,
             disabled_tools,
-            _channel,
+            channel,
             user_query,
             available_tool_names,
             tool_prompt_rules,
@@ -402,7 +405,7 @@ impl ContextBuilder {
         active_skill: Option<&ActiveSkillContext>,
         disabled_skills: &HashSet<String>,
         disabled_tools: &HashSet<String>,
-        _channel: &str,
+        channel: &str,
         user_query: &str,
         available_tool_names: &[String],
         tool_prompt_rules: &[String],
@@ -505,7 +508,15 @@ impl ContextBuilder {
             self.paths.workspace().display()
         ));
 
-        if self.memory_recall_enabled && (is_skill_mode || is_general) && !user_query.is_empty() {
+        let recall_mode = match mode {
+            InteractionMode::Chat => MemoryRecallMode::Chat,
+            InteractionMode::General => MemoryRecallMode::General,
+            InteractionMode::Skill => MemoryRecallMode::Skill,
+        };
+        if self.memory_recall_enabled
+            && self.memory_recall_policy.allows(recall_mode, channel)
+            && !user_query.is_empty()
+        {
             let skill_summary = self
                 .skill_index_summary
                 .read()
@@ -1509,6 +1520,38 @@ description: deploy demo
         assert!(prompt.contains("patch it with `skill_manage(action=\"patch\")`"));
         assert!(prompt.contains("Do not save task progress"));
         assert!(!prompt.contains("skill candidates"));
+    }
+
+    #[test]
+    fn chat_mode_recall_injects_matching_canonical_knowledge() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-context-chat-recall-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        std::fs::write(paths.user_md(), "User prefers concise release summaries.")
+            .expect("write user profile");
+
+        let mut config = Config::default();
+        config.agents.ghost.learning.recall_enabled = Some(true);
+        config.memory.memory_recall.chat = true;
+        let builder = ContextBuilder::new(paths, config);
+
+        let prompt = builder.build_system_prompt_for_mode_with_channel(
+            InteractionMode::Chat,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "concise",
+            &[],
+            &[],
+        );
+
+        assert!(prompt.contains("<retrieved-context>"));
+        assert!(prompt.contains("[user-profile]"));
+        assert!(prompt.contains("concise release summaries"));
     }
 
     #[test]

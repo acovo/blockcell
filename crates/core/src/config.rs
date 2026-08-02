@@ -924,6 +924,36 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn memory_recall_policy_deserializes_per_mode_and_internal_channel() {
+        let cfg: Config = json5::from_str(
+            r#"{
+                memory: {
+                    memoryRecall: {
+                        chat: true,
+                        general: true,
+                        skill: true,
+                        internal: false,
+                    },
+                },
+            }"#,
+        )
+        .expect("parse memory recall policy");
+
+        assert!(cfg.memory.memory_recall.chat);
+        assert!(cfg.memory.memory_recall.general);
+        assert!(cfg.memory.memory_recall.skill);
+        assert!(!cfg.memory.memory_recall.internal);
+        assert!(cfg
+            .memory
+            .memory_recall
+            .allows(MemoryRecallMode::Chat, "cli"));
+        assert!(!cfg
+            .memory
+            .memory_recall
+            .allows(MemoryRecallMode::General, "system"));
+    }
+
     fn temp_config_path(name: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("blockcell-config-tests-{}", uuid::Uuid::new_v4()));
