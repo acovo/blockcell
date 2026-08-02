@@ -1,5 +1,6 @@
 use blockcell_core::Paths;
 use blockcell_storage::KnowledgeIndex;
+use blockcell_storage::{memory::UpsertParams, MemoryStore};
 
 fn test_paths(label: &str) -> Paths {
     Paths::with_base(std::env::temp_dir().join(format!(
@@ -68,5 +69,59 @@ fn rebuild_removes_entries_deleted_from_canonical_file() {
     assert!(index
         .search("concise", 10)
         .expect("final search")
+        .is_empty());
+}
+
+#[test]
+fn legacy_long_term_rows_can_be_listed_and_retired_for_file_migration() {
+    let paths = test_paths("legacy-long-term");
+    paths.ensure_dirs().expect("ensure paths");
+    let store = MemoryStore::open(&paths.memory_dir().join("memory.db")).expect("open memory");
+    let long_term = store
+        .upsert(UpsertParams {
+            scope: "long_term".to_string(),
+            item_type: "preference".to_string(),
+            title: None,
+            content: "User prefers concise replies.".to_string(),
+            summary: None,
+            tags: vec![],
+            source: "legacy".to_string(),
+            channel: None,
+            session_key: None,
+            importance: 0.8,
+            dedup_key: None,
+            expires_at: None,
+        })
+        .expect("seed long-term row");
+    store
+        .upsert(UpsertParams {
+            scope: "short_term".to_string(),
+            item_type: "note".to_string(),
+            title: None,
+            content: "Temporary task state.".to_string(),
+            summary: None,
+            tags: vec![],
+            source: "legacy".to_string(),
+            channel: None,
+            session_key: Some("cli:test".to_string()),
+            importance: 0.4,
+            dedup_key: None,
+            expires_at: None,
+        })
+        .expect("seed short-term row");
+
+    let rows = store.active_long_term_items().expect("list long-term rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, long_term.id);
+
+    assert_eq!(
+        store
+            .retire_long_term_items(&[long_term.id])
+            .expect("retire rows"),
+        1
+    );
+    assert!(store
+        .active_long_term_items()
+        .expect("list after retirement")
         .is_empty());
 }

@@ -1,6 +1,59 @@
 use super::*;
 
 impl MemoryStore {
+    /// Soft-delete only active legacy long-term rows after a successful file migration.
+    pub fn retire_long_term_items(&self, ids: &[String]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let retired_ids = {
+            let mut conn = self
+                .inner
+                .lock()
+                .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
+            let tx = conn.transaction().map_err(|e| {
+                blockcell_core::Error::Storage(format!(
+                    "Begin long-term retirement transaction error: {}",
+                    e
+                ))
+            })?;
+            let now = Utc::now().to_rfc3339();
+            let mut retired_ids = Vec::new();
+            for id in ids {
+                let affected = tx
+                    .execute(
+                        "UPDATE memory_items
+                         SET deleted_at = ?1
+                         WHERE id = ?2 AND scope = 'long_term' AND deleted_at IS NULL",
+                        params![now, id],
+                    )
+                    .map_err(|e| {
+                        blockcell_core::Error::Storage(format!(
+                            "Retire legacy long-term row error: {}",
+                            e
+                        ))
+                    })?;
+                if affected > 0 {
+                    if self.vector.is_some() {
+                        Self::enqueue_vector_sync_on_conn(&tx, id, VECTOR_SYNC_OP_DELETE, 0, None)?;
+                    }
+                    retired_ids.push(id.clone());
+                }
+            }
+            tx.commit().map_err(|e| {
+                blockcell_core::Error::Storage(format!(
+                    "Commit long-term retirement transaction error: {}",
+                    e
+                ))
+            })?;
+            retired_ids
+        };
+
+        self.sync_vector_delete_ids(&retired_ids);
+        Ok(retired_ids.len())
+    }
+
     /// Soft-delete a memory item.
     pub fn soft_delete(&self, id: &str) -> Result<bool> {
         self.soft_delete_with_owner(id, None)

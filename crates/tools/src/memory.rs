@@ -381,7 +381,7 @@ impl Tool for MemoryUpsertTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "memory_upsert".to_string(),
-            description: "Save or update a memory item. Supports structured metadata (type, scope, tags, importance) and dedup_key for automatic merge/update of existing items. Use scope='long_term' for persistent facts/preferences, scope='short_term' for session notes and temporary context.".to_string(),
+            description: "Save or update short-term session memory with structured metadata. Durable knowledge must be written through memory_manage to the canonical USER.md or MEMORY.md files.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -391,8 +391,8 @@ impl Tool for MemoryUpsertTool {
                     },
                     "scope": {
                         "type": "string",
-                        "enum": ["long_term", "short_term"],
-                        "description": "Memory scope. 'long_term' for persistent facts/preferences, 'short_term' for session notes. Default: 'short_term'."
+                        "enum": ["short_term"],
+                        "description": "Memory scope. Only 'short_term' is accepted; durable knowledge belongs in canonical files via memory_manage."
                     },
                     "type": {
                         "type": "string",
@@ -458,9 +458,15 @@ impl Tool for MemoryUpsertTool {
         }
         // 验证 scope 字段
         if let Some(scope) = params.get("scope").and_then(|v| v.as_str()) {
-            if scope != "long_term" && scope != "short_term" {
+            if scope == "long_term" {
+                return Err(Error::Validation(
+                    "long_term memory must be written through memory_manage to canonical files"
+                        .to_string(),
+                ));
+            }
+            if scope != "short_term" {
                 return Err(Error::Validation(format!(
-                    "Invalid scope '{}'. Must be 'long_term' or 'short_term'",
+                    "Invalid scope '{}'. Must be 'short_term'",
                     scope
                 )));
             }
@@ -1215,6 +1221,20 @@ mod tests {
         let tool = MemoryUpsertTool;
         assert!(tool.validate(&json!({"content": "remember this"})).is_ok());
         assert!(tool.validate(&json!({})).is_err());
+    }
+
+    #[test]
+    fn memory_upsert_rejects_long_term_in_favor_of_canonical_files() {
+        let error = MemoryUpsertTool
+            .validate(&json!({
+                "content": "User prefers concise replies.",
+                "scope": "long_term",
+                "type": "preference"
+            }))
+            .expect_err("long-term SQLite writes must be rejected");
+
+        assert!(error.to_string().contains("memory_manage"));
+        assert!(error.to_string().contains("canonical"));
     }
 
     #[tokio::test]

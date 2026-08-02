@@ -1,6 +1,38 @@
 use super::*;
 
 impl MemoryStore {
+    /// Return active legacy durable rows that still need migration to canonical files.
+    pub fn active_long_term_items(&self) -> Result<Vec<MemoryItem>> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM memory_items
+                 WHERE scope = 'long_term' AND deleted_at IS NULL
+                 ORDER BY updated_at ASC, id ASC",
+            )
+            .map_err(|e| {
+                blockcell_core::Error::Storage(format!(
+                    "Prepare legacy long-term query error: {}",
+                    e
+                ))
+            })?;
+        let rows = stmt
+            .query_map([], Self::memory_item_from_row)
+            .map_err(|e| {
+                blockcell_core::Error::Storage(format!("Query legacy long-term error: {}", e))
+            })?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row.map_err(|e| {
+                blockcell_core::Error::Storage(format!("Read legacy long-term row error: {}", e))
+            })?);
+        }
+        Ok(items)
+    }
+
     pub(crate) fn query_sqlite_raw(&self, params: &QueryParams) -> Result<Vec<MemoryResult>> {
         let conn = self
             .inner

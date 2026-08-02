@@ -787,6 +787,8 @@ enum MemoryCommands {
     },
     /// Rebuild the vector index from active SQLite rows
     Reindex,
+    /// Migrate active SQLite long-term rows into canonical MEMORY.md
+    MigrateCanonical,
     /// Clear memory (soft-delete)
     Clear {
         /// Only clear a specific scope (short_term / long_term)
@@ -1136,6 +1138,9 @@ async fn main() -> anyhow::Result<()> {
             MemoryCommands::Reindex => {
                 commands::memory::reindex().await?;
             }
+            MemoryCommands::MigrateCanonical => {
+                commands::memory::migrate_canonical().await?;
+            }
             MemoryCommands::Clear { scope } => {
                 commands::memory::clear(scope).await?;
             }
@@ -1436,6 +1441,23 @@ mod tests {
         match cli.command {
             Commands::Memory { command } => match command {
                 MemoryCommands::Reindex => {}
+                other => panic!(
+                    "unexpected memory command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_memory_migrate_canonical_parses() {
+        let cli = Cli::try_parse_from(["blockcell", "memory", "migrate-canonical"])
+            .expect("migrate-canonical should parse");
+
+        match cli.command {
+            Commands::Memory { command } => match command {
+                MemoryCommands::MigrateCanonical => {}
                 other => panic!(
                     "unexpected memory command: {:?}",
                     std::mem::discriminant(&other)

@@ -1,12 +1,80 @@
 use blockcell_core::{Config, Paths};
 use blockcell_storage::memory::QueryParams;
 use blockcell_storage::MemoryStore;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::memory_store::open_memory_store;
 
 fn open_cli_memory_store(paths: &Paths) -> anyhow::Result<MemoryStore> {
     let config = Config::load_or_default(paths)?;
     open_memory_store(paths, &config)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CanonicalMigrationResult {
+    pub migrated: usize,
+    pub deduplicated: usize,
+    pub retired: usize,
+}
+
+fn normalize_migration_content(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub(crate) fn migrate_canonical_at(
+    paths: &Paths,
+    store: &MemoryStore,
+) -> anyhow::Result<CanonicalMigrationResult> {
+    let rows = store.active_long_term_items()?;
+    if rows.is_empty() {
+        return Ok(CanonicalMigrationResult::default());
+    }
+
+    let mut unique = BTreeMap::new();
+    for row in &rows {
+        let content = normalize_migration_content(&row.content);
+        let hash = blockcell_core::stable_hash_session_key(&content);
+        unique.entry(hash).or_insert((content, row.id.as_str()));
+    }
+
+    let index = Arc::new(blockcell_storage::KnowledgeIndex::open(
+        &paths.knowledge_index_db(),
+    )?);
+    index.rebuild_from_files(paths)?;
+    let mut file_store = blockcell_agent::MemoryFileStore::open(paths)?;
+    file_store.set_knowledge_index(index, "USER.md", "memory/MEMORY.md");
+    let updated = chrono::Utc::now().format("%Y-%m-%d");
+    for (hash, (content, legacy_id)) in &unique {
+        let entry = format!(
+            "- [id:migrated-{hash}] [scope:workspace] [source:verified] [updated:{updated}] {content} <!-- migrated-from:memory.db:{legacy_id} -->"
+        );
+        file_store.add(blockcell_agent::MemoryFileTarget::Memory, &entry)?;
+    }
+
+    let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let retired = store.retire_long_term_items(&ids)?;
+    Ok(CanonicalMigrationResult {
+        migrated: unique.len(),
+        deduplicated: rows.len().saturating_sub(unique.len()),
+        retired,
+    })
+}
+
+pub async fn migrate_canonical() -> anyhow::Result<()> {
+    let paths = Paths::new_configured();
+    let db_path = paths.memory_dir().join("memory.db");
+    if !db_path.exists() {
+        println!("(Memory database not created yet)");
+        return Ok(());
+    }
+    let store = open_cli_memory_store(&paths)?;
+    let result = migrate_canonical_at(&paths, &store)?;
+    println!(
+        "✅ 规范知识迁移完成：写入 {} 条，去重 {} 条，退役 {} 条。",
+        result.migrated, result.deduplicated, result.retired
+    );
+    Ok(())
 }
 
 /// List recent memory items.
@@ -275,6 +343,90 @@ pub async fn search(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod canonical_migration_tests {
+    use super::*;
+    use blockcell_storage::memory::UpsertParams;
+
+    fn test_paths() -> Paths {
+        Paths::with_base(std::env::temp_dir().join(format!(
+            "blockcell-memory-migrate-canonical-{}",
+            uuid::Uuid::new_v4()
+        )))
+    }
+
+    fn seed_memory(store: &MemoryStore, scope: &str, content: &str) {
+        store
+            .upsert(UpsertParams {
+                scope: scope.to_string(),
+                item_type: "preference".to_string(),
+                title: None,
+                content: content.to_string(),
+                summary: None,
+                tags: vec![],
+                source: "legacy".to_string(),
+                channel: None,
+                session_key: None,
+                importance: 0.8,
+                dedup_key: None,
+                expires_at: None,
+            })
+            .expect("seed memory row");
+    }
+
+    #[test]
+    fn migrate_canonical_deduplicates_retires_and_reindexes() {
+        let paths = test_paths();
+        paths.ensure_dirs().expect("ensure paths");
+        let store =
+            MemoryStore::open(&paths.memory_dir().join("memory.db")).expect("open memory store");
+        seed_memory(&store, "long_term", "User prefers concise replies.");
+        seed_memory(&store, "long_term", "  User prefers concise replies.  ");
+        seed_memory(&store, "short_term", "Temporary task state.");
+
+        let result = migrate_canonical_at(&paths, &store).expect("migrate canonical memory");
+
+        assert_eq!(result.migrated, 1);
+        assert_eq!(result.deduplicated, 1);
+        assert_eq!(result.retired, 2);
+        let canonical = std::fs::read_to_string(paths.memory_md()).expect("read MEMORY.md");
+        assert_eq!(
+            canonical.matches("User prefers concise replies.").count(),
+            1
+        );
+        assert!(canonical.contains("[id:migrated-"));
+        assert!(canonical.contains("[scope:workspace]"));
+        assert!(canonical.contains("[source:verified]"));
+        assert!(store
+            .active_long_term_items()
+            .expect("list active long-term")
+            .is_empty());
+        let short_term = store
+            .query(&QueryParams {
+                scope: Some("short_term".to_string()),
+                top_k: 10,
+                ..QueryParams::default()
+            })
+            .expect("query short-term");
+        assert_eq!(short_term.len(), 1);
+
+        let index = blockcell_storage::KnowledgeIndex::open(&paths.knowledge_index_db())
+            .expect("open knowledge index");
+        assert_eq!(
+            index
+                .search("concise", 10)
+                .expect("search migrated entry")
+                .len(),
+            1
+        );
+
+        let rerun = migrate_canonical_at(&paths, &store).expect("rerun migration");
+        assert_eq!(rerun.migrated, 0);
+        assert_eq!(rerun.deduplicated, 0);
+        assert_eq!(rerun.retired, 0);
+    }
 }
 
 /// Run maintenance (clean expired + purge recycle bin).

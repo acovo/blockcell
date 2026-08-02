@@ -288,14 +288,14 @@ impl Tool for MemoryMaintenanceTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "memory_maintenance".to_string(),
-            description: "Memory maintenance operations for Ghost Agent. Actions: garden (clean short-term memory and maintain long-term facts), cleanup (remove expired/trivial entries), stats (memory health report), compact (merge duplicate entries).".to_string(),
+            description: "Memory maintenance operations for Ghost Agent. Actions: garden (clean short-term memory and promote durable facts to canonical files), cleanup (remove expired/trivial entries), stats (memory health report), compact (inspect legacy long-term duplicates).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["garden", "cleanup", "stats", "compact"],
-                        "description": "garden: scan recent short-term memories, clean junk, and maintain long-term facts with memory_upsert/memory_forget. cleanup: remove expired entries and purge recycle bin. stats: get memory health report. compact: merge duplicate entries."
+                        "description": "garden: scan recent short-term memories, clean junk, and maintain durable facts with memory_manage/memory_forget. cleanup: remove expired entries and purge recycle bin. stats: get memory health report. compact: inspect legacy duplicates before canonical migration."
                     },
                     "days": {
                         "type": "integer",
@@ -357,8 +357,7 @@ impl Tool for MemoryMaintenanceTool {
                     let recent = store.query_json(query_params)?;
                     let items = recent.as_array().map(|a| a.len()).unwrap_or(0);
 
-                    // Query existing long-term memories so the model can avoid duplicates and
-                    // merge stable facts using memory_upsert dedup keys.
+                    // Query legacy long-term rows so the model can avoid promoting duplicates.
                     let lt_params = json!({
                         "scope": "long_term",
                         "top_k": 50
@@ -402,7 +401,7 @@ impl Tool for MemoryMaintenanceTool {
                         "recycle_purged": purged,
                         "recent_memories": recent,
                         "long_term_memories": long_term,
-                        "instruction": "Review recent_memories and long_term_memories. Promote only stable user preferences, project facts, recurring patterns, and durable lessons by calling memory_upsert with scope='long_term' and a dedup_key. Delete trivial, expired, or duplicate short-term entries with memory_forget. Do not create skills here; skills are handled by Ghost Learning."
+                        "instruction": "Review recent_memories and long_term_memories. Promote only stable user preferences, project facts, recurring patterns, and durable lessons by calling memory_manage with scope='user' or scope='workspace' so they are written to canonical files. Delete trivial, expired, or duplicate short-term entries with memory_forget. Do not create skills here; skills are handled by Ghost Learning."
                     }))
                 })
                 .await
@@ -486,7 +485,7 @@ impl Tool for MemoryMaintenanceTool {
                         "action": "compact",
                         "long_term_memories": long_term,
                         "count": items,
-                        "instruction": "Review the long_term_memories above. Find entries with similar or overlapping content. For duplicates, keep the most complete version and call memory_forget on the others. For related entries, merge them into a single comprehensive entry using memory_upsert with the same dedup_key."
+                        "instruction": "These are legacy SQLite long-term rows. Run `blockcell memory migrate-canonical` to move them into canonical files, then use memory_manage replace/remove for semantic consolidation. Do not create new long-term SQLite rows."
                     }))
                 })
                 .await
@@ -683,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_memory_maintenance_garden_provides_long_term_maintenance_instruction() {
+    async fn test_memory_maintenance_garden_routes_durable_writes_to_canonical_files() {
         let store = Arc::new(CaptureMemoryStore::new());
         let tool = MemoryMaintenanceTool;
 
@@ -703,8 +702,9 @@ mod tests {
         assert!(result.get("long_term_memories").is_some());
         assert_eq!(result.get("existing_long_term"), Some(&json!(0)));
         let rendered = serde_json::to_string(&result).expect("render garden result");
-        assert!(rendered.contains(&format!("memory_{}", "upsert")));
-        assert!(rendered.contains("scope='long_term'"));
+        assert!(rendered.contains("memory_manage"));
+        assert!(rendered.contains("canonical"));
+        assert!(!rendered.contains(&format!("memory_{}", "upsert")));
         assert!(rendered.contains("memory_forget"));
     }
 }
