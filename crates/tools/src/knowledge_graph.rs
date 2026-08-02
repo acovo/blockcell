@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use blockcell_core::{Error, Result};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use crate::{Tool, ToolContext, ToolSchema};
@@ -17,6 +18,42 @@ use crate::{Tool, ToolContext, ToolSchema};
 /// - Graph statistics
 /// - Export to JSON/DOT/Mermaid formats
 pub struct KnowledgeGraphTool;
+
+fn validate_graph_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(Error::Tool("invalid graph_name".into()));
+    }
+    Ok(())
+}
+
+fn resolve_graph_db_path(workspace: &Path, graph_name: &str) -> Result<PathBuf> {
+    validate_graph_name(graph_name)?;
+
+    let db_dir = workspace.join("knowledge_graphs");
+    std::fs::create_dir_all(&db_dir)
+        .map_err(|e| Error::Tool(format!("Failed to create graph directory: {}", e)))?;
+
+    let canonical_workspace = std::fs::canonicalize(workspace)
+        .map_err(|e| Error::Tool(format!("Failed to resolve workspace: {}", e)))?;
+    let canonical_db_dir = std::fs::canonicalize(&db_dir)
+        .map_err(|e| Error::Tool(format!("Failed to resolve graph directory: {}", e)))?;
+    if !canonical_db_dir.starts_with(&canonical_workspace) {
+        return Err(Error::Tool(
+            "knowledge_graphs directory escapes workspace".into(),
+        ));
+    }
+
+    let db_path = canonical_db_dir.join(format!("{}.db", graph_name));
+    if db_path.parent() != Some(canonical_db_dir.as_path()) {
+        return Err(Error::Tool("invalid graph database path".into()));
+    }
+    Ok(db_path)
+}
 
 #[async_trait]
 impl Tool for KnowledgeGraphTool {
@@ -83,6 +120,9 @@ impl Tool for KnowledgeGraphTool {
                 valid.join(", ")
             )));
         }
+        if let Some(graph_name) = params.get("graph_name").and_then(|value| value.as_str()) {
+            validate_graph_name(graph_name)?;
+        }
         Ok(())
     }
 
@@ -92,6 +132,7 @@ impl Tool for KnowledgeGraphTool {
             .get("graph_name")
             .and_then(|v| v.as_str())
             .unwrap_or("default");
+        validate_graph_name(graph_name)?;
 
         debug!(
             action = action,
@@ -100,10 +141,7 @@ impl Tool for KnowledgeGraphTool {
         );
 
         // Open or create the graph database
-        let db_dir = ctx.workspace.join("knowledge_graphs");
-        std::fs::create_dir_all(&db_dir)
-            .map_err(|e| Error::Tool(format!("Failed to create graph directory: {}", e)))?;
-        let db_path = db_dir.join(format!("{}.db", graph_name));
+        let db_path = resolve_graph_db_path(&ctx.workspace, graph_name)?;
 
         let db = rusqlite::Connection::open(&db_path)
             .map_err(|e| Error::Tool(format!("Failed to open graph database: {}", e)))?;
@@ -1100,6 +1138,29 @@ mod tests {
     fn test_validate_invalid() {
         let tool = make_tool();
         assert!(tool.validate(&json!({"action": "destroy"})).is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_graph_name_path_traversal() {
+        let tool = make_tool();
+        let result = tool.validate(&json!({
+            "action": "stats",
+            "graph_name": "../../etc/x"
+        }));
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid graph_name"));
+    }
+
+    #[test]
+    fn test_validate_accepts_default_graph_name() {
+        let tool = make_tool();
+        assert!(tool
+            .validate(&json!({"action": "stats", "graph_name": "default"}))
+            .is_ok());
     }
 
     #[test]
