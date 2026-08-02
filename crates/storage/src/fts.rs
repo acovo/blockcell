@@ -53,7 +53,7 @@ pub(crate) fn build_fts_query(query: &str) -> String {
             .into_iter()
             .map(|term| format!("\"{}\"", term.replace('"', " ")))
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" OR ")
     }
 }
 

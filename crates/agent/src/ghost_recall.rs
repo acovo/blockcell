@@ -109,7 +109,7 @@ pub(crate) fn query_file_memory_recall_items(
         return Ok(Vec::new());
     }
 
-    let mut collected = collect_file_memory_items(paths, session_key, &query_tokens)?;
+    let mut collected = collect_file_memory_items(paths, session_key, raw_query, &query_tokens)?;
     collected.sort_by(|left, right| {
         right
             .score
@@ -131,6 +131,7 @@ pub(crate) struct FileMemoryRecallItem {
 fn collect_file_memory_items(
     paths: &Paths,
     session_key: Option<&str>,
+    raw_query: &str,
     query_tokens: &[String],
 ) -> Result<Vec<FileMemoryRecallItem>> {
     let mut seen = HashSet::new();
@@ -138,26 +139,20 @@ fn collect_file_memory_items(
 
     let index = blockcell_storage::KnowledgeIndex::open(&paths.knowledge_index_db())?;
     index.rebuild_from_files(paths)?;
-    for token in query_tokens {
-        for entry in index.search(token, 100)? {
-            if !seen.insert(format!("index:{}", entry.id)) {
-                continue;
-            }
-            let score = recall_score(&entry.content, query_tokens);
-            if score == 0 {
-                continue;
-            }
-            let source = if entry.file == "USER.md" {
-                "USER.md"
-            } else {
-                "MEMORY.md"
-            };
-            items.push(FileMemoryRecallItem {
-                source,
-                content: entry.content,
-                score,
-            });
+    for (rank, entry) in index.search(raw_query, 100)?.into_iter().enumerate() {
+        if !seen.insert(format!("index:{}", entry.id)) {
+            continue;
         }
+        let source = if entry.file == "USER.md" {
+            "USER.md"
+        } else {
+            "MEMORY.md"
+        };
+        items.push(FileMemoryRecallItem {
+            source,
+            content: entry.content,
+            score: 10_000usize.saturating_sub(rank),
+        });
     }
 
     let mut sources = Vec::new();
