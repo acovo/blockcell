@@ -136,7 +136,11 @@ workspace/
   USER.md
   memory/
     MEMORY.md
+    knowledge_index.db
+    memory.db
     .snapshots/
+  ghost/
+    ghost_ledger.db
   skills/
     <skill-name>/
       SKILL.md
@@ -146,6 +150,13 @@ workspace/
       scripts/
       assets/
 ```
+
+其中：
+
+- `USER.md` 与 `memory/MEMORY.md` 是唯一可写的长期知识事实源。
+- `knowledge_index.db` 是可删除、可重建的 FTS/元数据/向量索引，不是事实源。
+- `memory.db` 只承载短期 TTL 记忆和待迁移的遗留长期行。
+- `ghost_ledger.db` 只承载学习与遗忘审计。
 
 ### 3.2 `USER.md`
 
@@ -159,8 +170,8 @@ workspace/
 示例：
 
 ```markdown
-User prefers concise Chinese summaries after code changes.
-User does not want git push to be performed automatically.
+- [id:pref-summary] [scope:user] [source:user_statement] [updated:2026-08-01] User prefers concise Chinese summaries after code changes.
+- [id:pref-no-push] [scope:user] [source:user_statement] [updated:2026-08-01] User does not want git push to be performed automatically.
 ```
 
 ### 3.3 `memory/MEMORY.md`
@@ -175,11 +186,33 @@ User does not want git push to be performed automatically.
 示例：
 
 ```markdown
-BlockCell Ghost learning uses file-based USER.md and memory/MEMORY.md as the durable knowledge source; SQLite is only audit/ledger.
-Before release verification, confirm rollback planning and run targeted Ghost learning tests.
+## Project
+
+- [id:ghost-source] [scope:workspace] [source:verified] [updated:2026-08-01] BlockCell Ghost learning uses USER.md and memory/MEMORY.md as the durable knowledge source.
+
+## Feedback
+
+- [id:release-check] [scope:workspace] [source:user_statement] [updated:2026-08-01] Before release verification, confirm rollback planning and run targeted Ghost learning tests.
+
+## Reference
 ```
 
-### 3.4 Learned Skill
+长期条目元数据支持 `id`、`scope`、`source`、`updated` 和可选的 `supersedes`。`source` 的冲突优先级是 `user_statement > verified > inferred`；`supersedes` 用于明确淘汰旧条目。
+
+### 3.4 Layer 5 收敛
+
+旧版 Layer 5 文件会自动、幂等地迁移：
+
+```text
+base/memory/user.md       → workspace/USER.md
+base/memory/project.md    → workspace/memory/MEMORY.md / Project
+base/memory/feedback.md   → workspace/memory/MEMORY.md / Feedback
+base/memory/reference.md  → workspace/memory/MEMORY.md / Reference
+```
+
+迁移按规范化内容去重，并给条目增加来源元数据；迁移来源 HTML 注释不参与内容 hash 和召回正文。成功后旧文件重置为兼容模板，runtime injector 只读取两个 canonical 文件。
+
+### 3.5 Learned Skill
 
 保存方法类知识，适合重复执行的流程：
 
@@ -196,9 +229,13 @@ Run formatting, cargo check, targeted Ghost tests, and git diff checks before re
 
 ---
 
-## 4. SQLite Ledger 数据语义
+## 4. SQLite 数据语义
 
-SQLite 只用于过程记录，不作为 knowledge source of truth。
+SQLite 不作为长期 knowledge source of truth，但不同数据库有明确分工：
+
+- `memory.db`：短期、结构化、可过期记忆；遗留 `long_term` 行通过 `blockcell memory migrate-canonical` 迁移到规范文件。
+- `knowledge_index.db`：从规范文件生成的可重建全文、元数据与可选向量索引。
+- `ghost_ledger.db`：episode、review run、工具动作和统一遗忘事件的审计账本。
 
 ### 4.1 Episode
 
@@ -222,7 +259,7 @@ Review run 表示一次后台复盘执行。
 - `status`：`completed` 或 `failed`。
 - `result`：工具动作、轮数、stop reason、失败原因等 JSON 元数据。
 
-### 4.3 为什么不把知识放进 SQLite
+### 4.3 为什么不把长期知识放进 SQLite
 
 文件化知识有 4 个优势：
 
@@ -230,6 +267,8 @@ Review run 表示一次后台复盘执行。
 - 可版本化：天然适合 git diff 和 snapshot。
 - 可编辑：用户可以手工修正错误学习。
 - 更符合当前产品目标：memory 和 skill 都是可读、可迁移的资产。
+
+SQLite 仍用于高效检索、短期 TTL 和审计，但这些数据都不能反向覆盖规范文件。
 
 ---
 
@@ -396,8 +435,10 @@ record actions and status in GhostLedger
 - `replace` 和 `remove` 要求 `old_text` 命中唯一 entry。
 - 写入前会 normalize entry。
 - 写入前会 safety scan。
+- 写入前会检查统一遗忘 tombstone，拒绝复活已遗忘内容。
 - 写入前会 snapshot 原文件。
 - 写入使用 atomic write。
+- 写入后同步重建 `KnowledgeIndex` 中受影响的文件。
 
 ### 7.4 Undo
 
@@ -448,7 +489,19 @@ patch 失败时应返回足够信息给模型修复：
 
 ## 9. Recall 注入
 
-Recall 读取 `USER.md` 和 `MEMORY.md`，按当前用户 query 做轻量 token 匹配和排序。
+Recall 使用 `KnowledgeIndex` 对 `USER.md` 和 `MEMORY.md` 做 FTS 检索，并单独合并当前 Session 文件中的相关知识。规范文件发生变化时索引增量重建；索引本身可随时从文件恢复。
+
+长期候选按固定语义收敛：
+
+```text
+内容去重
+→ 丢弃被 supersedes 指向的旧条目
+→ user_statement > verified > inferred
+→ updated 越新越优先
+→ FTS relevance
+```
+
+已写入 tombstone 的内容即使因异常仍残留在文件或索引中，也会在召回时被过滤。
 
 输出格式是 fenced context：
 
@@ -490,6 +543,7 @@ Use only when directly relevant. Current user instructions override this context
 - 同进程写入使用 mutex。
 - 跨进程写入使用 lockdir guard。
 - 写入后 sync file 和 parent dir。
+- `MemoryFileStore::add`、`replace`、`restore_latest` 和 Ghost durable router 共用 tombstone 检查，阻止后台学习或快照恢复重新写回已遗忘知识。
 
 ### 10.3 工具安全
 
@@ -503,6 +557,7 @@ Use only when directly relevant. Current user instructions override this context
 - 当前用户指令优先于 learned memory。
 - 学习失败不阻塞主任务。
 - 学错可 undo。
+- 跨来源遗忘必须先 `knowledge_forget(action="preview")`，再使用精确 `preview_token` 调用 `confirm`。
 - Ledger 保留审计信息。
 
 ---
@@ -535,6 +590,8 @@ WebUI 的 Ghost 页面当前表示 scheduled maintenance，不是嵌入式学习
 - 并发 add 串行化。
 - 拒绝 prompt injection 内容。
 - replace 多匹配或零匹配时失败。
+- Layer 5 四类旧文件只迁移一次并收敛到两个 canonical 文件。
+- add、replace、restore_latest 不得复活 tombstoned 内容。
 
 ### 12.2 Background Review
 
@@ -554,8 +611,18 @@ WebUI 的 Ghost 页面当前表示 scheduled maintenance，不是嵌入式学习
 - pre-compress 强制 boundary flush。
 - 从 episode 到 USER.md、MEMORY.md、learned skill 的闭环成立。
 - recall 是 fenced 且不持久化。
+- recall 通过 KnowledgeIndex 去重、淘汰 superseded 条目并按来源可信度和更新时间排序。
+- runtime injector 只读取 `USER.md` 和 `memory/MEMORY.md`。
 
-### 12.4 Skill Tools
+### 12.4 Unified Forget
+
+- preview 返回完整影响范围和精确确认 token。
+- confirm 拒绝过期或不匹配的 preview token。
+- 同时清理 canonical 文件、当前 Session 文件和 SQLite short-term。
+- 重建索引并写入 tombstone 与 GhostLedger 审计。
+- Ghost background review、普通写入和 snapshot restore 均不能复活遗忘内容。
+
+### 12.5 Skill Tools
 
 - create/edit/patch/delete/write_file/remove_file/undo 路由到 file store。
 - patch 支持 fuzzy matching 和失败 preview。
@@ -586,16 +653,16 @@ git diff --check
 3. 检查 `USER.md` 和 `memory/MEMORY.md` 是否有写入。
 4. 检查 `GhostLedger` 是否有 episode。
 5. 检查 review run 是否失败。
-6. 检查 recall query 是否命中 token。
+6. 检查 `knowledge_index.db` 是否已从规范文件重建，以及查询是否命中 FTS。
 7. 检查当前 channel 是否在 recall denylist。
 
 ### 13.2 用户反馈“记错了”
 
 处理方式：
 
-1. 用 `memory_manage(action="remove")` 删除错误事实。
-2. 或用 `memory_manage(action="replace")` 修正。
-3. 如果刚写入，可以 `undo_latest`。
+1. 如果用户要求“忘记”或需要跨来源彻底清除，先调用 `knowledge_forget(action="preview", query="...")`。
+2. 用户确认影响范围后，携带返回的 `preview_token` 调用 `knowledge_forget(action="confirm", reason="用户要求")`。
+3. 如果只是修正单条规范知识，用 `memory_manage(action="replace")`；如果刚写入，也可使用 `undo_latest`。
 4. 如果错误来自 skill，由主 Agent 或独立 Skill Learning 通道先用 `skill_view` 查看，再调用 `skill_manage(action="patch")`。
 
 ### 13.3 Background Review 没动作

@@ -1,347 +1,310 @@
 # Article 05: The Memory System — Letting AI Remember What You Said
 
 > Series: *In-Depth Analysis of the Open Source Project “blockcell”* — Article 5
+
 ---
 
 ## Why AI needs memory
 
-Anyone who has used ChatGPT knows a pain point: **every time you start a new chat, the AI forgets who you are.**
-
-Last time you told it “I do quantitative trading and focus on China A-share tech,” and this time you have to explain it all over again.
-
-Worse, even within the same conversation, if it gets too long, early messages get “forgotten” once they exceed the context window.
-
-blockcell’s memory system is designed to solve this.
+A new model conversation does not inherently remember user preferences, project facts, or previously verified lessons. blockcell separates that information into durable knowledge and short-term memory, then recalls it when relevant.
 
 ---
 
-## Memory System Architecture
+## Memory system architecture
 
-blockcell’s memory system is built on **SQLite canonical storage + FTS5 full-text search + optional RabitQ vector indexing**.
+blockcell uses **files as the durable source of truth, with SQLite for rebuildable indexes, short-term storage, and audit**:
 
+```text
+~/.blockcell/workspace/
+├── USER.md                         # user preferences and durable constraints
+└── memory/
+    ├── MEMORY.md                   # project, feedback, and reference knowledge
+    ├── knowledge_index.db          # disposable/rebuildable FTS and vector index
+    └── memory.db                   # TTL-based short-term memory and migration source
+
+~/.blockcell/workspace/ghost/
+└── ghost_ledger.db                 # Ghost learning and forget audit
 ```
-~/.blockcell/workspace/memory/memory.db
-```
 
-It’s a local SQLite database that lives entirely on your machine — nothing is uploaded to any server. When vector recall is enabled, blockcell also maintains a local sync queue and stores embeddings in a RabitQ index.
+| Data | Role | Source of truth? |
+|------|------|------------------|
+| `USER.md` | stable user preferences, constraints, and explicit statements | Yes |
+| `memory/MEMORY.md` | project, environment, feedback, and reference knowledge | Yes |
+| `knowledge_index.db` | FTS5, metadata, and optional vector index over the files | No; rebuildable |
+| `memory.db` | short-term, expiring memory for the current work | No |
+| `GhostLedger` | audit trail for automatic learning and forgetting | No |
 
-### Database schema
-
-```sql
--- Memory items table
-CREATE TABLE memory_items (
-    id          TEXT PRIMARY KEY,
-    scope       TEXT,    -- 'short_term' | 'long_term'
-    type        TEXT,    -- 'fact' | 'preference' | 'project' | 'task' | 'note'
-    title       TEXT,
-    content     TEXT,
-    summary     TEXT,
-    tags        TEXT,    -- JSON array
-    importance  INTEGER, -- 1-10
-    created_at  INTEGER,
-    updated_at  INTEGER,
-    expires_at  INTEGER, -- optional expiration
-    deleted_at  INTEGER, -- soft delete
-    dedup_key   TEXT     -- deduplication key
-);
-
--- FTS5 full-text search virtual table
-CREATE VIRTUAL TABLE memory_fts USING fts5(
-    title, summary, content, tags,
-    content=memory_items
-);
-
--- Optional vector-index sync queue, used when memory.vector is enabled
-CREATE TABLE memory_vector_queue (
-    id          TEXT PRIMARY KEY,
-    operation   TEXT NOT NULL,
-    attempts    INTEGER NOT NULL DEFAULT 0,
-    last_error  TEXT,
-    updated_at  TEXT NOT NULL
-);
-```
+Only `USER.md` and `memory/MEMORY.md` are writable durable knowledge sources. A missing or damaged index is rebuilt from those files; index contents must never overwrite them as authoritative data.
 
 ---
 
 ## Memory categories
 
-blockcell categorizes memory along two dimensions:
+### Durable knowledge
 
-### By retention (scope)
+- `USER.md`: explicit user preferences, communication style, and long-lived constraints.
+- `memory/MEMORY.md`: project facts, verified lessons, feedback, and reference material.
 
-| Type | Description | Typical usage |
-|------|-------------|---------------|
-| `long_term` | Long-term memory, kept permanently | user preferences, important facts, project info |
-| `short_term` | Short-term memory, can expire | current task state, temporary data |
+`MEMORY.md` uses stable category headings:
 
-### By content (type)
+```markdown
+## Project
 
-| Type | Description |
-|------|-------------|
-| `fact` | objective facts (“Moutai’s symbol is 600519”) |
-| `preference` | user preferences (“prefers Python over JS”) |
-| `project` | project information (“building a quant trading system”) |
-| `task` | task status (“analyzing Q3 earnings”) |
-| `note` | general notes |
+## Feedback
+
+## Reference
+```
+
+Durable entries may include machine-readable metadata:
+
+```markdown
+- [id:pref-new] [scope:user] [source:user_statement] [updated:2026-08-01] [supersedes:pref-old] User prefers concise replies
+```
+
+- `id`: stable entry identifier.
+- `scope`: `user` or `workspace`.
+- `source`: `user_statement`, `verified`, or `inferred`.
+- `updated`: most recent confirmation date.
+- `supersedes`: ID of an older entry replaced by this one.
+
+### Short-term memory
+
+Short-term memory lives in `memory.db`, always uses `scope=short_term`, and is appropriate for task state, temporary data, and expiring information. It is not a durable knowledge source.
 
 ---
 
-## Three memory tools
+## Memory tools
 
-### `memory_upsert` — save memory
+### `memory_manage` — manage durable knowledge
 
-```json
-{
-  "tool": "memory_upsert",
-  "params": {
-    "title": "User preference: programming language",
-    "content": "User prefers Python and dislikes JavaScript",
-    "type": "preference",
-    "scope": "long_term",
-    "importance": 8,
-    "tags": ["programming", "preference"],
-    "dedup_key": "user_lang_preference"
-  }
-}
-```
-
-`dedup_key` is used for deduplication: if a memory item with the same key already exists, it will be updated instead of creating a new entry.
-
-### `memory_query` — search memory
+Add a user preference:
 
 ```json
 {
-  "tool": "memory_query",
-  "params": {
-    "query": "stocks preference",
-    "scope": "long_term",
-    "top_k": 5
-  }
+  "action": "add",
+  "target": "user",
+  "scope": "user",
+  "content": "The user prefers concise summaries after code changes."
 }
 ```
 
-This uses hybrid retrieval: FTS5 recalls text-relevant candidates, the optional RabitQ vector index adds semantic candidates when enabled, and blockcell returns the highest fused scores.
-
-### `memory_forget` — delete memory
+Add workspace knowledge:
 
 ```json
 {
-  "tool": "memory_forget",
-  "params": {
-    "action": "delete",
-    "id": "MEMORY_ID"
-  }
+  "action": "add",
+  "target": "memory",
+  "scope": "workspace",
+  "content": "Run targeted tests and git diff --check before release."
 }
 ```
 
-Supports soft delete (recoverable) and batch deletes (filtered by scope/type/tags).
+The tool also supports `replace`, `remove`, and `undo_latest`. Writes are normalized, safety-scanned, snapshotted, atomically persisted, and synchronized to the knowledge index.
+
+### `memory_upsert` — save short-term memory
+
+```json
+{
+  "title": "Current task",
+  "content": "Analyzing Q3 financial statements",
+  "type": "task",
+  "scope": "short_term",
+  "expires_in_days": 1
+}
+```
+
+`memory_upsert` accepts only `short_term`. A `long_term` write is rejected with guidance to use `memory_manage`.
+
+### `memory_query` — query SQLite short-term memory
+
+```json
+{
+  "query": "Q3 statements",
+  "scope": "short_term",
+  "top_k": 5
+}
+```
+
+This tool queries structured short-term entries in `memory.db`. Durable file knowledge is recalled by `KnowledgeIndex` at runtime.
+
+### `memory_forget` — soft-delete legacy SQLite memory
+
+```json
+{
+  "action": "delete",
+  "id": "MEMORY_ID"
+}
+```
+
+This retains the existing SQLite soft-delete and restore semantics, mainly for short-term and compatibility data.
+
+### `knowledge_forget` — forget across all knowledge sources
+
+Unified forgetting uses a two-phase confirmation flow across canonical files, current-session files, and SQLite short-term memory.
+
+Preview the affected entries:
+
+```json
+{
+  "action": "preview",
+  "query": "concise replies"
+}
+```
+
+Confirm with the exact token returned by preview:
+
+```json
+{
+  "action": "confirm",
+  "query": "concise replies",
+  "reason": "user request",
+  "preview_token": "..."
+}
+```
+
+Confirmation removes the matches, rebuilds the index, records forget tombstones, and writes a GhostLedger audit event. Tombstones prevent Ghost background learning, normal writes, or snapshot restoration from resurrecting the same content.
 
 ---
 
-## Enabling Vector Recall
+## How durable knowledge is recalled
 
-Vector recall is optional and disabled by default. Enable it in `config.json5` under `memory.vector`:
+`KnowledgeIndex` incrementally indexes `USER.md` and `memory/MEMORY.md`. Candidates converge through this order:
 
-```json
-{
-  "memory": {
-    "vector": {
-      "enabled": true,
-      "provider": "openai",
-      "model": "text-embedding-3-small",
-      "uri": "./memory/vectors.rabitq",
-      "table": "memory_vectors"
-    }
-  }
-}
+```text
+deduplicate content
+→ discard entries targeted by supersedes
+→ user_statement > verified > inferred
+→ newer updated date first
+→ FTS relevance
 ```
 
-Field meanings:
+Ghost recall searches this index and separately merges relevant current-session file memory. The runtime injector reads only the two canonical durable files, not the legacy Layer 5 files.
 
-- `enabled`: whether the vector runtime is enabled; default is `false`
-- `provider` / `model`: embedding provider and model used for vector generation
-- `uri`: RabitQ index location, preferably relative to the workspace
-- `table`: vector table name; defaults to `memory_vectors`
-
-When enabled, blockcell first writes memory items into SQLite, then syncs embedding operations into RabitQ. If the provider/model is missing or does not support OpenAI-compatible embeddings, vector runtime initialization fails fast. Without vector recall, SQLite + FTS5 remains fully usable.
-
----
-
-## How memory is injected into conversations
-
-When building context for **Skill / General mode**, blockcell generates a **memory brief** and injects it into the system prompt. **Chat mode currently does not inject the Memory Brief**:
-
-```
-[Memory Brief]
-Long-term (top 20):
-- User prefers Python and focuses on China A-share tech [preference, importance:8]
-- Building a quant trading system with backtrader [project, importance:9]
-- Moutai (600519) is a key watchlist stock [fact, importance:7]
-
-Short-term (top 10):
-- Today: analyzing Q3 financial statement data [task, expires: 2h]
-```
-
-This lets Skill / General tasks reuse relevant background without repetition; Chat mode currently keeps the lighter context without a Memory Brief.
+Recall is ephemeral context rather than a system instruction, and current user instructions always take precedence.
 
 ---
 
 ## Real-world scenarios
 
-### Scenario 1: remember user preferences
+### Remember a user preference
 
-```
-You: I do quant trading and focus on China A-share tech.
-    I prefer Python and dislike Excel.
+```text
+You: I prefer Python, and give me a concise summary after code changes.
 
-AI: Got it — I’ll remember your preferences.
-    [calls memory_upsert]
-```
-
-Next time:
-
-```
-You: Analyze the recent trend of the tech sector
-
-AI: [knows you care about China A-share tech]
-    Sure — let’s analyze China A-share tech...
+AI: Got it — I will remember that.
+    [memory_manage target=user scope=user]
 ```
 
-### Scenario 2: remember project info
+### Remember project information
 
+```text
+You: This project requires targeted tests and a rollback check before release.
+
+AI: Recorded as durable workspace knowledge.
+    [memory_manage target=memory scope=workspace]
 ```
-You: I’m building a project called “Smart Stock Picker”,
-    using Python + backtrader, aiming to beat CSI 300.
 
-AI: Project info recorded.
-    [memory_upsert type=project]
+### Track temporary task state
+
+```text
+You: Analyze the last three months of financial data.
+
+AI: [memory_upsert scope=short_term expires_in_days=1]
 ```
 
-### Scenario 3: track task state
+### Fully forget incorrect knowledge
 
-```
-You: Analyze Moutai’s financial data over the past three months
-
-AI: Sure — starting the analysis...
-    [memory_upsert type=task scope=short_term expires_in_days=1]
-    ...
-    Done — the result has been saved.
-```
+Call `knowledge_forget(action="preview")` first, inspect the impact, then call `confirm` with the returned `preview_token` to avoid accidental fuzzy deletion.
 
 ---
 
-## Memory query scoring
+## Maintenance and safety
 
-Memory search results are ranked by a fused score:
+blockcell maintains expired short-term entries, the soft-delete recycle bin, and rebuildable indexes. Durable file writes include:
 
-```
-Final score = FTS/vector fused rank + importance bonus + recency bonus
-```
-
-- **FTS/vector fusion**: FTS5 candidates and optional RabitQ vector candidates are merged with rank fusion
-- **Importance bonus**: `importance` (1–10), higher ranks earlier
-- **Recency bonus**: more recently updated items get extra weight
-
-This ensures that the most relevant, most important, and newest memories appear first in briefs. If vector runtime is disabled, the search automatically falls back to SQLite + FTS5 only.
-
----
-
-## Memory maintenance
-
-blockcell runs an automatic maintenance task every 60 seconds:
-
-```rust
-// tick logic in runtime.rs
-store.maintenance(30)  // purge soft-deleted items older than 30 days
-```
-
-Maintenance includes:
-1. Purging expired short-term memories
-2. Purging soft-deleted memories older than 30 days (trash)
-3. Updating FTS5 indexes
-4. Retrying or writing pending vector-sync operations
+- normalization and deduplication;
+- prompt-injection, credential, and hidden-control-character scanning;
+- snapshots before writes;
+- in-process mutexes, cross-process lockdirs, and atomic writes;
+- index synchronization after writes;
+- tombstones that prevent forgotten knowledge from returning.
 
 ---
 
 ## Managing memory from the CLI
 
 ```bash
-# List all memories
+# List, search, and inspect SQLite memory
 blockcell memory list
-
-# Search memories
-blockcell memory search "stocks"
-
-# Show one memory item
+blockcell memory search "statements"
 blockcell memory show <ID>
 
-# Delete one memory item
+# Delete, clean, and inspect SQLite memory
 blockcell memory delete <ID>
-
-# Clear memories by scope/type
 blockcell memory clear --scope short_term
-
-# Memory statistics
 blockcell memory stats
-
-# Clean expired memories
 blockcell memory maintenance --recycle-days 30
 
-# Retry vector sync queue
-blockcell memory retry-vector-sync --limit 100
-
-# Rebuild vector index
-blockcell memory reindex
+# Move legacy SQLite long_term rows into canonical files
+blockcell memory migrate-canonical
 ```
 
 ---
 
-## Migrating from the old version
+## Migrating from older versions
 
-If you previously used the Markdown-file-based memory system (`MEMORY.md`), blockcell will automatically migrate on first start:
+### SQLite long-term rows
 
-```rust
-// agent.rs
-store.migrate_from_files(&paths)
-// read sections from MEMORY.md + historical daily notes
-// import into SQLite
+Run:
+
+```bash
+blockcell memory migrate-canonical
 ```
+
+The command normalizes and deduplicates legacy `long_term` rows, writes them to `USER.md` or `memory/MEMORY.md`, soft-deletes each source row after a successful file write, and synchronizes the index. Re-running it is idempotent.
+
+### Legacy Layer 5 files
+
+At runtime, blockcell automatically consolidates these files into the two canonical files:
+
+```text
+base/memory/user.md       → workspace/USER.md
+base/memory/project.md    → workspace/memory/MEMORY.md / Project
+base/memory/feedback.md   → workspace/memory/MEMORY.md / Feedback
+base/memory/reference.md  → workspace/memory/MEMORY.md / Reference
+```
+
+Migration deduplicates normalized content. After success, legacy files are reset to compatibility templates and are no longer injection sources.
 
 ---
 
-## Why SQLite + FTS5?
+## Why files are canonical while SQLite still exists
 
-A common question: why not put memory entirely in a vector database?
+File-based durable knowledge is easy to inspect, edit, diff in Git, back up, and migrate. It also gives one unambiguous answer to “which data is true?” SQLite remains useful for the jobs it handles best:
 
-Reasons blockcell chose SQLite + FTS5:
+- `knowledge_index.db` provides fast full-text retrieval, metadata ranking, and optional vector caching.
+- `memory.db` manages structured, expiring short-term memory.
+- `GhostLedger` stores learning and forgetting audit records.
 
-1. **Zero extra services**: no additional server required
-2. **Local-first**: all data stays on-device for privacy
-3. **Good enough baseline**: structured memories work well with SQLite + FTS5
-4. **Fast**: excellent read/write performance
-5. **Reliable**: SQLite is one of the most widely used databases in the world
-
-The vector index is now an optional enhancement layer. When enabled, blockcell syncs memory embeddings to RabitQ and uses hybrid recall; when disabled, the system still works entirely through SQLite + FTS5.
+Deleting the index therefore does not delete durable knowledge; changing canonical files allows the index to be regenerated.
 
 ---
 
 ## Summary
 
-blockcell’s memory system provides:
+The knowledge and memory system follows four rules:
 
-- **Persistence**: local SQLite storage; no loss after restart
-- **Full-text search**: FTS5 supports Chinese keyword search
-- **Hybrid retrieval**: optional RabitQ vectors add semantic recall
-- **Smart injection**: injects the most relevant memory brief in Skill / General mode; Chat mode currently skips it
-- **Automatic maintenance**: expiration cleanup and soft-delete trash
-- **Privacy**: fully local; nothing is uploaded
-
-With memory, blockcell becomes a personal AI assistant that understands you — not just a stateless chat tool.
+- `USER.md` and `memory/MEMORY.md` are the only durable sources of truth.
+- `memory_upsert` writes only short-term memory; `memory_manage` owns durable knowledge.
+- `KnowledgeIndex` provides incremental retrieval and conflict resolution but is always rebuildable.
+- `knowledge_forget` provides real cross-source forgetting through preview, confirmation, tombstones, and audit.
 
 ---
 
 *Previous: [The Skill system — extending AI capabilities with Rhai scripts](./04_skill_system.md)*
+
 *Next: [Multi-channel access — Telegram/Slack/Discord/Feishu all supported](./06_channels.md)*
 
 *Repo: https://github.com/blockcell-labs/blockcell*
+
 *Website: https://blockcell.dev*
