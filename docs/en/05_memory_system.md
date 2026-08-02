@@ -169,7 +169,7 @@ When enabled, blockcell first writes memory items into SQLite, then syncs embedd
 
 ## How memory is injected into conversations
 
-At the start of each conversation, blockcell automatically generates a **memory brief** and injects it into the system prompt:
+When building context for **Skill / General mode**, blockcell generates a **memory brief** and injects it into the system prompt. **Chat mode currently does not inject the Memory Brief**:
 
 ```
 [Memory Brief]
@@ -182,7 +182,7 @@ Short-term (top 10):
 - Today: analyzing Q3 financial statement data [task, expires: 2h]
 ```
 
-This way, the AI “remembers” your background each time without you repeating it.
+This lets Skill / General tasks reuse relevant background without repetition; Chat mode currently keeps the lighter context without a Memory Brief.
 
 ---
 
@@ -332,7 +332,7 @@ blockcell’s memory system provides:
 - **Persistence**: local SQLite storage; no loss after restart
 - **Full-text search**: FTS5 supports Chinese keyword search
 - **Hybrid retrieval**: optional RabitQ vectors add semantic recall
-- **Smart injection**: injects the most relevant memory brief each chat
+- **Smart injection**: injects the most relevant memory brief in Skill / General mode; Chat mode currently skips it
 - **Automatic maintenance**: expiration cleanup and soft-delete trash
 - **Privacy**: fully local; nothing is uploaded
 

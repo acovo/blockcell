@@ -35,7 +35,7 @@ Core implementation:
 
 BlockCell now has two different Ghost-related paths:
 
-- **Embedded Ghost learning** runs inside `AgentRuntime` during normal assistant turns. It extracts durable learning into `USER.md`, `MEMORY.md`, and `workspace/skills/<name>/SKILL.md`. This is the main product loop for a learning assistant.
+- **Embedded Ghost learning** runs inside `AgentRuntime` during normal assistant turns and extracts durable learning into `USER.md` and `MEMORY.md`. Ghost Background Review does not use `skill_manage`; skills are created by the main agent or the separate Skill Learning channel.
 - **Ghost Maintenance** runs from Gateway scheduling and handles low-frequency hygiene work such as memory gardening, temporary file cleanup, and Community Hub sync.
 
 These paths do not share the same switch:
@@ -89,7 +89,7 @@ On each run, Ghost Maintenance builds a routine prompt and dispatches it into th
 1. **SQLite memory maintenance**
    - Call `memory_maintenance(action="garden")` to clean short-term noise, deduplicate, purge expired entries, and maintain SQLite `long_term` memory
    - Key rule: only stable user preferences, project facts, recurring patterns, and durable lessons should be written to `long_term`; routine logs, one-off task status, and temporary TODOs should not be saved
-   - Skill creation and `USER.md` / `MEMORY.md` file memory remain owned by embedded Ghost learning
+   - `USER.md` / `MEMORY.md` file memory remains owned by embedded Ghost learning; skill creation belongs to the main agent or the separate Skill Learning channel
 
 2. **File cleanup**
    - Check `workspace/media` and `workspace/downloads`
@@ -127,7 +127,7 @@ Gateway exposes endpoints for Ghost Maintenance configuration and activity:
 
 ## Difference from the learning assistant loop
 
-- **Embedded Ghost learning** extracts lessons from real user conversations, tool execution, and task outcomes. It writes stable preferences to `USER.md`, durable facts to `MEMORY.md`, and reusable procedures to `workspace/skills/<name>/SKILL.md`.
+- **Embedded Ghost learning** extracts lessons from real user conversations, tool execution, and task outcomes. It writes stable preferences to `USER.md` and durable facts to `MEMORY.md`. Reusable procedures are written to `workspace/skills/<name>/SKILL.md` by the main agent or the separate Skill Learning channel.
 - **Ghost Maintenance** does not create new skills or user preferences. It only runs scheduled hygiene, cleanup, and Community Hub sync. Disabling it does not disable embedded learning.
 
 ---

@@ -84,7 +84,7 @@ BlockCell 可以在真实使用中沉淀长期有效的经验：
 
 - 将稳定用户偏好写入 `USER.md`
 - 将项目事实、环境约定和踩坑记录写入 `MEMORY.md`
-- 将可复用流程整理成 workspace skills
+- Ghost 后台 Review 只沉淀声明性记忆；可复用流程由主 Agent 或独立 Skill Learning 通道整理成 workspace skills
 - 后台 review 失败不影响当前对话，所有自动写入都有审计、快照和撤销入口
 
 ### 🧭 ModelRouter 智能路由与连接阶段降级

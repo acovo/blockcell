@@ -19,7 +19,7 @@ Ghost 学习的产品目标是让助手在真实使用中持续变聪明：记�
 
 - 从成功任务和用户纠正中捕获长期有效的经验。
 - 将事实类知识写入 `USER.md` 或 `memory/MEMORY.md`。
-- 将方法类知识沉淀为 `skills/<name>/SKILL.md`。
+- 将声明性知识交给 Ghost Background Review；方法类知识由主 Agent 或独立 Skill Learning 通道沉淀为 `skills/<name>/SKILL.md`。
 - 在后续对话中通过 prompt snapshot、recall 和 learned skill 自动使用已学知识。
 - 后台学习失败不影响主响应。
 - 所有自动写入都可审计、可撤销、有安全扫描。
@@ -110,12 +110,13 @@ Ledger 不承载最终知识。最终知识源头是文件。
 
 ### 2.6 Tool Layer
 
-后台 review 和主 turn 共用受限知识工具：
+Ghost Background Review 固定使用受限的声明性知识工具：
 
 - `memory_manage`
 - `skill_view`
-- `skill_manage`
 - `session_search`
+
+`skill_manage` 不在 Ghost Background Review 的允许列表中。技能创建与修改由主 Agent 或独立 Skill Learning 通道完成。
 
 关键文件：
 
@@ -336,7 +337,6 @@ Flush 重点：
 memory_manage
 session_search
 skill_view
-skill_manage
 ```
 
 不允许执行 shell、文件任意写、网络工具或普通业务工具。
@@ -377,15 +377,18 @@ record actions and status in GhostLedger
 {
   "action": "add | replace | remove | undo_latest",
   "target": "user | memory",
+  "scope": "session | workspace | user",
   "content": "entry content",
   "old_text": "unique text for replace/remove"
 }
 ```
 
-### 7.2 Target 映射
+### 7.2 Scope 与 Target 映射
 
-- `target=user` -> `workspace/USER.md`
-- `target=memory` -> `workspace/memory/MEMORY.md`
+- `scope=session`：缺省值，写当前 Session 的 `USER.md` 或 `MEMORY.md`，保持原行为。
+- `scope=user` + `target=user`：写全局 `workspace/USER.md`，供后续 Session 召回。
+- `scope=workspace` + `target=memory`：写全局 `workspace/memory/MEMORY.md`，供项目内后续 Session 召回。
+- Shadow 写入关闭时，相同 scope 路由到 `memory/shadow/` 对应命名空间。
 
 ### 7.3 写入规则
 
@@ -405,6 +408,8 @@ Undo 是文件级恢复，不是逐字段事务回滚。
 ---
 
 ## 8. `skill_manage` 技术协议
+
+本节描述主 Agent / 独立 Skill Learning 通道使用的技能写入协议。Ghost Background Review 不允许调用 `skill_manage`。
 
 ### 8.1 Schema
 
@@ -591,7 +596,7 @@ git diff --check
 1. 用 `memory_manage(action="remove")` 删除错误事实。
 2. 或用 `memory_manage(action="replace")` 修正。
 3. 如果刚写入，可以 `undo_latest`。
-4. 如果错误来自 skill，用 `skill_view` 查看后 `skill_manage(action="patch")`。
+4. 如果错误来自 skill，由主 Agent 或独立 Skill Learning 通道先用 `skill_view` 查看，再调用 `skill_manage(action="patch")`。
 
 ### 13.3 Background Review 没动作
 
@@ -623,7 +628,7 @@ git diff --check
 - 用户正常对话。
 - runtime 捕获 episode。
 - background review 调用受限知识工具。
-- 文件化 memory/skill 更新。
+- Ghost Background Review 更新文件化 memory；主 Agent 或独立 Skill Learning 通道更新 skill。
 - 下一轮自然生效。
 
 WebUI 中 Ghost Maintenance 的命名调整，就是为了避免把 scheduled maintenance 和 embedded learning 混为一谈。
@@ -636,7 +641,7 @@ WebUI 中 Ghost Maintenance 的命名调整，就是为了避免把 scheduled ma
 
 - 用户纠正一次后，稳定偏好能写入 `USER.md`。
 - 项目事实和环境坑点能写入 `memory/MEMORY.md`。
-- 成功复杂流程能沉淀为 `skills/<name>/SKILL.md`。
+- 成功复杂流程能由主 Agent 或独立 Skill Learning 通道沉淀为 `skills/<name>/SKILL.md`，而不是由 Ghost Background Review 直接写入。
 - 下一次 session 能通过 frozen snapshot 和 recall 使用已学知识。
 - 当前 session 不因后台学习而 prompt 漂移。
 - background review 不输出旧式中间草稿。

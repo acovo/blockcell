@@ -215,7 +215,7 @@ fallback:
   message: "Market data is temporarily unavailable. Please try again later."
 ```
 
-The recommended fields are defined by `SkillMeta` and the default `BLOCKCELL.md` contract:
+The recommended fields are defined by `SkillMeta` and the self-evolution contract in the default `BLOCKCELL.md`. `BLOCKCELL.md` is only used for self-evolution/skill-generation context; it is not the global rules file for ordinary conversations. Workspace-wide conversation rules belong in `AGENTS.md`.
 - required: `name`, `description`
 - common: `tools`, `requires`, `permissions`, `fallback`
 - still supported for compatibility but not recommended for new skills: `capabilities`, `always`, `output_format`

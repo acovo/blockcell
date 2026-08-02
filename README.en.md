@@ -84,7 +84,7 @@ BlockCell can retain durable lessons from real usage:
 
 - Stable user preferences go into `USER.md`
 - Project facts, environment conventions, and recurring lessons go into `MEMORY.md`
-- Reusable workflows can become workspace skills
+- Ghost background review only writes declarative memory; reusable workflows become workspace skills through the main agent or the separate Skill Learning channel
 - Background review failures do not block the current answer, and automatic writes are audited, snapshotted, and undoable
 
 ### 🧭 ModelRouter and Connection-Phase Fallback

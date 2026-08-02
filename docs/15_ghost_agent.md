@@ -35,7 +35,7 @@ Ghost Maintenance 是一个**按计划运行**的后台例行维护服务：
 
 BlockCell 现在有两条不同的 Ghost 相关路径：
 
-- **嵌入式 Ghost 自学习**：运行在 `AgentRuntime` 的正常对话流程中，会从成功经验里提炼 `USER.md`、`MEMORY.md` 和 `workspace/skills/<name>/SKILL.md`。这是“会学习的助手”的主闭环。
+- **嵌入式 Ghost 自学习**：运行在 `AgentRuntime` 的正常对话流程中，从成功经验里提炼 `USER.md` 和 `MEMORY.md`。Ghost Background Review 不使用 `skill_manage`；技能沉淀由主 Agent 或独立 Skill Learning 通道完成。
 - **Ghost Maintenance**：运行在 Gateway 的定时调度中，负责低频维护任务，例如记忆整理、临时文件清理和社区同步。
 
 这两个路径不是同一个开关：
@@ -107,7 +107,7 @@ Ghost Maintenance 的配置位于 `config.json5` 的 `agents.ghost`：
 1. **SQLite 记忆维护**
    - 调用 `memory_maintenance(action="garden")`，清理短期噪音、去重、过期回收，并维护 SQLite `long_term` 记忆
    - 重要原则：只把稳定用户偏好、项目事实、重复模式和长期经验写入 `long_term`；维护日志、一次性任务状态和临时 TODO 不应写入长期记忆
-   - 技能创建和 `USER.md` / `MEMORY.md` 文件记忆仍由嵌入式 Ghost 自学习负责
+   - `USER.md` / `MEMORY.md` 文件记忆由嵌入式 Ghost 自学习负责；技能创建由主 Agent 或独立 Skill Learning 通道负责
 
 2. **文件清理**
    - 检查 `workspace/media` 与 `workspace/downloads`
@@ -148,7 +148,8 @@ Gateway 暴露了 Ghost Maintenance 的配置与活动日志接口：
 
 - **嵌入式 Ghost 自学习**
   - 从真实用户对话、工具执行和任务结果中总结经验
-  - 将稳定偏好沉淀为 `USER.md`，将长期事实沉淀为 `MEMORY.md`，将可复用做法沉淀为 `workspace/skills/<name>/SKILL.md`
+  - 将稳定偏好沉淀为 `USER.md`，将长期事实沉淀为 `MEMORY.md`
+  - 可复用做法由主 Agent 或独立 Skill Learning 通道沉淀为 `workspace/skills/<name>/SKILL.md`
   - 运行在主助手流程内，是产品级学习闭环
 
 - **Ghost Maintenance**

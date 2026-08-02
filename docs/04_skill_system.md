@@ -244,7 +244,7 @@ fallback:
   message: "当前无法获取行情数据，请稍后重试。"
 ```
 
-当前推荐字段以源码中的 `SkillMeta` 和默认 `BLOCKCELL.md` 约束为准：
+当前推荐字段以源码中的 `SkillMeta` 和默认 `BLOCKCELL.md` 的自进化约束为准。注意：`BLOCKCELL.md` 只服务自进化/技能生成上下文，不是普通对话的全局规则文件；普通对话的工作区级全局规则以 `AGENTS.md` 为准。
 - 必需：`name`、`description`
 - 常用：`tools`、`requires`、`permissions`、`fallback`
 - 兼容但不建议新增：`capabilities`、`always`、`output_format`
