@@ -105,7 +105,8 @@ pub use learning_dedup::LearningDedup;
 pub use learning_throttle::LearningThrottle;
 pub use memory_adapter::MemoryStoreAdapter;
 pub use memory_file_store::{
-    MemoryFileMutation, MemoryFileSnapshot, MemoryFileStore, MemoryFileTarget,
+    MemoryFileMutation, MemoryFileSnapshot, MemoryFileStore, MemoryFileStoreRouter,
+    MemoryFileTarget,
 };
 pub use memory_system::{
     evaluate_memory_hooks, BackgroundTaskHandle, MemorySystem, MemorySystemConfig,

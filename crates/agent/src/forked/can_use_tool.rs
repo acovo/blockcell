@@ -397,6 +397,12 @@ fn build_memory_manage_schema() -> serde_json::Value {
                     "enum": ["user", "memory"],
                     "description": "user = user profile/preferences; memory = durable project/environment facts."
                 },
+                "scope": {
+                    "type": "string",
+                    "enum": ["session", "workspace", "user"],
+                    "default": "session",
+                    "description": "session = current session only; workspace = cross-session project facts; user = cross-session user profile/preferences."
+                },
                 "content": {
                     "type": "string",
                     "description": "Entry content for add/replace."

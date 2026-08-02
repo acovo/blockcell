@@ -61,6 +61,45 @@ pub struct MemoryFileStore {
     write_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MemoryFileStoreRouter {
+    session: MemoryFileStore,
+    durable: MemoryFileStore,
+}
+
+impl MemoryFileStoreRouter {
+    pub fn open(paths: &Paths, session_key: Option<&str>, write_enabled: bool) -> Result<Self> {
+        let durable = if write_enabled {
+            MemoryFileStore::open(paths)?
+        } else {
+            MemoryFileStore::open_shadow(paths)?
+        };
+        let session = match (write_enabled, session_key) {
+            (true, Some(session_key)) => MemoryFileStore::open_for_session(paths, session_key)?,
+            (false, Some(session_key)) => {
+                MemoryFileStore::open_shadow_for_session(paths, session_key)?
+            }
+            (_, None) => durable.clone(),
+        };
+        Ok(Self { session, durable })
+    }
+
+    pub fn set_write_guard(&mut self, write_guard: Arc<WriteGuard>) {
+        self.session.set_write_guard(Arc::clone(&write_guard));
+        self.durable.set_write_guard(write_guard);
+    }
+
+    fn store_for_scope(&self, scope: &str) -> Result<&MemoryFileStore> {
+        match scope {
+            "session" => Ok(&self.session),
+            "workspace" | "user" => Ok(&self.durable),
+            _ => Err(Error::Validation(format!(
+                "unsupported memory scope: {scope}"
+            ))),
+        }
+    }
+}
+
 impl MemoryFileStore {
     pub fn open(paths: &Paths) -> Result<Self> {
         Self::open_at(paths.user_md(), paths.memory_md(), paths.memory_dir())
@@ -361,6 +400,66 @@ impl MemoryFileStoreOps for MemoryFileStore {
         let target = parse_target(target)?;
         let mutation = self.restore_latest(target)?;
         Ok(mutation_json(mutation))
+    }
+}
+
+impl MemoryFileStoreOps for MemoryFileStoreRouter {
+    fn add_file_memory_json(&self, target: &str, content: &str) -> Result<Value> {
+        self.session.add_file_memory_json(target, content)
+    }
+
+    fn replace_file_memory_json(
+        &self,
+        target: &str,
+        old_text: &str,
+        content: &str,
+    ) -> Result<Value> {
+        self.session
+            .replace_file_memory_json(target, old_text, content)
+    }
+
+    fn remove_file_memory_json(&self, target: &str, old_text: &str) -> Result<Value> {
+        self.session.remove_file_memory_json(target, old_text)
+    }
+
+    fn restore_latest_file_memory_json(&self, target: &str) -> Result<Value> {
+        self.session.restore_latest_file_memory_json(target)
+    }
+
+    fn add_scoped_file_memory_json(
+        &self,
+        scope: &str,
+        target: &str,
+        content: &str,
+    ) -> Result<Value> {
+        self.store_for_scope(scope)?
+            .add_file_memory_json(target, content)
+    }
+
+    fn replace_scoped_file_memory_json(
+        &self,
+        scope: &str,
+        target: &str,
+        old_text: &str,
+        content: &str,
+    ) -> Result<Value> {
+        self.store_for_scope(scope)?
+            .replace_file_memory_json(target, old_text, content)
+    }
+
+    fn remove_scoped_file_memory_json(
+        &self,
+        scope: &str,
+        target: &str,
+        old_text: &str,
+    ) -> Result<Value> {
+        self.store_for_scope(scope)?
+            .remove_file_memory_json(target, old_text)
+    }
+
+    fn restore_latest_scoped_file_memory_json(&self, scope: &str, target: &str) -> Result<Value> {
+        self.store_for_scope(scope)?
+            .restore_latest_file_memory_json(target)
     }
 }
 

@@ -84,6 +84,12 @@ impl Tool for MemoryManageTool {
                         "enum": ["user", "memory"],
                         "description": "user = durable user profile/preferences. memory = project/environment facts and stable lessons."
                     },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["session", "workspace", "user"],
+                        "default": "session",
+                        "description": "Write visibility. session is current-session only (default); workspace is durable project knowledge and requires target=memory; user is durable cross-session preference/profile and requires target=user."
+                    },
                     "content": {
                         "type": "string",
                         "description": "Entry content for add/replace. Keep compact and durable."
@@ -114,6 +120,25 @@ impl Tool for MemoryManageTool {
         if !matches!(target, "user" | "memory") {
             return Err(Error::Validation(
                 "target must be 'user' or 'memory'".to_string(),
+            ));
+        }
+        let scope = params
+            .get("scope")
+            .and_then(|value| value.as_str())
+            .unwrap_or("session");
+        if !matches!(scope, "session" | "workspace" | "user") {
+            return Err(Error::Validation(
+                "scope must be 'session', 'workspace', or 'user'".to_string(),
+            ));
+        }
+        if scope == "workspace" && target != "memory" {
+            return Err(Error::Validation(
+                "scope 'workspace' requires target 'memory'".to_string(),
+            ));
+        }
+        if scope == "user" && target != "user" {
+            return Err(Error::Validation(
+                "scope 'user' requires target 'user'".to_string(),
             ));
         }
         match action {
@@ -177,8 +202,13 @@ impl Tool for MemoryManageTool {
             .get("target")
             .and_then(|value| value.as_str())
             .ok_or_else(|| Error::Tool("Missing or non-string parameter: target".to_string()))?;
-        let result = match action {
-            "add" => store.add_file_memory_json(
+        let scope = params
+            .get("scope")
+            .and_then(|value| value.as_str())
+            .unwrap_or("session");
+        let mut result = match action {
+            "add" => store.add_scoped_file_memory_json(
+                scope,
                 target,
                 params
                     .get("content")
@@ -187,7 +217,8 @@ impl Tool for MemoryManageTool {
                         Error::Tool("Missing or non-string parameter: content".to_string())
                     })?,
             ),
-            "replace" => store.replace_file_memory_json(
+            "replace" => store.replace_scoped_file_memory_json(
+                scope,
                 target,
                 params
                     .get("old_text")
@@ -202,7 +233,8 @@ impl Tool for MemoryManageTool {
                         Error::Tool("Missing or non-string parameter: content".to_string())
                     })?,
             ),
-            "remove" => store.remove_file_memory_json(
+            "remove" => store.remove_scoped_file_memory_json(
+                scope,
                 target,
                 params
                     .get("old_text")
@@ -211,9 +243,12 @@ impl Tool for MemoryManageTool {
                         Error::Tool("Missing or non-string parameter: old_text".to_string())
                     })?,
             ),
-            "undo_latest" => store.restore_latest_file_memory_json(target),
+            "undo_latest" => store.restore_latest_scoped_file_memory_json(scope, target),
             _ => unreachable!("validated action"),
         }?;
+        if let Some(result) = result.as_object_mut() {
+            result.insert("scope".to_string(), Value::String(scope.to_string()));
+        }
 
         if result
             .get("success")
@@ -989,6 +1024,34 @@ mod tests {
         assert!(tool
             .validate(&json!({"action": "remove", "target": "memory"}))
             .is_err());
+        assert!(tool
+            .validate(&json!({
+                "action": "add",
+                "target": "user",
+                "scope": "workspace",
+                "content": "Prefer Chinese replies."
+            }))
+            .is_err());
+        assert!(tool
+            .validate(&json!({
+                "action": "add",
+                "target": "memory",
+                "scope": "invalid",
+                "content": "Stable project fact."
+            }))
+            .is_err());
+    }
+
+    #[test]
+    fn test_memory_manage_schema_declares_scope_with_session_default() {
+        let schema = MemoryManageTool.schema();
+        let scope = &schema.parameters["properties"]["scope"];
+
+        assert_eq!(scope["default"], "session");
+        assert_eq!(
+            schema_enum_values(&schema.parameters, "scope"),
+            vec!["session", "workspace", "user"]
+        );
     }
 
     #[tokio::test]

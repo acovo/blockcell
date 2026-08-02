@@ -350,6 +350,38 @@ pub trait MemoryFileStoreOps: Send + Sync {
     ) -> Result<Value>;
     fn remove_file_memory_json(&self, target: &str, old_text: &str) -> Result<Value>;
     fn restore_latest_file_memory_json(&self, target: &str) -> Result<Value>;
+
+    fn add_scoped_file_memory_json(
+        &self,
+        _scope: &str,
+        target: &str,
+        content: &str,
+    ) -> Result<Value> {
+        self.add_file_memory_json(target, content)
+    }
+
+    fn replace_scoped_file_memory_json(
+        &self,
+        _scope: &str,
+        target: &str,
+        old_text: &str,
+        content: &str,
+    ) -> Result<Value> {
+        self.replace_file_memory_json(target, old_text, content)
+    }
+
+    fn remove_scoped_file_memory_json(
+        &self,
+        _scope: &str,
+        target: &str,
+        old_text: &str,
+    ) -> Result<Value> {
+        self.remove_file_memory_json(target, old_text)
+    }
+
+    fn restore_latest_scoped_file_memory_json(&self, _scope: &str, target: &str) -> Result<Value> {
+        self.restore_latest_file_memory_json(target)
+    }
 }
 
 pub trait GhostMemoryLifecycleOps: Send + Sync {

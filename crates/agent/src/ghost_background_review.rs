@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use crate::memory_file_store::MemoryFileStore;
+use crate::memory_file_store::MemoryFileStoreRouter;
 use crate::skill_file_store::SkillFileStore;
 use blockcell_tools::memory::MemoryManageTool;
 use blockcell_tools::session_search::SessionSearchTool;
@@ -470,16 +470,12 @@ async fn run_restricted_review_tool_loop(
 
     // Create stores once before the loop — avoids re-opening per tool call
     let learning = &config.agents.ghost.learning;
-    let memory_file_store: blockcell_tools::MemoryFileStoreHandle = Arc::new(
-        match (learning.write_enabled(), snapshot.session_key.as_deref()) {
-            (true, Some(session_key)) => MemoryFileStore::open_for_session(paths, session_key)?,
-            (true, None) => MemoryFileStore::open(paths)?,
-            (false, Some(session_key)) => {
-                MemoryFileStore::open_shadow_for_session(paths, session_key)?
-            }
-            (false, None) => MemoryFileStore::open_shadow(paths)?,
-        },
-    );
+    let memory_file_store: blockcell_tools::MemoryFileStoreHandle =
+        Arc::new(MemoryFileStoreRouter::open(
+            paths,
+            snapshot.session_key.as_deref(),
+            learning.write_enabled(),
+        )?);
     let skill_file_store: blockcell_tools::SkillFileStoreHandle =
         Arc::new(SkillFileStore::open(paths)?);
 
@@ -617,7 +613,7 @@ fn restricted_review_tool_registry() -> ToolRegistry {
 fn build_restricted_review_messages(snapshot: &GhostEpisodeSnapshot) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(
-            "You are a quiet Ghost learning reviewer. Learn only durable user preferences, stable project facts, and reusable non-procedural memory. Use only the provided tools to update final memory files directly. Do not create, edit, or request skills. If no durable memory is useful, make no tool calls.",
+            "You are a quiet Ghost learning reviewer. Learn only durable user preferences, stable project facts, and reusable non-procedural memory. Every memory_manage call must choose scope explicitly: user preferences/profile use scope=user with target=user; stable project or workspace facts use scope=workspace with target=memory; facts useful only in the current task/session use scope=session. Use only the provided tools to update final memory files directly. Do not create, edit, or request skills. If no durable memory is useful, make no tool calls.",
         ),
         ChatMessage::user(
             &serde_json::json!({
@@ -808,6 +804,7 @@ fn record_failed_review_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -821,7 +818,11 @@ mod tests {
     use blockcell_storage::GhostLedger;
     use blockcell_tools::ToolRegistry;
 
-    use crate::runtime::AgentRuntime;
+    use crate::{
+        context::{ContextBuilder, InteractionMode},
+        memory_file_store::MemoryFileStore,
+        runtime::AgentRuntime,
+    };
 
     #[derive(Debug, Clone, Copy)]
     enum ToolLoopMode {
@@ -984,6 +985,7 @@ mod tests {
                             arguments: serde_json::json!({
                                 "action": "add",
                                 "target": "user",
+                                "scope": "user",
                                 "content": "User prefers canary-first rollout."
                             }),
                             thought_signature: None,
@@ -1240,12 +1242,7 @@ mod tests {
             .load_snapshot()
             .expect("load normal scoped memory");
         assert!(normal_scoped.user_block.is_none());
-        let shadow_user_path = paths
-            .memory_dir()
-            .join("shadow")
-            .join("sessions")
-            .join(blockcell_core::stable_hash_session_key("cli:ghost-review"))
-            .join("USER.md");
+        let shadow_user_path = paths.memory_dir().join("shadow").join("USER.md");
         let user_memory = std::fs::read_to_string(shadow_user_path).expect("shadow USER memory");
         assert!(user_memory.contains("canary-first rollout"));
         assert!(!paths
@@ -1269,6 +1266,50 @@ mod tests {
             run.result["learningFeedback"],
             serde_json::json!(["User profile updated"])
         );
+    }
+
+    #[tokio::test]
+    async fn user_scoped_review_is_recalled_by_a_new_session() {
+        let paths = temp_paths("user-scope-recall");
+        let episode_id = insert_sample_episode(&paths);
+        let provider = Arc::new(ToolLoopReviewProvider::new(ToolLoopMode::WriteFiles));
+        let provider_pool = ProviderPool::from_single_provider("test/mock", "test", provider);
+        let mut config = Config::default();
+        config.agents.ghost.learning.write_enabled = Some(true);
+        config.agents.ghost.learning.recall_enabled = Some(true);
+
+        run_background_review_for_episode(
+            &paths,
+            provider_pool,
+            &episode_id,
+            &config,
+            &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+            None,
+        )
+        .await
+        .expect("run user scoped review");
+
+        let durable_user = std::fs::read_to_string(paths.user_md()).expect("global USER.md");
+        assert!(durable_user.contains("canary-first rollout"));
+        let old_session = MemoryFileStore::open_for_session(&paths, "cli:ghost-review")
+            .expect("open original session store")
+            .load_snapshot()
+            .expect("load original session store");
+        assert!(old_session.user_block.is_none());
+
+        let builder = ContextBuilder::new(paths, config);
+        let prompt = builder.build_system_prompt_for_mode_with_channel_and_session(
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "How should I deploy?",
+            &[],
+            &[],
+            Some("cli:new-session"),
+        );
+        assert!(prompt.contains("canary-first rollout"));
     }
 
     #[tokio::test]

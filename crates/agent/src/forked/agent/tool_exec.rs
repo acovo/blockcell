@@ -660,21 +660,38 @@ pub(crate) async fn execute_forked_tool(
                         .get("target")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
+                    let scope = input
+                        .get("scope")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("session");
+                    if !matches!(scope, "session" | "workspace" | "user")
+                        || (scope == "workspace" && target != "memory")
+                        || (scope == "user" && target != "user")
+                    {
+                        return Err(ForkedAgentError::ToolError(
+                            "memory_manage scope/target combination is invalid".to_string(),
+                        ));
+                    }
                     let result = match action {
-                        "add" => store.add_file_memory_json(
+                        "add" => store.add_scoped_file_memory_json(
+                            scope,
                             target,
                             input.get("content").and_then(|v| v.as_str()).unwrap_or(""),
                         ),
-                        "replace" => store.replace_file_memory_json(
+                        "replace" => store.replace_scoped_file_memory_json(
+                            scope,
                             target,
                             input.get("old_text").and_then(|v| v.as_str()).unwrap_or(""),
                             input.get("content").and_then(|v| v.as_str()).unwrap_or(""),
                         ),
-                        "remove" => store.remove_file_memory_json(
+                        "remove" => store.remove_scoped_file_memory_json(
+                            scope,
                             target,
                             input.get("old_text").and_then(|v| v.as_str()).unwrap_or(""),
                         ),
-                        "undo_latest" => store.restore_latest_file_memory_json(target),
+                        "undo_latest" => {
+                            store.restore_latest_scoped_file_memory_json(scope, target)
+                        }
                         _ => Err(blockcell_core::Error::Validation(
                             "memory_manage action must be add, replace, remove, or undo_latest"
                                 .to_string(),
