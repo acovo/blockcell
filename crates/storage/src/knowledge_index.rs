@@ -155,30 +155,62 @@ impl KnowledgeIndex {
         if query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let fts_query = query
-            .split_whitespace()
-            .filter(|token| !token.is_empty())
-            .map(|token| format!("\"{}\"", token.replace('"', " ")))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let cjk_bigrams = crate::fts::cjk_bigrams(query);
         let conn = self
             .inner
             .lock()
             .map_err(|_| Error::Storage("Knowledge index lock poisoned".to_string()))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT e.id, e.file, e.anchor, e.content, e.content_hash,
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let sql = if cjk_bigrams.is_empty() {
+            bind_values.push(Box::new(crate::fts::build_fts_query(query)));
+            bind_values.push(Box::new(500_i64));
+            "SELECT e.id, e.file, e.anchor, e.content, e.content_hash,
                         e.scope, e.source, e.updated_at, e.supersedes,
                         bm25(knowledge_fts) AS relevance
                  FROM knowledge_entries e
                  JOIN knowledge_fts f ON f.rowid = e.rowid
                  WHERE knowledge_fts MATCH ?1
                  ORDER BY relevance ASC
-                 LIMIT ?2",
+                 LIMIT ?2"
+                .to_string()
+        } else {
+            let conditions = cjk_bigrams
+                .iter()
+                .enumerate()
+                .map(|(offset, _)| format!("f.content LIKE ?{}", offset + 1))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let match_score = cjk_bigrams
+                .iter()
+                .enumerate()
+                .map(|(offset, _)| {
+                    format!("CASE WHEN f.content LIKE ?{} THEN 1 ELSE 0 END", offset + 1)
+                })
+                .collect::<Vec<_>>()
+                .join(" + ");
+            for term in &cjk_bigrams {
+                bind_values.push(Box::new(format!("%{term}%")));
+            }
+            bind_values.push(Box::new(500_i64));
+            format!(
+                "SELECT e.id, e.file, e.anchor, e.content, e.content_hash,
+                        e.scope, e.source, e.updated_at, e.supersedes,
+                        -({match_score}) AS relevance
+                 FROM knowledge_entries e
+                 JOIN knowledge_fts f ON f.rowid = e.rowid
+                 WHERE {conditions}
+                 ORDER BY relevance ASC
+                 LIMIT ?{}",
+                cjk_bigrams.len() + 1
             )
-            .map_err(map_sqlite_error)?;
+        };
+        let mut stmt = conn.prepare(&sql).map_err(map_sqlite_error)?;
+        let bind_refs = bind_values
+            .iter()
+            .map(|value| value.as_ref())
+            .collect::<Vec<_>>();
         let rows = stmt
-            .query_map(params![fts_query, 500_i64], |row| {
+            .query_map(bind_refs.as_slice(), |row| {
                 Ok((
                     KnowledgeIndexEntry {
                         id: row.get(0)?,
@@ -198,6 +230,14 @@ impl KnowledgeIndex {
         let candidates = rows
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_sqlite_error)?;
+        let best_cjk_relevance = if cjk_bigrams.is_empty() {
+            None
+        } else {
+            candidates
+                .iter()
+                .map(|(_, relevance)| *relevance)
+                .min_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal))
+        };
         let mut superseded = HashSet::new();
         let mut superseded_stmt = conn
             .prepare("SELECT supersedes FROM knowledge_entries WHERE supersedes IS NOT NULL")
@@ -221,6 +261,9 @@ impl KnowledgeIndex {
 
         let mut by_hash: HashMap<String, (KnowledgeIndexEntry, f64)> = HashMap::new();
         for (entry, relevance) in candidates {
+            if best_cjk_relevance.is_some_and(|best| relevance > best) {
+                continue;
+            }
             if superseded.contains(&entry.id) || forgotten.contains(&entry.content_hash) {
                 continue;
             }
@@ -304,6 +347,11 @@ impl KnowledgeIndex {
             .inner
             .lock()
             .map_err(|_| Error::Storage("Knowledge index lock poisoned".to_string()))?;
+        let rebuild_fts = crate::fts::prepare_trigram_fts(
+            &conn,
+            "knowledge_fts",
+            &["knowledge_ai", "knowledge_ad", "knowledge_au"],
+        )?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS knowledge_entries (
                 id TEXT PRIMARY KEY,
@@ -323,7 +371,8 @@ impl KnowledgeIndex {
                 file,
                 anchor,
                 content='knowledge_entries',
-                content_rowid='rowid'
+                content_rowid='rowid',
+                tokenize='trigram'
             );
             CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON knowledge_entries BEGIN
                 INSERT INTO knowledge_fts(rowid, content, file, anchor)
@@ -361,6 +410,13 @@ impl KnowledgeIndex {
             END;",
         )
         .map_err(map_sqlite_error)?;
+        if rebuild_fts {
+            conn.execute(
+                "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')",
+                [],
+            )
+            .map_err(map_sqlite_error)?;
+        }
         Ok(())
     }
 }

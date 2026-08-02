@@ -39,6 +39,12 @@ impl MemoryStore {
             .lock()
             .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
 
+        let rebuild_fts = crate::fts::prepare_trigram_fts(
+            &conn,
+            "memory_fts",
+            &["memory_ai", "memory_ad", "memory_au"],
+        )?;
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS memory_items (
@@ -96,7 +102,8 @@ impl MemoryStore {
                 content,
                 tags,
                 content='memory_items',
-                content_rowid='rowid'
+                content_rowid='rowid',
+                tokenize='trigram'
             );
 
             -- Triggers to keep FTS in sync
@@ -138,6 +145,15 @@ impl MemoryStore {
         .map_err(|e| {
             blockcell_core::Error::Storage(format!("Failed to init memory schema: {}", e))
         })?;
+
+        if rebuild_fts {
+            conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')", [])
+                .map_err(|error| {
+                    blockcell_core::Error::Storage(format!(
+                        "Failed to rebuild trigram memory FTS: {error}"
+                    ))
+                })?;
+        }
 
         debug!("Memory store schema initialized");
         Ok(())

@@ -49,6 +49,58 @@ fn rebuild_indexes_canonical_files_with_metadata() {
 }
 
 #[test]
+fn chinese_fts_recalls_related_canonical_knowledge() {
+    let paths = test_paths("chinese-recall");
+    paths.ensure_dirs().expect("ensure paths");
+    std::fs::write(paths.memory_md(), "发布前需要检查 changelog 和版本号\n")
+        .expect("write MEMORY.md");
+
+    let index = KnowledgeIndex::open(&paths.knowledge_index_db()).expect("open index");
+    index.rebuild_from_files(&paths).expect("rebuild index");
+    let hits = index
+        .search("发版检查什么", 10)
+        .expect("search Chinese knowledge");
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].content.contains("changelog"));
+
+    drop(index);
+    let conn = rusqlite::Connection::open(paths.knowledge_index_db()).expect("open raw index db");
+    conn.execute_batch(
+        "DROP TRIGGER knowledge_ai;
+         DROP TRIGGER knowledge_ad;
+         DROP TRIGGER knowledge_au;
+         DROP TABLE knowledge_fts;
+         CREATE VIRTUAL TABLE knowledge_fts USING fts5(
+             content, file, anchor,
+             content='knowledge_entries', content_rowid='rowid'
+         );
+         INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild');",
+    )
+    .expect("restore legacy knowledge fts");
+    drop(conn);
+
+    let migrated = KnowledgeIndex::open(&paths.knowledge_index_db()).expect("migrate index");
+    assert_eq!(
+        migrated
+            .search("发版检查什么", 10)
+            .expect("search migrated Chinese knowledge")
+            .len(),
+        1
+    );
+    drop(migrated);
+
+    let conn = rusqlite::Connection::open(paths.knowledge_index_db()).expect("reopen raw index db");
+    let schema: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='knowledge_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read knowledge fts schema");
+    assert!(schema.to_lowercase().contains("tokenize='trigram'"));
+}
+
+#[test]
 fn rebuild_removes_entries_deleted_from_canonical_file() {
     let paths = test_paths("delete");
     paths.ensure_dirs().expect("ensure paths");

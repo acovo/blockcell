@@ -1,7 +1,5 @@
 use blockcell_core::Result;
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
-use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -21,10 +19,6 @@ use crate::retriever::HybridMemoryRetriever;
 use crate::vector::{VectorMeta, VectorRuntime};
 
 pub use crate::memory_contract::MemoryType;
-
-/// 预编译的 FTS5 特殊字符正则，避免每次调用重新编译
-static FTS_SPECIAL_CHARS: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"[*"():^{}]"#).expect("FTS special chars regex is valid"));
 
 const VECTOR_SYNC_OP_UPSERT: &str = "upsert";
 const VECTOR_SYNC_OP_DELETE: &str = "delete";
@@ -269,19 +263,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 /// Sanitize a user query for FTS5 (escape special characters, use implicit AND).
 pub(crate) fn sanitize_fts_query(query: &str) -> String {
-    // 使用预编译的静态正则，避免每次调用重新编译
-    let cleaned = FTS_SPECIAL_CHARS.replace_all(query, " ");
-    // Split into tokens and wrap each in quotes for exact matching
-    let tokens: Vec<String> = cleaned
-        .split_whitespace()
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{}\"", t))
-        .collect();
-    if tokens.is_empty() {
-        "\"\"".to_string()
-    } else {
-        tokens.join(" ")
-    }
+    crate::fts::build_fts_query(query)
 }
 
 /// Parse markdown content into (heading, body) sections.

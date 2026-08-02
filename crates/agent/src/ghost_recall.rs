@@ -250,12 +250,52 @@ fn normalize_recall_tokens(raw_query: &str) -> Vec<String> {
         "of", "on", "or", "the", "to", "usually", "we", "what", "written", "would", "you",
     ];
 
-    raw_query
-        .split(|ch: char| !ch.is_alphanumeric())
-        .map(|token| token.trim().to_lowercase())
-        .filter(|token| !token.is_empty())
-        .filter(|token| !STOP_WORDS.contains(&token.as_str()))
-        .collect()
+    let mut tokens = Vec::new();
+    let mut cjk_run = Vec::new();
+    let mut latin_run = String::new();
+    let flush_cjk = |run: &mut Vec<char>, output: &mut Vec<String>| {
+        if run.len() == 1 {
+            output.push(run[0].to_string());
+        } else {
+            output.extend(run.windows(2).map(|pair| pair.iter().collect::<String>()));
+        }
+        run.clear();
+    };
+    let flush_latin = |run: &mut String, output: &mut Vec<String>| {
+        if run.is_empty() {
+            return;
+        }
+        let token = std::mem::take(run).to_lowercase();
+        if !STOP_WORDS.contains(&token.as_str()) {
+            output.push(token);
+        }
+    };
+
+    for character in raw_query.chars() {
+        if is_cjk(character) {
+            flush_latin(&mut latin_run, &mut tokens);
+            cjk_run.push(character);
+        } else {
+            flush_cjk(&mut cjk_run, &mut tokens);
+            if character.is_alphanumeric() {
+                latin_run.push(character);
+            } else {
+                flush_latin(&mut latin_run, &mut tokens);
+            }
+        }
+    }
+    flush_cjk(&mut cjk_run, &mut tokens);
+    flush_latin(&mut latin_run, &mut tokens);
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+    )
 }
 
 #[cfg(test)]
@@ -355,6 +395,26 @@ mod tests {
         let message = build_ghost_recall_context_block(&paths, &config, &test_msg("deploy docs"))
             .expect("recall");
         assert!(message.is_none());
+    }
+
+    #[test]
+    fn chinese_ghost_recall_matches_related_canonical_memory() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-ghost-recall-chinese-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        std::fs::write(paths.memory_md(), "发布前需要检查 changelog 和版本号")
+            .expect("write memory md");
+        let mut config = Config::default();
+        config.agents.ghost.learning.recall_enabled = Some(true);
+
+        let block = build_ghost_recall_context_block(&paths, &config, &test_msg("发版检查什么"))
+            .expect("recall Chinese memory")
+            .expect("Chinese context block");
+
+        assert!(block.contains("changelog"));
     }
 
     #[test]

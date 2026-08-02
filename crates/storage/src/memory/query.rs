@@ -44,18 +44,48 @@ impl MemoryStore {
         let mut where_clauses = Vec::new();
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut bind_idx = 1;
+        let cjk_bigrams = params
+            .query
+            .as_deref()
+            .map(crate::fts::cjk_bigrams)
+            .unwrap_or_default();
 
         if has_fts_query {
-            sql.push_str(
-                "SELECT m.*, bm25(memory_fts) AS fts_score
+            if cjk_bigrams.is_empty() {
+                sql.push_str(
+                    "SELECT m.*, bm25(memory_fts) AS fts_score
                  FROM memory_items m
                  JOIN memory_fts ON memory_fts.rowid = m.rowid
                  WHERE memory_fts MATCH ?1",
-            );
-            bind_values.push(Box::new(sanitize_fts_query(
-                params.query.as_deref().unwrap_or_default(),
-            )));
-            bind_idx = 2;
+                );
+                bind_values.push(Box::new(sanitize_fts_query(
+                    params.query.as_deref().unwrap_or_default(),
+                )));
+                bind_idx = 2;
+            } else {
+                sql.push_str(
+                    "SELECT m.*, 0.0 AS fts_score
+                     FROM memory_items m
+                     JOIN memory_fts ON memory_fts.rowid = m.rowid
+                     WHERE (",
+                );
+                let conditions = cjk_bigrams
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, _)| {
+                        let index = bind_idx + offset;
+                        format!(
+                            "memory_fts.title LIKE ?{index} OR memory_fts.summary LIKE ?{index} OR memory_fts.content LIKE ?{index} OR memory_fts.tags LIKE ?{index}"
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                sql.push_str(&conditions.join(" OR "));
+                sql.push(')');
+                for term in &cjk_bigrams {
+                    bind_values.push(Box::new(format!("%{term}%")));
+                    bind_idx += 1;
+                }
+            }
         } else {
             sql.push_str("SELECT m.*, 0.0 AS fts_score FROM memory_items m WHERE 1=1");
         }
@@ -167,7 +197,7 @@ impl MemoryStore {
 
     pub(crate) fn search_fts_candidates(
         &self,
-        fts_query: &str,
+        raw_query: &str,
         query_params: &QueryParams,
         top_k: usize,
     ) -> Result<Vec<(String, f64)>> {
@@ -179,15 +209,41 @@ impl MemoryStore {
             .inner
             .lock()
             .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
-        let mut sql = String::from(
-            "SELECT m.id, bm25(memory_fts) AS fts_score
+        let cjk_bigrams = crate::fts::cjk_bigrams(raw_query);
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut bind_idx = 1;
+        let mut sql = if cjk_bigrams.is_empty() {
+            bind_values.push(Box::new(sanitize_fts_query(raw_query)));
+            bind_idx = 2;
+            String::from(
+                "SELECT m.id, bm25(memory_fts) AS fts_score
              FROM memory_items m
              JOIN memory_fts ON memory_fts.rowid = m.rowid
              WHERE memory_fts MATCH ?1",
-        );
-        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(fts_query.to_string())];
-        let mut bind_idx = 2;
+            )
+        } else {
+            let conditions = cjk_bigrams
+                .iter()
+                .enumerate()
+                .map(|(offset, _)| {
+                    let index = offset + 1;
+                    format!(
+                        "memory_fts.title LIKE ?{index} OR memory_fts.summary LIKE ?{index} OR memory_fts.content LIKE ?{index} OR memory_fts.tags LIKE ?{index}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            for term in &cjk_bigrams {
+                bind_values.push(Box::new(format!("%{term}%")));
+                bind_idx += 1;
+            }
+            format!(
+                "SELECT m.id, 0.0 AS fts_score
+                 FROM memory_items m
+                 JOIN memory_fts ON memory_fts.rowid = m.rowid
+                 WHERE ({conditions})"
+            )
+        };
 
         if !query_params.include_deleted {
             sql.push_str(" AND m.deleted_at IS NULL");
@@ -244,10 +300,14 @@ impl MemoryStore {
             bind_values.push(Box::new(Utc::now().to_rfc3339()));
             bind_idx += 1;
         }
-        sql.push_str(&format!(
-            " ORDER BY bm25(memory_fts) ASC LIMIT ?{}",
-            bind_idx
-        ));
+        if cjk_bigrams.is_empty() {
+            sql.push_str(&format!(
+                " ORDER BY bm25(memory_fts) ASC LIMIT ?{}",
+                bind_idx
+            ));
+        } else {
+            sql.push_str(&format!(" ORDER BY m.importance DESC LIMIT ?{}", bind_idx));
+        }
         bind_values.push(Box::new(top_k as i64));
 
         let mut stmt = conn

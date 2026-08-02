@@ -1493,6 +1493,78 @@ fn test_query_falls_back_to_fts_when_vector_search_fails() {
 }
 
 #[test]
+fn chinese_fts_recalls_related_short_term_memory() {
+    let (store, dir) = test_store();
+    let item = store
+        .upsert(UpsertParams {
+            scope: "short_term".to_string(),
+            item_type: "note".to_string(),
+            title: None,
+            content: "发布前需要检查 changelog 和版本号".to_string(),
+            summary: None,
+            tags: vec![],
+            source: "user".to_string(),
+            channel: None,
+            session_key: Some("cli:release".to_string()),
+            importance: 0.8,
+            dedup_key: None,
+            expires_at: None,
+        })
+        .expect("store Chinese memory");
+
+    let results = store
+        .query(&QueryParams {
+            query: Some("发版检查什么".to_string()),
+            session_key: Some("cli:release".to_string()),
+            top_k: 5,
+            ..Default::default()
+        })
+        .expect("query Chinese memory");
+    assert!(results.iter().any(|result| result.item.id == item.id));
+
+    drop(store);
+    let db_path = dir.path().join("memory.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open memory db");
+    conn.execute_batch(
+        "DROP TRIGGER memory_ai;
+         DROP TRIGGER memory_ad;
+         DROP TRIGGER memory_au;
+         DROP TABLE memory_fts;
+         CREATE VIRTUAL TABLE memory_fts USING fts5(
+             title, summary, content, tags,
+             content='memory_items', content_rowid='rowid'
+         );
+         INSERT INTO memory_fts(memory_fts) VALUES('rebuild');",
+    )
+    .expect("restore legacy memory fts");
+    drop(conn);
+
+    let migrated = MemoryStore::open(&db_path).expect("migrate memory fts");
+    let migrated_results = migrated
+        .query(&QueryParams {
+            query: Some("发版检查什么".to_string()),
+            session_key: Some("cli:release".to_string()),
+            top_k: 5,
+            ..Default::default()
+        })
+        .expect("query migrated Chinese memory");
+    assert!(migrated_results
+        .iter()
+        .any(|result| result.item.id == item.id));
+    drop(migrated);
+
+    let conn = rusqlite::Connection::open(&db_path).expect("reopen memory db");
+    let schema: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='memory_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read memory fts schema");
+    assert!(schema.to_lowercase().contains("tokenize='trigram'"));
+}
+
+#[test]
 fn fts_filters_deleted_candidates_before_applying_candidate_limit() {
     let (store, _dir) = test_store();
     for index in 0..25 {

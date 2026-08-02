@@ -2,6 +2,7 @@ pub mod audit;
 pub mod contacts;
 pub mod evolution_workflow;
 mod file_lock;
+mod fts;
 pub mod ghost_ledger;
 pub mod knowledge_index;
 pub mod memory;
