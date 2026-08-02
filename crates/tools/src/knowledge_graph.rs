@@ -335,41 +335,43 @@ fn action_search_entities(db: &rusqlite::Connection, params: &Value) -> Result<V
     let max_results = params
         .get("max_results")
         .and_then(|v| v.as_u64())
-        .unwrap_or(50);
+        .unwrap_or(50)
+        .min(i64::MAX as u64) as i64;
 
     let entities = if !query.is_empty() {
         // FTS search
-        let fts_query = query.replace('"', "\"\"");
-        let sql = if let Some(et) = entity_type {
-            format!(
+        let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
+        if let Some(et) = entity_type {
+            query_entities(
+                db,
                 "SELECT e.id, e.entity_type, e.name, e.properties, e.tags, e.created_at \
                  FROM entities_fts fts JOIN entities e ON fts.id = e.id \
-                 WHERE entities_fts MATCH '\"{}\"' AND e.entity_type = '{}' \
-                 LIMIT {}",
-                fts_query, et, max_results
-            )
+                 WHERE entities_fts MATCH ?1 AND e.entity_type = ?2 LIMIT ?3",
+                rusqlite::params![fts_query, et, max_results],
+            )?
         } else {
-            format!(
+            query_entities(
+                db,
                 "SELECT e.id, e.entity_type, e.name, e.properties, e.tags, e.created_at \
                  FROM entities_fts fts JOIN entities e ON fts.id = e.id \
-                 WHERE entities_fts MATCH '\"{}\"' \
-                 LIMIT {}",
-                fts_query, max_results
-            )
-        };
-        query_entities(db, &sql)?
+                 WHERE entities_fts MATCH ?1 LIMIT ?2",
+                rusqlite::params![fts_query, max_results],
+            )?
+        }
     } else if let Some(et) = entity_type {
-        let sql = format!(
-            "SELECT id, entity_type, name, properties, tags, created_at FROM entities WHERE entity_type = '{}' LIMIT {}",
-            et, max_results
-        );
-        query_entities(db, &sql)?
+        query_entities(
+            db,
+            "SELECT id, entity_type, name, properties, tags, created_at \
+             FROM entities WHERE entity_type = ?1 LIMIT ?2",
+            rusqlite::params![et, max_results],
+        )?
     } else {
-        let sql = format!(
-            "SELECT id, entity_type, name, properties, tags, created_at FROM entities ORDER BY updated_at DESC LIMIT {}",
-            max_results
-        );
-        query_entities(db, &sql)?
+        query_entities(
+            db,
+            "SELECT id, entity_type, name, properties, tags, created_at \
+             FROM entities ORDER BY updated_at DESC LIMIT ?1",
+            rusqlite::params![max_results],
+        )?
     };
 
     Ok(json!({"entities": entities, "count": entities.len(), "query": query}))
@@ -496,16 +498,16 @@ fn action_get_relations(db: &rusqlite::Connection, params: &Value) -> Result<Val
     let relations = if let Some(eid) = entity_id {
         get_entity_relations(db, eid, direction)?
     } else if let Some(rt) = relation_type {
-        let sql = format!(
+        query_relations_full(
+            db,
             "SELECT r.id, r.source_id, r.target_id, r.relation_type, r.properties, r.created_at, \
              s.name as source_name, t.name as target_name \
              FROM relations r \
              LEFT JOIN entities s ON r.source_id = s.id \
              LEFT JOIN entities t ON r.target_id = t.id \
-             WHERE r.relation_type = '{}' LIMIT 100",
-            rt
-        );
-        query_relations_full(db, &sql)?
+             WHERE r.relation_type = ?1 LIMIT 100",
+            rusqlite::params![rt],
+        )?
     } else {
         let sql =
             "SELECT r.id, r.source_id, r.target_id, r.relation_type, r.properties, r.created_at, \
@@ -514,7 +516,7 @@ fn action_get_relations(db: &rusqlite::Connection, params: &Value) -> Result<Val
              LEFT JOIN entities s ON r.source_id = s.id \
              LEFT JOIN entities t ON r.target_id = t.id \
              LIMIT 100";
-        query_relations_full(db, sql)?
+        query_relations_full(db, sql, [])?
     };
 
     // Filter by relation_type if both entity_id and relation_type are specified
@@ -821,6 +823,7 @@ fn action_export(db: &rusqlite::Connection, params: &Value, ctx: &ToolContext) -
     let entities = query_entities(
         db,
         "SELECT id, entity_type, name, properties, tags, created_at FROM entities",
+        [],
     )?;
     let relations = query_relations_full(
         db,
@@ -829,6 +832,7 @@ fn action_export(db: &rusqlite::Connection, params: &Value, ctx: &ToolContext) -
          FROM relations r \
          LEFT JOIN entities s ON r.source_id = s.id \
          LEFT JOIN entities t ON r.target_id = t.id",
+        [],
     )?;
 
     let content = match format {
@@ -864,37 +868,41 @@ fn action_query(db: &rusqlite::Connection, params: &Value) -> Result<Value> {
     let max_results = params
         .get("max_results")
         .and_then(|v| v.as_u64())
-        .unwrap_or(50);
+        .unwrap_or(50)
+        .min(i64::MAX as u64) as i64;
 
     // Simple pattern matching: "entity_type:person" or "tag:important" or free text
     if query.starts_with("type:") || query.starts_with("entity_type:") {
         let et = query.split_once(':').map(|x| x.1).unwrap_or("");
-        let sql = format!(
-            "SELECT id, entity_type, name, properties, tags, created_at FROM entities WHERE entity_type = '{}' LIMIT {}",
-            et, max_results
-        );
-        let entities = query_entities(db, &sql)?;
+        let entities = query_entities(
+            db,
+            "SELECT id, entity_type, name, properties, tags, created_at \
+             FROM entities WHERE entity_type = ?1 LIMIT ?2",
+            rusqlite::params![et, max_results],
+        )?;
         Ok(json!({"entities": entities, "count": entities.len()}))
     } else if query.starts_with("tag:") {
         let tag = query.split_once(':').map(|x| x.1).unwrap_or("");
-        let sql = format!(
-            "SELECT id, entity_type, name, properties, tags, created_at FROM entities WHERE tags LIKE '%\"{}%' LIMIT {}",
-            tag, max_results
-        );
-        let entities = query_entities(db, &sql)?;
+        let tag_pattern = format!("%\"{}%", tag);
+        let entities = query_entities(
+            db,
+            "SELECT id, entity_type, name, properties, tags, created_at \
+             FROM entities WHERE tags LIKE ?1 LIMIT ?2",
+            rusqlite::params![tag_pattern, max_results],
+        )?;
         Ok(json!({"entities": entities, "count": entities.len()}))
     } else if query.starts_with("relation:") {
         let rt = query.split_once(':').map(|x| x.1).unwrap_or("");
-        let sql = format!(
+        let relations = query_relations_full(
+            db,
             "SELECT r.id, r.source_id, r.target_id, r.relation_type, r.properties, r.created_at, \
              s.name as source_name, t.name as target_name \
              FROM relations r \
              LEFT JOIN entities s ON r.source_id = s.id \
              LEFT JOIN entities t ON r.target_id = t.id \
-             WHERE r.relation_type = '{}' LIMIT {}",
-            rt, max_results
-        );
-        let relations = query_relations_full(db, &sql)?;
+             WHERE r.relation_type = ?1 LIMIT ?2",
+            rusqlite::params![rt, max_results],
+        )?;
         Ok(json!({"relations": relations, "count": relations.len()}))
     } else {
         // Full-text search
@@ -904,12 +912,16 @@ fn action_query(db: &rusqlite::Connection, params: &Value) -> Result<Value> {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn query_entities(db: &rusqlite::Connection, sql: &str) -> Result<Vec<Value>> {
+fn query_entities<P: rusqlite::Params>(
+    db: &rusqlite::Connection,
+    sql: &str,
+    params: P,
+) -> Result<Vec<Value>> {
     let mut stmt = db
         .prepare(sql)
         .map_err(|e| Error::Tool(format!("Query error: {}", e)))?;
     let entities: Vec<Value> = stmt
-        .query_map([], |row| {
+        .query_map(params, |row| {
             let props_str: String = row.get(3)?;
             let tags_str: String = row.get(4)?;
             Ok(json!({
@@ -927,12 +939,16 @@ fn query_entities(db: &rusqlite::Connection, sql: &str) -> Result<Vec<Value>> {
     Ok(entities)
 }
 
-fn query_relations_full(db: &rusqlite::Connection, sql: &str) -> Result<Vec<Value>> {
+fn query_relations_full<P: rusqlite::Params>(
+    db: &rusqlite::Connection,
+    sql: &str,
+    params: P,
+) -> Result<Vec<Value>> {
     let mut stmt = db
         .prepare(sql)
         .map_err(|e| Error::Tool(format!("Query error: {}", e)))?;
     let relations: Vec<Value> = stmt
-        .query_map([], |row| {
+        .query_map(params, |row| {
             let props_str: String = row.get(4)?;
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
@@ -956,28 +972,27 @@ fn get_entity_relations(
     entity_id: &str,
     direction: &str,
 ) -> Result<Vec<Value>> {
-    let sql =
-        match direction {
-            "outgoing" => format!(
+    let sql = match direction {
+        "outgoing" => {
             "SELECT r.id, r.source_id, r.target_id, r.relation_type, r.properties, r.created_at, \
              s.name, t.name FROM relations r \
              LEFT JOIN entities s ON r.source_id = s.id LEFT JOIN entities t ON r.target_id = t.id \
-             WHERE r.source_id = '{}'", entity_id
-        ),
-            "incoming" => format!(
+             WHERE r.source_id = ?1"
+        }
+        "incoming" => {
             "SELECT r.id, r.source_id, r.target_id, r.relation_type, r.properties, r.created_at, \
              s.name, t.name FROM relations r \
              LEFT JOIN entities s ON r.source_id = s.id LEFT JOIN entities t ON r.target_id = t.id \
-             WHERE r.target_id = '{}'", entity_id
-        ),
-            _ => format!(
+             WHERE r.target_id = ?1"
+        }
+        _ => {
             "SELECT r.id, r.source_id, r.target_id, r.relation_type, r.properties, r.created_at, \
              s.name, t.name FROM relations r \
              LEFT JOIN entities s ON r.source_id = s.id LEFT JOIN entities t ON r.target_id = t.id \
-             WHERE r.source_id = '{}' OR r.target_id = '{}'", entity_id, entity_id
-        ),
-        };
-    query_relations_full(db, &sql)
+             WHERE r.source_id = ?1 OR r.target_id = ?1"
+        }
+    };
+    query_relations_full(db, sql, rusqlite::params![entity_id])
 }
 
 fn get_entity_brief(db: &rusqlite::Connection, id: &str) -> Value {
@@ -1189,6 +1204,93 @@ mod tests {
         // Verify stats after deletion
         let stats2 = action_stats(&db).unwrap();
         assert_eq!(stats2["entity_count"], 2);
+    }
+
+    #[test]
+    fn test_get_relations_does_not_allow_entity_id_sql_injection() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        init_schema(&db).unwrap();
+
+        action_add_entity(
+            &db,
+            &json!({"entity_id": "alice", "entity_type": "person", "name": "Alice"}),
+        )
+        .unwrap();
+        action_add_entity(
+            &db,
+            &json!({"entity_id": "bob", "entity_type": "person", "name": "Bob"}),
+        )
+        .unwrap();
+        action_add_relation(
+            &db,
+            &json!({
+                "source_id": "alice",
+                "target_id": "bob",
+                "relation_type": "knows"
+            }),
+        )
+        .unwrap();
+
+        let result = action_get_relations(
+            &db,
+            &json!({"entity_id": "x' OR '1'='1", "direction": "both"}),
+        )
+        .unwrap();
+
+        assert_eq!(result["count"], 0);
+        assert!(result["relations"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_search_entities_does_not_allow_entity_type_sql_injection() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        init_schema(&db).unwrap();
+        action_add_entity(
+            &db,
+            &json!({"entity_id": "alice", "entity_type": "person", "name": "Alice"}),
+        )
+        .unwrap();
+
+        let result = action_search_entities(
+            &db,
+            &json!({"entity_type": "x' OR '1'='1", "max_results": 50}),
+        )
+        .unwrap();
+
+        assert_eq!(result["count"], 0);
+    }
+
+    #[test]
+    fn test_pattern_query_does_not_allow_relation_type_sql_injection() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        init_schema(&db).unwrap();
+        action_add_entity(
+            &db,
+            &json!({"entity_id": "alice", "entity_type": "person", "name": "Alice"}),
+        )
+        .unwrap();
+        action_add_entity(
+            &db,
+            &json!({"entity_id": "bob", "entity_type": "person", "name": "Bob"}),
+        )
+        .unwrap();
+        action_add_relation(
+            &db,
+            &json!({
+                "source_id": "alice",
+                "target_id": "bob",
+                "relation_type": "knows"
+            }),
+        )
+        .unwrap();
+
+        let result = action_query(
+            &db,
+            &json!({"query": "relation:x' OR '1'='1", "max_results": 50}),
+        )
+        .unwrap();
+
+        assert_eq!(result["count"], 0);
     }
 
     #[test]
