@@ -31,6 +31,7 @@ pub mod memory_system;
 pub mod progress;
 pub mod prompt_skill_executor;
 pub mod response_cache;
+pub mod retrieval;
 pub mod runtime;
 pub mod session_memory;
 pub mod session_metrics;

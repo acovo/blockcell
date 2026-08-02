@@ -1,4 +1,7 @@
 use crate::auto_memory::MemoryInjector;
+use crate::retrieval::{
+    PromptBudgetAllocator, PromptSections, RetrievalOrchestrator, RetrievalSource,
+};
 use blockcell_core::types::ChatMessage;
 use blockcell_core::{Config, Paths};
 use blockcell_skills::manager::SkillSource;
@@ -85,6 +88,7 @@ pub struct ContextBuilder {
     skill_manager: Option<SkillManager>,
     ghost_learning_enabled: bool,
     memory_recall_enabled: bool,
+    prompt_budget: blockcell_core::config::PromptBudgetConfig,
     file_memory_snapshots: Mutex<HashMap<String, FrozenFileMemorySnapshot>>,
     memory_store: Option<MemoryStoreHandle>,
     /// Layer 5 记忆注入器 (7 层记忆系统)
@@ -111,23 +115,6 @@ impl FrozenFileMemorySnapshot {
     }
 }
 
-fn replace_prompt_section(mut prompt: String, header: &str, replacement: Option<&str>) -> String {
-    let Some(start) = prompt.find(header) else {
-        return prompt;
-    };
-    let body_start = start + header.len();
-    let next_section = prompt[body_start..]
-        .find("\n## ")
-        .map(|offset| body_start + offset + 1)
-        .unwrap_or(prompt.len());
-    let section = replacement
-        .filter(|content| !content.trim().is_empty())
-        .map(|content| format!("{}{}\n\n", header, content))
-        .unwrap_or_default();
-    prompt.replace_range(start..next_section, &section);
-    prompt
-}
-
 impl ContextBuilder {
     pub fn new(paths: Paths, config: Config) -> Self {
         let skills_dir = paths.skills_dir();
@@ -145,6 +132,7 @@ impl ContextBuilder {
             skill_manager: Some(skill_manager),
             ghost_learning_enabled: config.agents.ghost.learning.capture_enabled(),
             memory_recall_enabled: config.agents.ghost.learning.recall_enabled(),
+            prompt_budget: config.memory.prompt_budget.clone(),
             file_memory_snapshots: Mutex::new(HashMap::new()),
             memory_store: None,
             memory_injector: None,
@@ -393,10 +381,41 @@ impl ContextBuilder {
         tool_prompt_rules: &[String],
         session_key: Option<&str>,
     ) -> String {
+        self.build_system_prompt_inner(
+            mode,
+            active_skill,
+            disabled_skills,
+            disabled_tools,
+            _channel,
+            user_query,
+            available_tool_names,
+            tool_prompt_rules,
+            session_key,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_system_prompt_inner(
+        &self,
+        mode: InteractionMode,
+        active_skill: Option<&ActiveSkillContext>,
+        disabled_skills: &HashSet<String>,
+        disabled_tools: &HashSet<String>,
+        _channel: &str,
+        user_query: &str,
+        available_tool_names: &[String],
+        tool_prompt_rules: &[String],
+        session_key: Option<&str>,
+        memory_snapshot: Option<&FrozenFileMemorySnapshot>,
+    ) -> String {
         let mut prompt = String::new();
         let is_chat = matches!(mode, InteractionMode::Chat);
         let is_skill_mode = matches!(mode, InteractionMode::Skill);
         let is_general = matches!(mode, InteractionMode::General);
+        let mut user_profile_context = String::new();
+        let mut retrieved_context = String::new();
+        let mut active_skill_context = String::new();
 
         prompt.push_str("You are blockcell, an AI assistant with access to tools.\n\n");
 
@@ -410,20 +429,6 @@ impl ContextBuilder {
             prompt.push_str("## Personality\n");
             prompt.push_str(&content);
             prompt.push_str("\n\n");
-        }
-
-        if self.memory_recall_enabled {
-            if let Some(content) = self.load_file_if_exists(self.paths.user_md()) {
-                prompt.push_str("## User Preferences\n");
-                prompt.push_str(&content);
-                prompt.push_str("\n\n");
-            }
-
-            if let Some(content) = self.load_file_if_exists(self.paths.memory_md()) {
-                prompt.push_str("## Durable File Memory\n");
-                prompt.push_str(&content);
-                prompt.push_str("\n\n");
-            }
         }
 
         if self.ghost_learning_enabled && !is_chat {
@@ -500,59 +505,28 @@ impl ContextBuilder {
             self.paths.workspace().display()
         ));
 
-        if self.memory_recall_enabled && (is_skill_mode || is_general) {
-            if let Some(ref store) = self.memory_store {
-                let brief_result = if !user_query.is_empty() {
-                    match session_key {
-                        Some(session_key) => {
-                            store.generate_brief_for_query_in_session(session_key, user_query, 8)
-                        }
-                        None => store.generate_brief_for_query(user_query, 8),
-                    }
-                } else {
-                    match session_key {
-                        Some(session_key) => store.generate_brief_in_session(session_key, 5, 3),
-                        None => store.generate_brief(5, 3),
-                    }
-                };
-                match brief_result {
-                    Ok(brief) if !brief.is_empty() => {
-                        prompt.push_str("## Memory Brief (SQLite FTS5 Search)\n");
-                        prompt.push_str("> 以下是通过语义搜索检索的相关记忆：\n\n");
-                        prompt.push_str(&brief);
-                        prompt.push_str("\n\n");
-                    }
-                    _ => {}
-                }
-            } else {
-                let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                if let Some(content) = self.load_file_if_exists(self.paths.daily_memory(&today)) {
-                    prompt.push_str("## Today's Notes (Legacy File)\n");
-                    prompt.push_str(&content);
-                    prompt.push_str("\n\n");
-                }
-            }
-        }
-
-        // Layer 5: 注入持久化记忆 (7 层记忆系统)
-        // 在 SQLite 记忆之后注入，提供更深层的上下文
-        if self.memory_recall_enabled {
-            if let Some(ref injector) = self.memory_injector {
-                let injection = injector.build_injection_content();
-                if !injection.is_empty() {
-                    prompt.push_str(&injection);
-
-                    // 记录 Layer 5 injection_completed 事件
-                    let (user, project, feedback, reference) = injector.memory_counts();
-                    crate::memory_event!(
-                        layer5,
-                        injection_completed,
-                        user,
-                        project,
-                        feedback,
-                        reference
-                    );
-                }
+        if self.memory_recall_enabled && (is_skill_mode || is_general) && !user_query.is_empty() {
+            let skill_summary = self
+                .skill_index_summary
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            let snapshot = memory_snapshot
+                .map(|snapshot| (snapshot.user.as_deref(), snapshot.memory.as_deref()));
+            if let Ok(items) = RetrievalOrchestrator::retrieve_with_snapshot(
+                &self.paths,
+                self.memory_store.as_ref(),
+                session_key,
+                user_query,
+                skill_summary.as_deref(),
+                snapshot,
+                20,
+            ) {
+                let (profile, retrieved): (Vec<_>, Vec<_>) = items
+                    .into_iter()
+                    .partition(|item| item.source == RetrievalSource::UserProfile);
+                user_profile_context = RetrievalOrchestrator::render(&profile);
+                retrieved_context = RetrievalOrchestrator::render(&retrieved);
             }
         }
 
@@ -597,18 +571,18 @@ impl ContextBuilder {
         }
 
         if let Some(skill) = active_skill {
-            prompt.push_str(&format!("## Active Skill: {}\n", skill.name));
+            active_skill_context.push_str(&format!("## Active Skill: {}\n", skill.name));
             if skill.inject_prompt_md {
-                prompt.push_str("The user's input matches this installed skill. Follow the skill's instructions below. Prefer the skill's scoped tools and avoid unrelated tools.\n\n");
-                prompt.push_str(&skill.prompt_md);
-                prompt.push_str("\n\n");
+                active_skill_context.push_str("The user's input matches this installed skill. Follow the skill's instructions below. Prefer the skill's scoped tools and avoid unrelated tools.\n\n");
+                active_skill_context.push_str(&skill.prompt_md);
+                active_skill_context.push_str("\n\n");
             } else {
-                prompt.push_str("The user's input matches this installed skill. Use the skill's scoped tools and avoid unrelated tools.\n\n");
+                active_skill_context.push_str("The user's input matches this installed skill. Use the skill's scoped tools and avoid unrelated tools.\n\n");
             }
             if let Some(fallback_message) = &skill.fallback_message {
-                prompt.push_str("## Skill Fallback\n");
-                prompt.push_str(fallback_message);
-                prompt.push_str("\n\n");
+                active_skill_context.push_str("## Skill Fallback\n");
+                active_skill_context.push_str(fallback_message);
+                active_skill_context.push_str("\n\n");
             }
         }
 
@@ -629,20 +603,13 @@ impl ContextBuilder {
             prompt.push('\n');
         }
 
-        // 注入 Skill 索引摘要 (可用 Skill 列表)
-        if let Some(ref summary) = *self
-            .skill_index_summary
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-        {
-            if !summary.is_empty() {
-                prompt.push_str("\n## Available Skills\n");
-                prompt.push_str(summary);
-                prompt.push('\n');
-            }
-        }
-
-        prompt
+        PromptBudgetAllocator::new(self.prompt_budget.clone()).assemble(PromptSections {
+            rules: prompt,
+            user_profile: user_profile_context,
+            retrieved: retrieved_context,
+            active_skill: active_skill_context,
+            session_recovery: String::new(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -659,22 +626,7 @@ impl ContextBuilder {
         memory_snapshot: Option<&FrozenFileMemorySnapshot>,
         session_key: Option<&str>,
     ) -> String {
-        if memory_snapshot.is_none() {
-            return self.build_system_prompt_for_mode_with_channel_and_session(
-                mode,
-                active_skill,
-                disabled_skills,
-                disabled_tools,
-                channel,
-                user_query,
-                available_tool_names,
-                tool_prompt_rules,
-                session_key,
-            );
-        }
-
-        let snapshot = memory_snapshot.expect("checked above");
-        let mut prompt = self.build_system_prompt_for_mode_with_channel_and_session(
+        self.build_system_prompt_inner(
             mode,
             active_skill,
             disabled_skills,
@@ -684,13 +636,7 @@ impl ContextBuilder {
             available_tool_names,
             tool_prompt_rules,
             session_key,
-        );
-
-        prompt = replace_prompt_section(prompt, "## User Preferences\n", snapshot.user.as_deref());
-        replace_prompt_section(
-            prompt,
-            "## Durable File Memory\n",
-            snapshot.memory.as_deref(),
+            memory_snapshot,
         )
     }
 
@@ -1046,7 +992,11 @@ mod tests {
         fn upsert_json(&self, _params_json: Value) -> Result<Value> {
             Ok(json!({}))
         }
-        fn query_json(&self, _params_json: Value) -> Result<Value> {
+        fn query_json(&self, params_json: Value) -> Result<Value> {
+            *self.seen_session.lock().unwrap() = params_json
+                .get("session_key")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
             Ok(json!([]))
         }
         fn soft_delete(&self, _id: &str) -> Result<bool> {
@@ -1088,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_brief_receives_current_session_key() {
+    fn retrieval_receives_current_session_key() {
         let base = std::env::temp_dir().join(format!(
             "blockcell-context-session-memory-test-{}",
             uuid::Uuid::new_v4()
@@ -1357,8 +1307,72 @@ description: deploy demo
             &[],
         );
 
-        assert!(prompt.contains("## Durable File Memory"));
+        assert!(prompt.contains("<retrieved-context>"));
+        assert!(prompt.contains("[knowledge]"));
         assert!(prompt.contains("release verification starts with rollback planning"));
+    }
+
+    #[test]
+    fn retrieved_context_is_single_source_tagged_and_deduplicated() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-context-retrieval-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        let fact = "User prefers concise replies for code changes.";
+        std::fs::write(paths.user_md(), fact).expect("write user md");
+        std::fs::write(paths.memory_md(), fact).expect("write memory md");
+        let mut config = Config::default();
+        config.agents.ghost.learning.recall_enabled = Some(true);
+        let builder = ContextBuilder::new(paths, config);
+
+        let prompt = builder.build_system_prompt_for_mode_with_channel(
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "concise code replies",
+            &[],
+            &[],
+        );
+
+        assert!(prompt.contains("<retrieved-context>"));
+        assert!(prompt.contains("[user-profile]"));
+        assert_eq!(prompt.matches(fact).count(), 1);
+        assert!(!prompt.contains("## Durable File Memory"));
+        assert!(!prompt.contains("## Memory Brief (SQLite FTS5 Search)"));
+    }
+
+    #[test]
+    fn configured_prompt_total_caps_complete_system_prompt() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-context-budget-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        let oversized = "必须遵守这条很长的规则。".repeat(8_000);
+        std::fs::write(paths.agents_md(), &oversized).expect("write agents md");
+        std::fs::write(paths.soul_md(), &oversized).expect("write soul md");
+        let mut config = Config::default();
+        config.memory.prompt_budget.total = 8_000;
+        config.memory.prompt_budget.rules = 8_000;
+        let builder = ContextBuilder::new(paths, config);
+
+        let prompt = builder.build_system_prompt_for_mode_with_channel(
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "budget",
+            &[],
+            &[],
+        );
+
+        assert!(crate::token::estimate_tokens(&prompt) <= 8_000);
     }
 
     #[test]
@@ -1402,7 +1416,7 @@ description: deploy demo
         let first = builder.build_messages_for_session_mode_with_channel(
             "session-a",
             &[],
-            "hello",
+            "durable memory",
             &[],
             InteractionMode::General,
             None,
@@ -1417,7 +1431,7 @@ description: deploy demo
         let same_session = builder.build_messages_for_session_mode_with_channel(
             "session-a",
             &[],
-            "hello again",
+            "durable memory",
             &[],
             InteractionMode::General,
             None,
@@ -1431,7 +1445,7 @@ description: deploy demo
         let next_session = builder.build_messages_for_session_mode_with_channel(
             "session-b",
             &[],
-            "new session",
+            "durable memory",
             &[],
             InteractionMode::General,
             None,

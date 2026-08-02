@@ -660,6 +660,62 @@ impl MemorySystemConfig {
     }
 }
 
+/// Global system-prompt section budgets. Values are token ceilings and the
+/// allocator also enforces `total` across all sections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptBudgetConfig {
+    #[serde(default = "default_prompt_total")]
+    pub total: usize,
+    #[serde(default = "default_prompt_rules")]
+    pub rules: usize,
+    #[serde(default = "default_prompt_user_profile")]
+    pub user_profile: usize,
+    #[serde(default = "default_prompt_retrieved")]
+    pub retrieved: usize,
+    #[serde(default = "default_prompt_active_skill")]
+    pub active_skill: usize,
+    #[serde(default = "default_prompt_session_recovery")]
+    pub session_recovery: usize,
+}
+
+fn default_prompt_total() -> usize {
+    12_000
+}
+
+fn default_prompt_rules() -> usize {
+    2_000
+}
+
+fn default_prompt_user_profile() -> usize {
+    800
+}
+
+fn default_prompt_retrieved() -> usize {
+    3_000
+}
+
+fn default_prompt_active_skill() -> usize {
+    4_000
+}
+
+fn default_prompt_session_recovery() -> usize {
+    2_000
+}
+
+impl Default for PromptBudgetConfig {
+    fn default() -> Self {
+        Self {
+            total: default_prompt_total(),
+            rules: default_prompt_rules(),
+            user_profile: default_prompt_user_profile(),
+            retrieved: default_prompt_retrieved(),
+            active_skill: default_prompt_active_skill(),
+            session_recovery: default_prompt_session_recovery(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryConfig {
@@ -668,6 +724,9 @@ pub struct MemoryConfig {
     /// 7 层记忆系统阈值配置
     #[serde(default)]
     pub memory_system: MemorySystemConfig,
+    /// Global prompt allocation for fixed rules and retrieved context.
+    #[serde(default)]
+    pub prompt_budget: PromptBudgetConfig,
 }
 
 /// Self-Improve 配置 — Nudge + Review 子系统
