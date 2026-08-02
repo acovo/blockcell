@@ -381,47 +381,35 @@ impl super::AgentRuntime {
     }
 
     /// Initialize and load Layer 5 memory injector (7-layer memory system).
-    /// This loads the four memory files (user.md, project.md, feedback.md, reference.md)
-    /// from the memory directory and makes them available for system prompt injection.
+    /// This consolidates legacy Layer 5 files and loads only USER.md and MEMORY.md.
     pub async fn init_memory_injector(&mut self) -> std::io::Result<()> {
-        use crate::auto_memory::{
-            ensure_memory_dir, get_memory_dir, InjectionConfig, MemoryInjector,
-        };
+        use crate::auto_memory::{consolidate_legacy_layer5, InjectionConfig, MemoryInjector};
 
-        // Ensure the memory directory and template files exist on disk
-        // before loading. On a fresh install the directory is absent,
-        // which would cause the permission gate (is_auto_mem_path) to
-        // deny writes and the forked agent to fail silently.
-        match ensure_memory_dir(&self.paths.base).await {
-            Ok(()) => {
-                info!(path = %self.paths.base.display(), "[layer5] Memory directory ensured on disk");
-            }
-            Err(e) => {
-                warn!(path = %self.paths.base.display(), error = %e, "[layer5] Failed to ensure memory directory");
-            }
+        if let Err(error) = consolidate_legacy_layer5(&self.paths) {
+            warn!(
+                error = %error,
+                "[Layer 5] Failed to consolidate legacy memory files"
+            );
         }
 
-        // Use the config base directory (e.g., ~/.blockcell/memory/)
-        let memory_dir = get_memory_dir(&self.paths.base);
         let mut injector = MemoryInjector::new(InjectionConfig::from(
             self.config.memory.memory_system.layer5.clone(),
         ));
 
-        // Try to load memory files; log warning if directory doesn't exist
-        match injector.load_memories(&memory_dir).await {
+        match injector.load_canonical(&self.paths).await {
             Ok(()) => {
                 let count = injector.cache_size();
                 if count > 0 {
                     info!(
-                        memory_dir = %memory_dir.display(),
+                        workspace = %self.paths.workspace().display(),
                         files_loaded = count,
-                        "[Layer 5] Memory injector initialized with {} memory files",
+                        "[Layer 5] Canonical memory injector initialized with {} sections",
                         count
                     );
                 } else {
                     debug!(
-                        memory_dir = %memory_dir.display(),
-                        "[Layer 5] Memory injector initialized (no memory files found)"
+                        workspace = %self.paths.workspace().display(),
+                        "[Layer 5] Canonical memory injector initialized (no memory found)"
                     );
                 }
                 self.context_builder.set_memory_injector(injector);
@@ -429,9 +417,9 @@ impl super::AgentRuntime {
             Err(e) => {
                 // Non-fatal: memory injection is optional enhancement
                 warn!(
-                    memory_dir = %memory_dir.display(),
+                    workspace = %self.paths.workspace().display(),
                     error = %e,
-                    "[Layer 5] Failed to load memory files, continuing without persistent memory injection"
+                    "[Layer 5] Failed to load canonical memory, continuing without persistent memory injection"
                 );
             }
         }
@@ -458,19 +446,21 @@ impl super::AgentRuntime {
             return Ok(());
         }
 
-        use crate::auto_memory::{get_memory_dir, InjectionConfig, MemoryInjector};
+        use crate::auto_memory::{consolidate_legacy_layer5, InjectionConfig, MemoryInjector};
 
-        let memory_dir = get_memory_dir(&self.paths.base);
+        if let Err(error) = consolidate_legacy_layer5(&self.paths) {
+            warn!(error = %error, "[Layer 5] Failed to consolidate legacy memory during reload");
+        }
         let mut injector = MemoryInjector::new(InjectionConfig::from(
             self.config.memory.memory_system.layer5.clone(),
         ));
-        injector.load_memories(&memory_dir).await?;
+        injector.load_canonical(&self.paths).await?;
 
         let count = injector.cache_size();
         info!(
-            memory_dir = %memory_dir.display(),
+            workspace = %self.paths.workspace().display(),
             files_loaded = count,
-            "[Layer 5] Memory injector cache reloaded after extraction"
+            "[Layer 5] Canonical memory injector cache reloaded after extraction"
         );
 
         self.context_builder.set_memory_injector(injector);

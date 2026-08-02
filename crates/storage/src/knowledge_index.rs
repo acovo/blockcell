@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -167,31 +168,64 @@ impl KnowledgeIndex {
         let mut stmt = conn
             .prepare(
                 "SELECT e.id, e.file, e.anchor, e.content, e.content_hash,
-                        e.scope, e.source, e.updated_at, e.supersedes
+                        e.scope, e.source, e.updated_at, e.supersedes,
+                        bm25(knowledge_fts) AS relevance
                  FROM knowledge_entries e
                  JOIN knowledge_fts f ON f.rowid = e.rowid
                  WHERE knowledge_fts MATCH ?1
-                 ORDER BY bm25(knowledge_fts) ASC
+                 ORDER BY relevance ASC
                  LIMIT ?2",
             )
             .map_err(map_sqlite_error)?;
         let rows = stmt
-            .query_map(params![fts_query, limit.min(100) as i64], |row| {
-                Ok(KnowledgeIndexEntry {
-                    id: row.get(0)?,
-                    file: row.get(1)?,
-                    anchor: row.get(2)?,
-                    content: row.get(3)?,
-                    content_hash: row.get(4)?,
-                    scope: row.get(5)?,
-                    source: row.get(6)?,
-                    updated_at: row.get(7)?,
-                    supersedes: row.get(8)?,
-                })
+            .query_map(params![fts_query, 500_i64], |row| {
+                Ok((
+                    KnowledgeIndexEntry {
+                        id: row.get(0)?,
+                        file: row.get(1)?,
+                        anchor: row.get(2)?,
+                        content: row.get(3)?,
+                        content_hash: row.get(4)?,
+                        scope: row.get(5)?,
+                        source: row.get(6)?,
+                        updated_at: row.get(7)?,
+                        supersedes: row.get(8)?,
+                    },
+                    row.get::<_, f64>(9)?,
+                ))
             })
             .map_err(map_sqlite_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(map_sqlite_error)
+        let candidates = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        let mut superseded = HashSet::new();
+        let mut superseded_stmt = conn
+            .prepare("SELECT supersedes FROM knowledge_entries WHERE supersedes IS NOT NULL")
+            .map_err(map_sqlite_error)?;
+        let superseded_rows = superseded_stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite_error)?;
+        for id in superseded_rows {
+            superseded.insert(id.map_err(map_sqlite_error)?);
+        }
+
+        let mut by_hash: HashMap<String, (KnowledgeIndexEntry, f64)> = HashMap::new();
+        for (entry, relevance) in candidates {
+            if superseded.contains(&entry.id) {
+                continue;
+            }
+            match by_hash.get(&entry.content_hash) {
+                Some(existing)
+                    if !entry_precedes((&entry, relevance), (&existing.0, existing.1)) => {}
+                _ => {
+                    by_hash.insert(entry.content_hash.clone(), (entry, relevance));
+                }
+            }
+        }
+        let mut results = by_hash.into_values().collect::<Vec<_>>();
+        results.sort_by(|left, right| compare_ranked_entries(right, left));
+        results.truncate(limit.min(100));
+        Ok(results.into_iter().map(|(entry, _)| entry).collect())
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -255,6 +289,31 @@ impl KnowledgeIndex {
     }
 }
 
+fn source_priority(source: &str) -> u8 {
+    match source {
+        "user_statement" => 3,
+        "verified" => 2,
+        "inferred" => 1,
+        _ => 0,
+    }
+}
+
+fn compare_ranked_entries(
+    left: &(KnowledgeIndexEntry, f64),
+    right: &(KnowledgeIndexEntry, f64),
+) -> Ordering {
+    source_priority(&left.0.source)
+        .cmp(&source_priority(&right.0.source))
+        .then_with(|| left.0.updated_at.cmp(&right.0.updated_at))
+        .then_with(|| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal))
+        .then_with(|| right.0.id.cmp(&left.0.id))
+}
+
+fn entry_precedes(left: (&KnowledgeIndexEntry, f64), right: (&KnowledgeIndexEntry, f64)) -> bool {
+    compare_ranked_entries(&(left.0.clone(), left.1), &(right.0.clone(), right.1))
+        == Ordering::Greater
+}
+
 fn parse_entries(file: &str, content: &str, default_scope: &str) -> Vec<KnowledgeIndexEntry> {
     let mut entries = Vec::new();
     let mut anchor = "root".to_string();
@@ -299,6 +358,7 @@ fn build_entry(file: &str, anchor: &str, raw: &str, default_scope: &str) -> Know
         }
         content = content[end + 1..].trim_start().to_string();
     }
+    content = strip_migration_provenance(&content).to_string();
     let content_hash = sha256_hex(content.as_bytes());
     let id = metadata.remove("id").unwrap_or_else(|| {
         format!(
@@ -327,6 +387,16 @@ fn build_entry(file: &str, anchor: &str, raw: &str, default_scope: &str) -> Know
             .unwrap_or_else(|| Utc::now().date_naive().to_string()),
         supersedes: metadata.remove("supersedes"),
     }
+}
+
+fn strip_migration_provenance(content: &str) -> &str {
+    let trimmed = content.trim();
+    if trimmed.ends_with("-->") {
+        if let Some(start) = trimmed.rfind("<!-- migrated-from:") {
+            return trimmed[..start].trim_end();
+        }
+    }
+    trimmed
 }
 
 fn slugify(value: &str) -> String {

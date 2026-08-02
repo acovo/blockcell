@@ -129,10 +129,32 @@ fn collect_file_memory_items(
 ) -> Result<Vec<FileMemoryRecallItem>> {
     let mut seen = HashSet::new();
     let mut items = Vec::new();
-    let mut sources = vec![
-        ("USER.md", paths.user_md()),
-        ("MEMORY.md", paths.memory_md()),
-    ];
+
+    let index = blockcell_storage::KnowledgeIndex::open(&paths.knowledge_index_db())?;
+    index.rebuild_from_files(paths)?;
+    for token in query_tokens {
+        for entry in index.search(token, 100)? {
+            if !seen.insert(format!("index:{}", entry.id)) {
+                continue;
+            }
+            let score = recall_score(&entry.content, query_tokens);
+            if score == 0 {
+                continue;
+            }
+            let source = if entry.file == "USER.md" {
+                "USER.md"
+            } else {
+                "MEMORY.md"
+            };
+            items.push(FileMemoryRecallItem {
+                source,
+                content: entry.content,
+                score,
+            });
+        }
+    }
+
+    let mut sources = Vec::new();
     if let Some(session_key) = session_key {
         let session_root = paths
             .memory_dir()
@@ -345,5 +367,34 @@ mod tests {
         assert!(other
             .iter()
             .any(|item| item.content.contains("signed artifacts")));
+    }
+
+    #[test]
+    fn ghost_recall_uses_knowledge_conflict_resolution() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-ghost-recall-conflict-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        std::fs::write(
+            paths.user_md(),
+            concat!(
+                "- [id:pref-old] [scope:user] [source:inferred] [updated:2026-07-01] User prefers detailed answers.\n",
+                "- [id:pref-new] [scope:user] [source:user_statement] [updated:2026-08-01] [supersedes:pref-old] User prefers concise answers.\n",
+                "- [id:pref-copy] [scope:user] [source:inferred] [updated:2026-07-15] User prefers concise answers.\n",
+            ),
+        )
+        .expect("write conflicts");
+
+        let concise = query_file_memory_recall_items(&paths, None, "concise answers", 10)
+            .expect("recall concise preference");
+        assert_eq!(concise.len(), 1);
+        assert!(concise[0].content.contains("concise answers"));
+        let detailed = query_file_memory_recall_items(&paths, None, "detailed answers", 10)
+            .expect("recall superseded preference");
+        assert!(detailed
+            .iter()
+            .all(|item| !item.content.contains("detailed answers")));
     }
 }

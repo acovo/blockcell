@@ -5,6 +5,7 @@
 
 use super::{MemoryType, DEFAULT_INJECTION_MAX_TOKENS};
 use crate::token::estimate_tokens;
+use blockcell_core::Paths;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -71,6 +72,24 @@ impl MemoryInjector {
     /// 使用默认配置创建注入器
     pub fn default_injector() -> Self {
         Self::new(InjectionConfig::default())
+    }
+
+    /// Load durable memory exclusively from USER.md and memory/MEMORY.md.
+    pub async fn load_canonical(&mut self, paths: &Paths) -> std::io::Result<()> {
+        self.cache.clear();
+        if let Some(user) = read_optional(&paths.user_md()).await? {
+            if !user.trim().is_empty() {
+                self.cache.insert(MemoryType::User, user);
+            }
+        }
+        if let Some(memory) = read_optional(&paths.memory_md()).await? {
+            for (memory_type, content) in split_canonical_memory(&memory) {
+                if !content.trim().is_empty() {
+                    self.cache.insert(memory_type, content);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 加载记忆文件
@@ -140,7 +159,7 @@ impl MemoryInjector {
             injection_block.push_str(&format!(
                 "## {} ({})\n\n{}\n\n",
                 memory.memory_type.description(),
-                memory.memory_type.filename(),
+                memory.memory_type.canonical_filename(),
                 memory.content
             ));
         }
@@ -165,7 +184,7 @@ impl MemoryInjector {
             injection_block.push_str(&format!(
                 "## {} ({})\n\n{}\n\n",
                 memory.memory_type.description(),
-                memory.memory_type.filename(),
+                memory.memory_type.canonical_filename(),
                 memory.content
             ));
         }
@@ -254,6 +273,38 @@ impl MemoryInjector {
         };
         (user, project, feedback, reference)
     }
+}
+
+async fn read_optional(path: &Path) -> std::io::Result<Option<String>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn split_canonical_memory(content: &str) -> HashMap<MemoryType, String> {
+    let mut sections = HashMap::new();
+    let mut current = MemoryType::Project;
+    for line in content.lines() {
+        current = match line.trim() {
+            "## Project" => MemoryType::Project,
+            "## Feedback" => MemoryType::Feedback,
+            "## Reference" => MemoryType::Reference,
+            _ => {
+                sections
+                    .entry(current)
+                    .or_insert_with(String::new)
+                    .push_str(line);
+                sections
+                    .entry(current)
+                    .or_insert_with(String::new)
+                    .push('\n');
+                current
+            }
+        };
+    }
+    sections
 }
 
 /// 截断内容到指定 token 数

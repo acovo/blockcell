@@ -2,7 +2,11 @@
 //!
 //! 四种持久化记忆类型及其存储路径。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use blockcell_core::{Paths, Result};
 
 /// 记忆类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -40,6 +44,14 @@ impl MemoryType {
             Self::Project => "project.md",
             Self::Feedback => "feedback.md",
             Self::Reference => "reference.md",
+        }
+    }
+
+    /// Canonical durable-memory file after Layer 5 source consolidation.
+    pub fn canonical_filename(&self) -> &'static str {
+        match self {
+            Self::User => "USER.md",
+            Self::Project | Self::Feedback | Self::Reference => "MEMORY.md",
         }
     }
 
@@ -202,9 +214,146 @@ pub async fn ensure_memory_dir(config_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Layer5ConsolidationResult {
+    pub migrated: usize,
+    pub legacy_files: usize,
+}
+
+/// Merge legacy Layer 5 files into the two canonical durable-memory files.
+///
+/// The operation is intentionally idempotent: normalized content already present
+/// in canonical files is skipped, and migrated legacy files are reset to their
+/// compatibility templates so durable facts no longer have two writable sources.
+pub fn consolidate_legacy_layer5(paths: &Paths) -> Result<Layer5ConsolidationResult> {
+    let index = Arc::new(blockcell_storage::KnowledgeIndex::open(
+        &paths.knowledge_index_db(),
+    )?);
+    index.rebuild_from_files(paths)?;
+    let mut store = crate::memory_file_store::MemoryFileStore::open(paths)?;
+    store.set_knowledge_index(index, "USER.md", "memory/MEMORY.md");
+
+    let mut canonical_text = format!(
+        "{}\n{}",
+        read_optional_text(&paths.user_md())?,
+        read_optional_text(&paths.memory_md())?
+    );
+    let mut seen = HashSet::new();
+    let mut result = Layer5ConsolidationResult::default();
+
+    for memory_type in MemoryType::all() {
+        let legacy_path = get_memory_file_path(&paths.base, memory_type);
+        let content = match std::fs::read_to_string(&legacy_path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let chunks = legacy_content_chunks(memory_type, &content);
+        if chunks.is_empty() {
+            continue;
+        }
+        result.legacy_files += 1;
+        tracing::warn!(
+            path = %legacy_path.display(),
+            canonical = memory_type.canonical_filename(),
+            "Legacy Layer 5 memory detected; consolidating into canonical memory"
+        );
+
+        let mut section_entries = Vec::new();
+        for chunk in chunks {
+            let normalized = normalize_content(&chunk);
+            if normalized.is_empty()
+                || !seen.insert(normalized.clone())
+                || normalize_content(&canonical_text).contains(&normalized)
+            {
+                continue;
+            }
+            let hash = blockcell_core::stable_hash_session_key(&normalized);
+            let scope = if memory_type == MemoryType::User {
+                "user"
+            } else {
+                "workspace"
+            };
+            let updated = chrono::Utc::now().format("%Y-%m-%d");
+            let entry = format!(
+                "- [id:layer5-{hash}] [scope:{scope}] [source:inferred] [updated:{updated}] {chunk} <!-- migrated-from:memory/{} -->",
+                memory_type.filename()
+            );
+            if memory_type == MemoryType::User {
+                store.add(crate::memory_file_store::MemoryFileTarget::User, &entry)?;
+                canonical_text.push_str(&format!("\n{entry}\n"));
+            } else {
+                section_entries.push(entry);
+            }
+            result.migrated += 1;
+        }
+        if !section_entries.is_empty() {
+            let block = format!(
+                "## {}\n\n{}",
+                category_heading(memory_type),
+                section_entries.join("\n")
+            );
+            store.add(crate::memory_file_store::MemoryFileTarget::Memory, &block)?;
+            canonical_text.push_str(&format!("\n{block}\n"));
+        }
+        crate::fs_util::atomic_write(&legacy_path, memory_type.template().as_bytes())?;
+    }
+
+    Ok(result)
+}
+
+fn read_optional_text(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn category_heading(memory_type: MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::User => "User",
+        MemoryType::Project => "Project",
+        MemoryType::Feedback => "Feedback",
+        MemoryType::Reference => "Reference",
+    }
+}
+
+fn normalize_content(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn legacy_content_chunks(memory_type: MemoryType, content: &str) -> Vec<String> {
+    if content.trim().is_empty() || content.trim() == memory_type.template().trim() {
+        return Vec::new();
+    }
+    let template_lines = memory_type
+        .template()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<HashSet<_>>();
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !template_lines.contains(line))
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| *line != "---")
+        .map(|line| {
+            line.trim_start_matches('-')
+                .trim_start_matches('*')
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blockcell_core::Paths;
 
     #[test]
     fn test_memory_type_all() {
@@ -236,5 +385,91 @@ mod tests {
             assert!(template.contains("---")); // YAML frontmatter
             assert!(template.contains("# ")); // Markdown header
         }
+    }
+
+    #[tokio::test]
+    async fn layer5_legacy_files_consolidate_once_and_injector_reads_only_canonical_files() {
+        let paths = Paths::with_base(std::env::temp_dir().join(format!(
+            "blockcell-layer5-consolidation-{}",
+            uuid::Uuid::new_v4()
+        )));
+        paths.ensure_dirs().expect("ensure paths");
+        let legacy_dir = paths.base.join("memory");
+        std::fs::create_dir_all(&legacy_dir).expect("create legacy memory dir");
+        std::fs::write(paths.user_md(), "Existing canonical preference.\n").expect("seed USER.md");
+        std::fs::write(
+            paths.memory_md(),
+            "## Feedback\n\nExisting canonical feedback.\n",
+        )
+        .expect("seed MEMORY.md");
+        std::fs::write(
+            legacy_dir.join("user.md"),
+            "Existing canonical preference.\nLegacy user preference.\n",
+        )
+        .expect("write legacy user");
+        std::fs::write(
+            legacy_dir.join("project.md"),
+            "Project uses canary deploys.\n",
+        )
+        .expect("write legacy project");
+        std::fs::write(
+            legacy_dir.join("feedback.md"),
+            "Always report verification results.\n",
+        )
+        .expect("write legacy feedback");
+        std::fs::write(
+            legacy_dir.join("reference.md"),
+            "Runbook is docs/runbook.md.\n",
+        )
+        .expect("write legacy reference");
+
+        let first = consolidate_legacy_layer5(&paths).expect("first consolidation");
+        assert_eq!(
+            std::fs::read_to_string(legacy_dir.join("project.md"))
+                .expect("read retired legacy project"),
+            MemoryType::Project.template()
+        );
+        let second = consolidate_legacy_layer5(&paths).expect("second consolidation");
+
+        assert_eq!(first.migrated, 4);
+        assert_eq!(second.migrated, 0);
+        let user = std::fs::read_to_string(paths.user_md()).expect("read USER.md");
+        assert_eq!(user.matches("Existing canonical preference.").count(), 1);
+        assert_eq!(user.matches("Legacy user preference.").count(), 1);
+        let memory = std::fs::read_to_string(paths.memory_md()).expect("read MEMORY.md");
+        assert!(memory.contains("## Project"));
+        assert!(memory.contains("## Feedback"));
+        assert!(memory.contains("## Reference"));
+        assert_eq!(memory.matches("Project uses canary deploys.").count(), 1);
+        assert_eq!(
+            memory
+                .matches("Always report verification results.")
+                .count(),
+            1
+        );
+        assert_eq!(memory.matches("Runbook is docs/runbook.md.").count(), 1);
+
+        std::fs::write(
+            legacy_dir.join("project.md"),
+            "Legacy file changed after consolidation.\n",
+        )
+        .expect("change legacy file");
+        let mut injector = crate::auto_memory::MemoryInjector::default_injector();
+        injector
+            .load_canonical(&paths)
+            .await
+            .expect("load canonical memory");
+        let injected = injector.build_injection_content();
+        assert!(injected.contains("Legacy user preference."));
+        assert!(injected.contains("Project uses canary deploys."));
+        assert!(!injected.contains("Legacy file changed after consolidation."));
+        assert!(injector
+            .get_memory(MemoryType::Project)
+            .expect("project section")
+            .contains("Project uses canary deploys."));
+        assert!(injector
+            .get_memory(MemoryType::Feedback)
+            .expect("feedback section")
+            .contains("Always report verification results."));
     }
 }

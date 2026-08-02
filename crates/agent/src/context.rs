@@ -1129,23 +1129,17 @@ mod tests {
         ));
         let paths = Paths::with_base(base);
         paths.ensure_dirs().expect("ensure dirs");
-        crate::auto_memory::ensure_memory_dir(&paths.base)
-            .await
-            .expect("ensure layer5 memory");
         std::fs::write(
-            crate::auto_memory::get_memory_file_path(
-                &paths.base,
-                crate::auto_memory::MemoryType::Project,
-            ),
-            "Shadow Layer5 project memory.",
+            paths.memory_md(),
+            "## Project\n\nShadow Layer5 project memory.",
         )
-        .expect("write layer5 project memory");
+        .expect("write canonical project memory");
 
         let mut injector = crate::auto_memory::MemoryInjector::default_injector();
         injector
-            .load_memories(&crate::auto_memory::get_memory_dir(&paths.base))
+            .load_canonical(&paths)
             .await
-            .expect("load layer5 memories");
+            .expect("load canonical memories");
 
         let mut builder = ContextBuilder::new(paths, Config::default());
         builder.set_memory_store(Arc::new(BriefMemoryStore));

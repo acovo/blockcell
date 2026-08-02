@@ -26,7 +26,10 @@ pub use extractor::{
     AutoMemoryExtractor, ExtractionParams, ExtractionResult,
 };
 pub use injector::{format_memory_for_context, InjectedMemory, InjectionConfig, MemoryInjector};
-pub use memory_type::{ensure_memory_dir, get_memory_file_path, MemoryType, MEMORY_FILE_NAMES};
+pub use memory_type::{
+    consolidate_legacy_layer5, ensure_memory_dir, get_memory_file_path, Layer5ConsolidationResult,
+    MemoryType, MEMORY_FILE_NAMES,
+};
 
 /// 记忆提取配置 — 仅用作 AutoMemoryConfig::default() 和
 /// should_extract_auto_memory() 的回退值，

@@ -125,3 +125,31 @@ fn legacy_long_term_rows_can_be_listed_and_retired_for_file_migration() {
         .expect("list after retirement")
         .is_empty());
 }
+
+#[test]
+fn knowledge_index_conflict_prefers_active_explicit_newer_entry() {
+    let paths = test_paths("conflict");
+    paths.ensure_dirs().expect("ensure paths");
+    std::fs::write(
+        paths.user_md(),
+        concat!(
+            "- [id:pref-old] [scope:user] [source:inferred] [updated:2026-07-01] 用户偏好详细回答\n",
+            "- [id:pref-new] [scope:user] [source:user_statement] [updated:2026-08-01] [supersedes:pref-old] 用户偏好简洁回答\n",
+            "- [id:pref-duplicate] [scope:user] [source:inferred] [updated:2026-07-15] 用户偏好简洁回答 <!-- migrated-from:memory/user.md -->\n",
+        ),
+    )
+    .expect("write conflicting entries");
+
+    let index = KnowledgeIndex::open(&paths.knowledge_index_db()).expect("open index");
+    index.rebuild_from_files(&paths).expect("rebuild index");
+    let hits = index
+        .search("用户偏好简洁回答", 10)
+        .expect("search duplicate preference");
+
+    assert_eq!(hits.len(), 1, "duplicate content should collapse");
+    assert_eq!(hits[0].id, "pref-new");
+    assert!(index
+        .search("用户偏好详细回答", 10)
+        .expect("search superseded preference")
+        .is_empty());
+}
