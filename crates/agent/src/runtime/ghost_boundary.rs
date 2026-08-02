@@ -6,7 +6,7 @@ pub(crate) fn persist_ghost_learning_boundary_with_config(
     boundary: GhostLearningBoundary,
     sources: Vec<GhostEpisodeSource>,
 ) -> Result<Option<String>> {
-    if !config.agents.ghost.learning.enabled {
+    if !config.agents.ghost.learning.capture_enabled() {
         return Ok(None);
     }
 
@@ -22,7 +22,7 @@ pub(crate) fn persist_ghost_learning_boundary_with_decision(
     sources: Vec<GhostEpisodeSource>,
     decision: LearningDecision,
 ) -> Result<Option<String>> {
-    if !config.agents.ghost.learning.enabled {
+    if !config.agents.ghost.learning.capture_enabled() {
         return Ok(None);
     }
 

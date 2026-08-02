@@ -84,6 +84,7 @@ pub struct ContextBuilder {
     paths: Paths,
     skill_manager: Option<SkillManager>,
     ghost_learning_enabled: bool,
+    memory_recall_enabled: bool,
     file_memory_snapshots: Mutex<HashMap<String, FrozenFileMemorySnapshot>>,
     memory_store: Option<MemoryStoreHandle>,
     /// Layer 5 记忆注入器 (7 层记忆系统)
@@ -142,7 +143,8 @@ impl ContextBuilder {
         Self {
             paths,
             skill_manager: Some(skill_manager),
-            ghost_learning_enabled: config.agents.ghost.learning.enabled,
+            ghost_learning_enabled: config.agents.ghost.learning.capture_enabled(),
+            memory_recall_enabled: config.agents.ghost.learning.recall_enabled(),
             file_memory_snapshots: Mutex::new(HashMap::new()),
             memory_store: None,
             memory_injector: None,
@@ -410,16 +412,18 @@ impl ContextBuilder {
             prompt.push_str("\n\n");
         }
 
-        if let Some(content) = self.load_file_if_exists(self.paths.user_md()) {
-            prompt.push_str("## User Preferences\n");
-            prompt.push_str(&content);
-            prompt.push_str("\n\n");
-        }
+        if self.memory_recall_enabled {
+            if let Some(content) = self.load_file_if_exists(self.paths.user_md()) {
+                prompt.push_str("## User Preferences\n");
+                prompt.push_str(&content);
+                prompt.push_str("\n\n");
+            }
 
-        if let Some(content) = self.load_file_if_exists(self.paths.memory_md()) {
-            prompt.push_str("## Durable File Memory\n");
-            prompt.push_str(&content);
-            prompt.push_str("\n\n");
+            if let Some(content) = self.load_file_if_exists(self.paths.memory_md()) {
+                prompt.push_str("## Durable File Memory\n");
+                prompt.push_str(&content);
+                prompt.push_str("\n\n");
+            }
         }
 
         if self.ghost_learning_enabled && !is_chat {
@@ -496,7 +500,7 @@ impl ContextBuilder {
             self.paths.workspace().display()
         ));
 
-        if is_skill_mode || is_general {
+        if self.memory_recall_enabled && (is_skill_mode || is_general) {
             if let Some(ref store) = self.memory_store {
                 let brief_result = if !user_query.is_empty() {
                     match session_key {
@@ -532,21 +536,23 @@ impl ContextBuilder {
 
         // Layer 5: 注入持久化记忆 (7 层记忆系统)
         // 在 SQLite 记忆之后注入，提供更深层的上下文
-        if let Some(ref injector) = self.memory_injector {
-            let injection = injector.build_injection_content();
-            if !injection.is_empty() {
-                prompt.push_str(&injection);
+        if self.memory_recall_enabled {
+            if let Some(ref injector) = self.memory_injector {
+                let injection = injector.build_injection_content();
+                if !injection.is_empty() {
+                    prompt.push_str(&injection);
 
-                // 记录 Layer 5 injection_completed 事件
-                let (user, project, feedback, reference) = injector.memory_counts();
-                crate::memory_event!(
-                    layer5,
-                    injection_completed,
-                    user,
-                    project,
-                    feedback,
-                    reference
-                );
+                    // 记录 Layer 5 injection_completed 事件
+                    let (user, project, feedback, reference) = injector.memory_counts();
+                    crate::memory_event!(
+                        layer5,
+                        injection_completed,
+                        user,
+                        project,
+                        feedback,
+                        reference
+                    );
+                }
             }
         }
 
@@ -998,6 +1004,44 @@ mod tests {
         seen_session: std::sync::Mutex<Option<String>>,
     }
 
+    struct BriefMemoryStore;
+
+    impl blockcell_tools::MemoryStoreOps for BriefMemoryStore {
+        fn upsert_json(&self, _params_json: Value) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn query_json(&self, _params_json: Value) -> Result<Value> {
+            Ok(json!([]))
+        }
+        fn soft_delete(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn batch_soft_delete_json(&self, _params_json: Value) -> Result<usize> {
+            Ok(0)
+        }
+        fn restore(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn stats_json(&self) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn generate_brief(&self, _long_term_max: usize, _short_term_max: usize) -> Result<String> {
+            Ok("Shadow SQLite memory brief.".to_string())
+        }
+        fn generate_brief_for_query(&self, _query: &str, _max_items: usize) -> Result<String> {
+            Ok("Shadow SQLite memory brief.".to_string())
+        }
+        fn upsert_session_summary(&self, _session_key: &str, _summary: &str) -> Result<()> {
+            Ok(())
+        }
+        fn get_session_summary(&self, _session_key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn maintenance(&self, _recycle_days: i64) -> Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+    }
+
     impl blockcell_tools::MemoryStoreOps for SessionCapturingMemoryStore {
         fn upsert_json(&self, _params_json: Value) -> Result<Value> {
             Ok(json!({}))
@@ -1054,7 +1098,9 @@ mod tests {
         let store = Arc::new(SessionCapturingMemoryStore {
             seen_session: std::sync::Mutex::new(None),
         });
-        let mut builder = ContextBuilder::new(paths, Config::default());
+        let mut config = Config::default();
+        config.agents.ghost.learning.recall_enabled = Some(true);
+        let mut builder = ContextBuilder::new(paths, config);
         builder.set_memory_store(store.clone());
 
         builder.build_system_prompt_for_mode_with_channel_and_session(
@@ -1073,6 +1119,50 @@ mod tests {
             store.seen_session.lock().unwrap().as_deref(),
             Some("ws:account:3:opschat-a")
         );
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_excludes_sqlite_brief_and_layer5_memory_from_prompt() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-context-shadow-all-memory-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        crate::auto_memory::ensure_memory_dir(&paths.base)
+            .await
+            .expect("ensure layer5 memory");
+        std::fs::write(
+            crate::auto_memory::get_memory_file_path(
+                &paths.base,
+                crate::auto_memory::MemoryType::Project,
+            ),
+            "Shadow Layer5 project memory.",
+        )
+        .expect("write layer5 project memory");
+
+        let mut injector = crate::auto_memory::MemoryInjector::default_injector();
+        injector
+            .load_memories(&crate::auto_memory::get_memory_dir(&paths.base))
+            .await
+            .expect("load layer5 memories");
+
+        let mut builder = ContextBuilder::new(paths, Config::default());
+        builder.set_memory_store(Arc::new(BriefMemoryStore));
+        builder.set_memory_injector(injector);
+        let prompt = builder.build_system_prompt_for_mode_with_channel(
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "shadow prompt",
+            &[],
+            &[],
+        );
+
+        assert!(!prompt.contains("Shadow SQLite memory brief."));
+        assert!(!prompt.contains("Shadow Layer5 project memory."));
     }
     use std::fs;
 
@@ -1247,7 +1337,7 @@ description: deploy demo
         assert!(!content.contains("/Users/apple/.blockcell/.env"));
     }
     #[test]
-    fn test_build_system_prompt_always_injects_file_memory() {
+    fn test_build_system_prompt_injects_file_memory_when_recall_enabled() {
         let base =
             std::env::temp_dir().join(format!("blockcell-context-test-{}", uuid::Uuid::new_v4()));
         let paths = Paths::with_base(base);
@@ -1257,7 +1347,9 @@ description: deploy demo
             "Project fact: release verification starts with rollback planning.",
         )
         .expect("write memory md");
-        let mut builder = ContextBuilder::new(paths, Config::default());
+        let mut config = Config::default();
+        config.agents.ghost.learning.recall_enabled = Some(true);
+        let mut builder = ContextBuilder::new(paths, config);
         builder.set_memory_store(Arc::new(EmptyMemoryStore));
 
         let prompt = builder.build_system_prompt_for_mode_with_channel(
@@ -1276,13 +1368,42 @@ description: deploy demo
     }
 
     #[test]
+    fn test_shadow_mode_excludes_durable_file_memory_from_prompt() {
+        let base =
+            std::env::temp_dir().join(format!("blockcell-context-test-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        std::fs::write(paths.user_md(), "Shadow user preference.").expect("write user md");
+        std::fs::write(paths.memory_md(), "Shadow durable project fact.").expect("write memory md");
+        let config = Config::default();
+        assert!(!config.agents.ghost.learning.recall_enabled());
+        let builder = ContextBuilder::new(paths, config);
+
+        let prompt = builder.build_system_prompt_for_mode_with_channel(
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "shadow prompt",
+            &[],
+            &[],
+        );
+
+        assert!(!prompt.contains("Shadow user preference."));
+        assert!(!prompt.contains("Shadow durable project fact."));
+    }
+
+    #[test]
     fn test_file_memory_prompt_snapshot_is_frozen_per_session() {
         let base =
             std::env::temp_dir().join(format!("blockcell-context-test-{}", uuid::Uuid::new_v4()));
         let paths = Paths::with_base(base);
         paths.ensure_dirs().expect("ensure dirs");
         std::fs::write(paths.memory_md(), "Initial durable memory.").expect("write memory md");
-        let builder = ContextBuilder::new(paths.clone(), Config::default());
+        let mut config = Config::default();
+        config.agents.ghost.learning.recall_enabled = Some(true);
+        let builder = ContextBuilder::new(paths.clone(), config);
 
         let first = builder.build_messages_for_session_mode_with_channel(
             "session-a",

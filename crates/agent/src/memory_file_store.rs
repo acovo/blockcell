@@ -74,6 +74,20 @@ impl MemoryFileStore {
         Self::open_at(root.join("USER.md"), root.join("MEMORY.md"), root)
     }
 
+    pub fn open_shadow(paths: &Paths) -> Result<Self> {
+        let root = paths.memory_dir().join("shadow");
+        Self::open_at(root.join("USER.md"), root.join("MEMORY.md"), root)
+    }
+
+    pub fn open_shadow_for_session(paths: &Paths, session_key: &str) -> Result<Self> {
+        let root = paths
+            .memory_dir()
+            .join("shadow")
+            .join("sessions")
+            .join(blockcell_core::stable_hash_session_key(session_key));
+        Self::open_at(root.join("USER.md"), root.join("MEMORY.md"), root)
+    }
+
     fn open_at(user_path: PathBuf, memory_path: PathBuf, state_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&state_dir)?;
         let snapshots_dir = state_dir.join(".snapshots");

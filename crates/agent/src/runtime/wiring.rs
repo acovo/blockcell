@@ -19,7 +19,7 @@ impl AgentRuntime {
                 );
             }
 
-            if !config.agents.ghost.learning.enabled {
+            if !config.agents.ghost.learning.capture_enabled() {
                 return;
             }
             let boundary = GhostLearningBoundary {
@@ -720,7 +720,11 @@ impl AgentRuntime {
     }
 
     pub fn init_memory_file_store(&mut self) -> Result<()> {
-        let mut store = MemoryFileStore::open(&self.paths)?;
+        let mut store = if self.config.agents.ghost.learning.write_enabled() {
+            MemoryFileStore::open(&self.paths)?
+        } else {
+            MemoryFileStore::open_shadow(&self.paths)?
+        };
         store.set_write_guard(Arc::clone(&self.write_guard));
         self.memory_file_store = Some(Arc::new(store));
         Ok(())

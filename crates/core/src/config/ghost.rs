@@ -7,10 +7,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GhostLearningConfig {
+    /// 旧版总开关。未配置 captureEnabled 时作为捕获开关的兼容来源。
     #[serde(default = "default_ghost_learning_enabled")]
     pub enabled: bool,
+    /// 旧版影子模式。新三开关未显式配置时等价于：捕获开启、写入影子目录、召回关闭。
     #[serde(default = "default_ghost_learning_shadow_mode")]
     pub shadow_mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_enabled: Option<bool>,
     #[serde(default = "default_ghost_turn_review_interval")]
     pub turn_review_interval: u32,
     #[serde(default = "default_ghost_method_tool_threshold")]
@@ -50,11 +58,31 @@ impl Default for GhostLearningConfig {
         Self {
             enabled: default_ghost_learning_enabled(),
             shadow_mode: default_ghost_learning_shadow_mode(),
+            capture_enabled: None,
+            write_enabled: None,
+            recall_enabled: None,
             turn_review_interval: default_ghost_turn_review_interval(),
             method_tool_threshold: default_ghost_method_tool_threshold(),
             recall_max_items: default_ghost_recall_max_items(),
             recall_token_budget: default_ghost_recall_token_budget(),
         }
+    }
+}
+
+impl GhostLearningConfig {
+    pub fn capture_enabled(&self) -> bool {
+        self.capture_enabled.unwrap_or(self.enabled)
+    }
+
+    /// true 表示写入正式知识文件；false 表示仅写入 shadow 命名空间。
+    pub fn write_enabled(&self) -> bool {
+        self.write_enabled
+            .unwrap_or(self.enabled && !self.shadow_mode)
+    }
+
+    pub fn recall_enabled(&self) -> bool {
+        self.recall_enabled
+            .unwrap_or(self.enabled && !self.shadow_mode)
     }
 }
 
@@ -102,5 +130,43 @@ impl Default for GhostConfig {
             auto_social: default_auto_social(),
             learning: GhostLearningConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_shadow_mode_maps_to_capture_without_write_or_recall() {
+        let config: GhostLearningConfig = json5::from_str(
+            r#"{
+                enabled: true,
+                shadowMode: true
+            }"#,
+        )
+        .unwrap();
+
+        assert!(config.capture_enabled());
+        assert!(!config.write_enabled());
+        assert!(!config.recall_enabled());
+    }
+
+    #[test]
+    fn explicit_learning_switches_override_legacy_shadow_mode() {
+        let config: GhostLearningConfig = json5::from_str(
+            r#"{
+                enabled: true,
+                shadowMode: true,
+                captureEnabled: false,
+                writeEnabled: true,
+                recallEnabled: true
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!config.capture_enabled());
+        assert!(config.write_enabled());
+        assert!(config.recall_enabled());
     }
 }

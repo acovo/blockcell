@@ -2230,7 +2230,7 @@ impl AgentRuntime {
             crate::response_cache::ResponseCacheConfig::from(&config.memory.memory_system.layer1);
 
         // Extract config values before config is moved into Self
-        let ghost_learning_enabled = config.agents.ghost.learning.enabled;
+        let ghost_learning_enabled = config.agents.ghost.learning.capture_enabled();
         let self_improve_review_enabled = config.self_improve.review.enabled;
         let ghost_learning_config = config.agents.ghost.learning.clone();
 
@@ -2343,7 +2343,7 @@ pub fn create_evolution_deploy_callback(
     config: &Config,
     paths: &Paths,
 ) -> Option<Arc<dyn Fn(&str) + Send + Sync>> {
-    if !config.agents.ghost.learning.enabled {
+    if !config.agents.ghost.learning.capture_enabled() {
         return None;
     }
 

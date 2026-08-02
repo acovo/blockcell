@@ -383,6 +383,9 @@ mod tests {
                 let config = GhostLearningConfig {
                     enabled: true,
                     shadow_mode: false,
+                    capture_enabled: None,
+                    write_enabled: None,
+                    recall_enabled: None,
                     turn_review_interval: i,
                     method_tool_threshold: i,
                     recall_max_items: 10,

@@ -7,8 +7,7 @@ use crate::token::estimate_tokens;
 const GHOST_RECALL_CHANNELS_DENYLIST: [&str; 4] = ["ghost", "cron", "system", "subagent"];
 
 pub(crate) fn should_inject_ghost_recall(config: &Config, msg: &InboundMessage) -> bool {
-    config.agents.ghost.learning.enabled
-        && !config.agents.ghost.learning.shadow_mode
+    config.agents.ghost.learning.recall_enabled()
         && config.agents.ghost.learning.recall_max_items > 0
         && !GHOST_RECALL_CHANNELS_DENYLIST.contains(&msg.channel.as_str())
 }

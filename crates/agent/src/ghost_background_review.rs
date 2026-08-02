@@ -469,12 +469,17 @@ async fn run_restricted_review_tool_loop(
     let mut stop_reason = "max_rounds".to_string();
 
     // Create stores once before the loop — avoids re-opening per tool call
-    let memory_file_store: blockcell_tools::MemoryFileStoreHandle =
-        Arc::new(if let Some(session_key) = snapshot.session_key.as_deref() {
-            MemoryFileStore::open_for_session(paths, session_key)?
-        } else {
-            MemoryFileStore::open(paths)?
-        });
+    let learning = &config.agents.ghost.learning;
+    let memory_file_store: blockcell_tools::MemoryFileStoreHandle = Arc::new(
+        match (learning.write_enabled(), snapshot.session_key.as_deref()) {
+            (true, Some(session_key)) => MemoryFileStore::open_for_session(paths, session_key)?,
+            (true, None) => MemoryFileStore::open(paths)?,
+            (false, Some(session_key)) => {
+                MemoryFileStore::open_shadow_for_session(paths, session_key)?
+            }
+            (false, None) => MemoryFileStore::open_shadow(paths)?,
+        },
+    );
     let skill_file_store: blockcell_tools::SkillFileStoreHandle =
         Arc::new(SkillFileStore::open(paths)?);
 
@@ -1230,12 +1235,18 @@ mod tests {
         );
 
         assert!(!paths.user_md().exists());
-        let user_memory = MemoryFileStore::open_for_session(&paths, "cli:ghost-review")
-            .expect("open scoped memory")
+        let normal_scoped = MemoryFileStore::open_for_session(&paths, "cli:ghost-review")
+            .expect("open normal scoped memory")
             .load_snapshot()
-            .expect("load scoped memory")
-            .user_block
-            .expect("scoped USER memory");
+            .expect("load normal scoped memory");
+        assert!(normal_scoped.user_block.is_none());
+        let shadow_user_path = paths
+            .memory_dir()
+            .join("shadow")
+            .join("sessions")
+            .join(blockcell_core::stable_hash_session_key("cli:ghost-review"))
+            .join("USER.md");
+        let user_memory = std::fs::read_to_string(shadow_user_path).expect("shadow USER memory");
         assert!(user_memory.contains("canary-first rollout"));
         assert!(!paths
             .skills_dir()
@@ -1315,12 +1326,14 @@ mod tests {
 
         assert_eq!(outcome.status, "completed");
         assert!(!paths.memory_md().exists());
-        let durable_memory = MemoryFileStore::open_for_session(&paths, "cli:ghost-review")
-            .expect("open scoped memory")
-            .load_snapshot()
-            .expect("load scoped memory")
-            .memory_block
-            .expect("scoped MEMORY memory");
+        let shadow_memory_path = paths
+            .memory_dir()
+            .join("shadow")
+            .join("sessions")
+            .join(blockcell_core::stable_hash_session_key("cli:ghost-review"))
+            .join("MEMORY.md");
+        let durable_memory =
+            std::fs::read_to_string(shadow_memory_path).expect("shadow MEMORY memory");
         assert!(durable_memory.contains("Check rollback order before release verification"));
         let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
         let run = ledger

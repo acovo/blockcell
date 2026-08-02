@@ -520,11 +520,11 @@ impl super::AgentRuntime {
     pub async fn mount_mcp_servers(&mut self) {}
 
     pub(super) fn ghost_learning_enabled(&self) -> bool {
-        self.config.agents.ghost.learning.enabled
+        self.config.agents.ghost.learning.capture_enabled()
     }
 
     pub(super) fn spawn_pending_ghost_background_reviews(&self) {
-        if self.config.agents.ghost.learning.enabled {
+        if self.config.agents.ghost.learning.capture_enabled() {
             spawn_pending_background_reviews(
                 self.paths.clone(),
                 Arc::clone(&self.provider_pool),
