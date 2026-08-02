@@ -212,10 +212,7 @@ impl AgentRuntime {
             .unwrap_or(2);
         let recent_messages = select_recent_messages(messages, keep_recent_messages);
 
-        // ========== 0. Memory Flush — 压缩前保存重要信息 ==========
-        self.flush_memory_store_before_compact(messages).await;
-
-        // ========== 0.5. Pre-Compact Hooks ==========
+        // ========== 0. Pre-Compact Hooks ==========
         // 允许注册的 hooks 在压缩前执行自定义逻辑（取消、延迟等）
         if let Some(ms) = self.memory_system.as_ref() {
             if ms.compact_hooks().has_pre_hooks() {

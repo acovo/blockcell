@@ -20,7 +20,7 @@ use blockcell_tools::{SessionSearchOps, ToolContext, ToolRegistry};
 use crate::ghost_learning::GhostEpisodeSnapshot;
 
 const GHOST_BACKGROUND_REVIEWER: &str = "embedded_ghost_background_review_v1";
-const REVIEW_TOOL_LOOP_MAX_ROUNDS: usize = 8;
+const REVIEW_TOOL_LOOP_MAX_ROUNDS: usize = 2;
 const REVIEW_ALLOWED_TOOLS: &[&str] = &["memory_manage", "session_search", "skill_view"];
 const REVIEW_LEASE_DURATION_SECS: i64 = 600;
 const REVIEW_HEARTBEAT_INTERVAL_SECS: u64 = 180;
@@ -113,6 +113,11 @@ async fn run_background_review_for_episode_with_lease_abort(
     };
     let metrics = crate::ghost_metrics::get_ghost_metrics(paths);
     metrics.record_review_started();
+    let requested_outputs = episode
+        .metadata
+        .get("requestedOutputs")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     let snapshot: GhostEpisodeSnapshot = match serde_json::from_value(episode.metadata.clone()) {
         Ok(s) => s,
         Err(err) => {
@@ -177,8 +182,15 @@ async fn run_background_review_for_episode_with_lease_abort(
                         "mode": "restricted_tool_loop",
                         "maxRounds": REVIEW_TOOL_LOOP_MAX_ROUNDS,
                         "roundsUsed": loop_outcome.rounds_used,
+                        "classifierCallCount": usize::from(loop_outcome.rounds_used > 0),
+                        "skillDeepeningCallCount": 0,
+                        "providerCallCount": loop_outcome.rounds_used,
+                        "requestedOutputs": requested_outputs,
+                        "output": unified_output_from_actions(&loop_outcome.actions),
                         "stopReason": loop_outcome.stop_reason,
                         "actionCount": loop_outcome.actions.len(),
+                        "dispatchedTargets": dispatched_targets(&loop_outcome.actions),
+                        "failures": dispatch_failures(&loop_outcome.actions),
                         "learningFeedback": learning_feedback,
                         "actions": loop_outcome.actions,
                     }),
@@ -214,8 +226,15 @@ async fn run_background_review_for_episode_with_lease_abort(
                     "mode": "restricted_tool_loop",
                     "maxRounds": REVIEW_TOOL_LOOP_MAX_ROUNDS,
                     "roundsUsed": loop_outcome.rounds_used,
+                    "classifierCallCount": usize::from(loop_outcome.rounds_used > 0),
+                    "skillDeepeningCallCount": 0,
+                    "providerCallCount": loop_outcome.rounds_used,
+                    "requestedOutputs": requested_outputs,
+                    "output": unified_output_from_actions(&loop_outcome.actions),
                     "stopReason": loop_outcome.stop_reason,
                     "actionCount": loop_outcome.actions.len(),
+                    "dispatchedTargets": dispatched_targets(&loop_outcome.actions),
+                    "failures": dispatch_failures(&loop_outcome.actions),
                     "actions": loop_outcome.actions,
                 })),
                 review_worker_id,
@@ -544,11 +563,69 @@ async fn run_restricted_review_tool_loop(
         }
     }
 
+    if !stopped
+        && actions.iter().any(|action| action.tool == "memory_manage")
+        && actions.iter().all(|action| action.success)
+    {
+        stopped = true;
+        stop_reason = "call_budget_completed".to_string();
+    }
+
     Ok(GhostReviewToolLoopOutcome {
         actions,
         stopped,
         rounds_used,
         stop_reason,
+    })
+}
+
+fn dispatched_targets(actions: &[GhostReviewToolAction]) -> Vec<String> {
+    let mut targets = Vec::new();
+    for action in actions.iter().filter(|action| action.success) {
+        let target = action
+            .result
+            .get("target")
+            .and_then(|value| value.as_str())
+            .unwrap_or(action.tool.as_str())
+            .to_string();
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+fn dispatch_failures(actions: &[GhostReviewToolAction]) -> Vec<serde_json::Value> {
+    actions
+        .iter()
+        .filter(|action| !action.success)
+        .map(|action| {
+            serde_json::json!({
+                "tool": action.tool,
+                "result": action.result,
+            })
+        })
+        .collect()
+}
+
+fn unified_output_from_actions(actions: &[GhostReviewToolAction]) -> serde_json::Value {
+    let mut durable_memory = Vec::new();
+    let mut user_preferences = Vec::new();
+    for action in actions
+        .iter()
+        .filter(|action| action.success && action.tool == "memory_manage")
+    {
+        let summary = summarize_learning_action(action).unwrap_or_else(|| "Memory updated".into());
+        match action.result.get("target").and_then(|value| value.as_str()) {
+            Some("user") => user_preferences.push(summary),
+            _ => durable_memory.push(summary),
+        }
+    }
+    serde_json::json!({
+        "sessionSummary": null,
+        "durableMemory": durable_memory,
+        "userPreferences": user_preferences,
+        "skillCandidate": null,
     })
 }
 
@@ -1262,6 +1339,12 @@ mod tests {
             serde_json::json!("restricted_tool_loop")
         );
         assert_eq!(run.result["actionCount"], serde_json::json!(1));
+        assert_eq!(run.result["classifierCallCount"], serde_json::json!(1));
+        assert!(run.result["providerCallCount"].as_u64().unwrap_or_default() <= 2);
+        assert_eq!(run.result["skillDeepeningCallCount"], serde_json::json!(0));
+        assert!(run.result["dispatchedTargets"].is_array());
+        assert!(run.result["failures"].is_array());
+        assert!(run.result["output"].is_object());
         assert_eq!(
             run.result["learningFeedback"],
             serde_json::json!(["User profile updated"])
@@ -1526,7 +1609,7 @@ mod tests {
         .expect("record failed review");
 
         assert_eq!(outcome.status, "failed");
-        assert_eq!(provider.review_calls.load(Ordering::SeqCst), 8);
+        assert_eq!(provider.review_calls.load(Ordering::SeqCst), 2);
         let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
         let run = ledger
             .get_review_run(&outcome.run_id)
@@ -1536,17 +1619,17 @@ mod tests {
             run.result["error"],
             serde_json::json!("Restricted ghost review tool loop exceeded max rounds")
         );
-        assert_eq!(run.result["details"]["maxRounds"], serde_json::json!(8));
-        assert_eq!(run.result["details"]["roundsUsed"], serde_json::json!(8));
+        assert_eq!(run.result["details"]["maxRounds"], serde_json::json!(2));
+        assert_eq!(run.result["details"]["roundsUsed"], serde_json::json!(2));
         assert_eq!(
             run.result["details"]["stopReason"],
             serde_json::json!("max_rounds")
         );
-        assert_eq!(run.result["details"]["actionCount"], serde_json::json!(8));
+        assert_eq!(run.result["details"]["actionCount"], serde_json::json!(2));
     }
 
     #[tokio::test]
-    async fn background_review_can_stop_on_eighth_round() {
+    async fn background_review_call_budget_prevents_long_followup_loop() {
         let paths = temp_paths("stop-on-eighth");
         let episode_id = insert_sample_episode(&paths);
         let provider = Arc::new(ToolLoopReviewProvider::new(ToolLoopMode::StopOnEighthRound));
@@ -1564,16 +1647,19 @@ mod tests {
         .await
         .expect("run background review");
 
-        assert_eq!(outcome.status, "completed");
-        assert_eq!(provider.review_calls.load(Ordering::SeqCst), 8);
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(provider.review_calls.load(Ordering::SeqCst), 2);
         let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
         let run = ledger
             .get_review_run(&outcome.run_id)
             .expect("review run query")
             .expect("review run exists");
-        assert_eq!(run.result["maxRounds"], serde_json::json!(8));
-        assert_eq!(run.result["roundsUsed"], serde_json::json!(8));
-        assert_eq!(run.result["stopReason"], serde_json::json!("model_stopped"));
-        assert_eq!(run.result["actionCount"], serde_json::json!(7));
+        assert_eq!(run.result["details"]["maxRounds"], serde_json::json!(2));
+        assert_eq!(run.result["details"]["roundsUsed"], serde_json::json!(2));
+        assert_eq!(
+            run.result["details"]["stopReason"],
+            serde_json::json!("max_rounds")
+        );
+        assert_eq!(run.result["details"]["actionCount"], serde_json::json!(2));
     }
 }

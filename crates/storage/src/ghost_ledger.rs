@@ -208,6 +208,29 @@ impl GhostLedger {
         .transpose()
     }
 
+    pub fn merge_episode_metadata(&self, episode_id: &str, patch: &Value) -> Result<bool> {
+        let Some(mut episode) = self.get_episode(episode_id)? else {
+            return Ok(false);
+        };
+        let (Value::Object(metadata), Value::Object(patch)) = (&mut episode.metadata, patch) else {
+            return Err(Error::Storage(
+                "Ghost episode metadata merge requires JSON objects".to_string(),
+            ));
+        };
+        for (key, value) in patch {
+            metadata.insert(key.clone(), value.clone());
+        }
+        let encoded = encode_json(&episode.metadata)?;
+        let conn = self.lock_conn()?;
+        let updated = conn
+            .execute(
+                "UPDATE episodes SET metadata_json = ?2, updated_at = ?3 WHERE id = ?1",
+                params![episode_id, encoded, now_rfc3339()],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(updated == 1)
+    }
+
     pub fn episode_count(&self) -> Result<usize> {
         let conn = self.lock_conn()?;
         let count = conn

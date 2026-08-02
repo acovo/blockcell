@@ -100,7 +100,8 @@ pub use ghost_metrics::{
 pub use health::HealthChecker;
 pub use intent::{IntentCategory, IntentClassifier};
 pub use learning_coordinator::{
-    LearningAction, LearningCoordinator, MemoryTrigger, ReviewMode, SkillTrigger,
+    LearningAction, LearningBoundaryJob, LearningCoordinator, LearningOutputRequest, MemoryTrigger,
+    ReviewMode, SkillCandidate, SkillTrigger, UnifiedLearningOutput,
 };
 pub use learning_dedup::LearningDedup;
 pub use learning_throttle::LearningThrottle;

@@ -9,7 +9,10 @@
 //! - Dedup prevents duplicate learning within a time window
 //! - Combined review when both memory and skill nudges fire
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
 
 use crate::ghost_learning::{GhostLearningPolicy, LearningDecision};
 use crate::learning_dedup::LearningDedup;
@@ -61,6 +64,73 @@ pub enum SkillTrigger {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningOutputRequest {
+    SessionSummary,
+    DurableMemory,
+    UserPreferences,
+    SkillCandidate,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillCandidate {
+    pub name: String,
+    pub description: String,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnifiedLearningOutput {
+    pub session_summary: Option<String>,
+    pub durable_memory: Vec<String>,
+    pub user_preferences: Vec<String>,
+    pub skill_candidate: Option<SkillCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningBoundaryJob {
+    pub session_key: String,
+    pub boundary: String,
+    pub reasons: Vec<String>,
+    pub history_snapshot: Vec<String>,
+    pub requested_outputs: Vec<LearningOutputRequest>,
+}
+
+impl LearningBoundaryJob {
+    pub fn new(
+        session_key: impl Into<String>,
+        boundary: impl Into<String>,
+        history_snapshot: Vec<String>,
+        requested_output: LearningOutputRequest,
+    ) -> Self {
+        let boundary = boundary.into();
+        Self {
+            session_key: session_key.into(),
+            reasons: vec![format!("{boundary}:{requested_output:?}")],
+            boundary,
+            history_snapshot,
+            requested_outputs: vec![requested_output],
+        }
+    }
+
+    fn merge(&mut self, incoming: Self) {
+        for reason in incoming.reasons {
+            if !self.reasons.contains(&reason) {
+                self.reasons.push(reason);
+            }
+        }
+        for output in incoming.requested_outputs {
+            if !self.requested_outputs.contains(&output) {
+                self.requested_outputs.push(output);
+            }
+        }
+    }
+}
+
 /// Unified learning coordinator
 ///
 /// Wraps SkillNudgeEngine + GhostLearningPolicy + throttle + dedup
@@ -72,6 +142,7 @@ pub struct LearningCoordinator {
     dedup: LearningDedup,
     ghost_learning_enabled: bool,
     self_improve_review_enabled: bool,
+    pending_boundary_jobs: Mutex<HashMap<(String, String), LearningBoundaryJob>>,
 }
 
 pub struct LearningReviewReservationGuard {
@@ -150,7 +221,33 @@ impl LearningCoordinator {
             dedup,
             ghost_learning_enabled,
             self_improve_review_enabled,
+            pending_boundary_jobs: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn enqueue_boundary_job(&self, job: LearningBoundaryJob) {
+        let key = (job.session_key.clone(), job.boundary.clone());
+        let mut jobs = self
+            .pending_boundary_jobs
+            .lock()
+            .unwrap_or_else(recover_mutex);
+        match jobs.get_mut(&key) {
+            Some(existing) => existing.merge(job),
+            None => {
+                jobs.insert(key, job);
+            }
+        }
+    }
+
+    pub fn take_boundary_job(
+        &self,
+        session_key: &str,
+        boundary: &str,
+    ) -> Option<LearningBoundaryJob> {
+        self.pending_boundary_jobs
+            .lock()
+            .unwrap_or_else(recover_mutex)
+            .remove(&(session_key.to_string(), boundary.to_string()))
     }
 
     /// Called at the start of each user turn
@@ -689,5 +786,41 @@ mod tests {
             }),
             Some(ReviewMode::Combined)
         );
+    }
+
+    #[test]
+    fn coordinated_boundary_coalesces_requested_outputs_and_history() {
+        let coord = test_coordinator();
+        coord.enqueue_boundary_job(LearningBoundaryJob::new(
+            "cli:release",
+            "pre_compress",
+            vec!["user: remember canary releases".to_string()],
+            LearningOutputRequest::SessionSummary,
+        ));
+        coord.enqueue_boundary_job(LearningBoundaryJob::new(
+            "cli:release",
+            "pre_compress",
+            vec!["new history must not replace the first snapshot".to_string()],
+            LearningOutputRequest::DurableMemory,
+        ));
+        coord.enqueue_boundary_job(LearningBoundaryJob::new(
+            "cli:release",
+            "pre_compress",
+            vec![],
+            LearningOutputRequest::UserPreferences,
+        ));
+        coord.enqueue_boundary_job(LearningBoundaryJob::new(
+            "cli:release",
+            "pre_compress",
+            vec![],
+            LearningOutputRequest::SkillCandidate,
+        ));
+
+        let job = coord
+            .take_boundary_job("cli:release", "pre_compress")
+            .expect("coalesced boundary job");
+        assert_eq!(job.history_snapshot.len(), 1);
+        assert_eq!(job.requested_outputs.len(), 4);
+        assert_eq!(job.reasons.len(), 4);
     }
 }

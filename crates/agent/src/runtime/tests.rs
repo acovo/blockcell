@@ -3045,7 +3045,7 @@ async fn pre_compress_boundary_creates_force_review_episode() {
 }
 
 #[tokio::test]
-async fn pre_compress_boundary_flushes_user_preference_to_file_memory() {
+async fn coordinated_boundary_queues_one_learning_job_without_preflush_call() {
     let provider = Arc::new(BoundaryFlushProvider {
         calls: Mutex::new(Vec::new()),
         flush_calls: AtomicUsize::new(0),
@@ -3054,29 +3054,25 @@ async fn pre_compress_boundary_flushes_user_preference_to_file_memory() {
 
     runtime.test_trigger_pre_compress().await.unwrap();
 
-    let user_memory = std::fs::read_to_string(runtime.paths.user_md()).expect("read USER.md");
-    assert!(user_memory.contains("rollback order before deploy compression"));
-    let calls = provider.calls.lock().unwrap().clone();
-    let flush_call = calls
-        .iter()
-        .find(|messages| {
-            messages
-                .last()
-                .map(chat_message_text)
-                .unwrap_or_default()
-                .contains("__ghost_memory_flush_sentinel")
-        })
-        .expect("boundary flush model call");
-    assert!(flush_call
-        .iter()
-        .any(|message| chat_message_text(message).contains("allowedTools")));
-    assert!(flush_call.iter().any(
-        |message| chat_message_text(message).contains("figure out the correct deploy sequence")
-    ));
-    assert!(flush_call.iter().all(|message| {
-        message.role != "tool"
-            || !chat_message_text(message).contains("__ghost_memory_flush_sentinel")
-    }));
+    assert_eq!(provider.calls.lock().unwrap().len(), 0);
+    assert_eq!(provider.flush_calls.load(Ordering::SeqCst), 0);
+    let mut claimed = runtime
+        .test_ghost_ledger()
+        .claim_reviewable_episodes(1, "coordinated-test", 600)
+        .expect("claim coordinated episode");
+    let episode = claimed.pop().expect("coordinated episode");
+    assert_eq!(
+        episode.metadata["learningJob"]["historySnapshot"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        episode.metadata["requestedOutputs"]
+            .as_array()
+            .map(Vec::len),
+        Some(4)
+    );
 }
 
 #[test]

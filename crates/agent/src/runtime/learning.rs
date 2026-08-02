@@ -13,13 +13,12 @@ use crate::ghost_background_review::spawn_pending_background_reviews;
 use crate::ghost_learning::{
     estimate_turn_complexity_score, GhostLearningBoundary, GhostLearningBoundaryKind,
 };
-use crate::memory_file_store::MemoryFileStore;
-use blockcell_core::types::{ChatMessage, ToolCallRequest};
+use crate::learning_coordinator::{LearningBoundaryJob, LearningOutputRequest};
+use blockcell_core::types::ChatMessage;
 use blockcell_core::Result;
 use blockcell_core::{scope_abort_token, InboundMessage, OutboundMessage};
-use blockcell_providers::{CallResult, ProviderPool};
 use blockcell_storage::ghost_ledger::GhostEpisodeSource;
-use blockcell_tools::{CapabilityRegistryHandle, CoreEvolutionHandle, ToolContext, ToolRegistry};
+use blockcell_tools::{CapabilityRegistryHandle, CoreEvolutionHandle, ToolRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -316,70 +315,6 @@ impl super::AgentRuntime {
         }
     }
 
-    /// 在上下文压缩前，让 LLM 保存重要信息到 Memory Store
-    ///
-    /// 参考 Hermes `flush_memories()` — 使用 ForkedAgent 执行，
-    /// 只允许 memory_upsert 和 memory_query 工具。
-    /// 与 Hermes 一致: 传入完整对话历史 + flush 提示作为用户消息
-    pub(super) async fn flush_memory_store_before_compact(&self, messages: &[ChatMessage]) {
-        if self.memory_file_store.is_none() {
-            tracing::debug!("[flush] 无 Memory Store, 跳过 flush");
-            return;
-        }
-
-        tracing::info!("[flush] 上下文压缩前保存重要信息...");
-
-        // 与 Hermes 一致: 传入完整对话历史，追加 flush 提示作为用户消息
-        // Hermes: messages + user_message="[System: The session is being compressed...]"
-        let mut flush_messages = messages.to_vec();
-        flush_messages.push(ChatMessage::user(
-            "[System: The session is being compressed. \
-             Save anything worth remembering — prioritize user preferences, \
-             corrections, and recurring patterns over task-specific details.]",
-        ));
-
-        let model = self.config.agents.defaults.model.clone();
-        // 与 Hermes 一致: flush_agent 继承主 agent 的 system prompt
-        let system_prompt = self.context_builder.build_system_prompt();
-        let cache_safe = crate::forked::CacheSafeParams::new(&system_prompt, &model);
-
-        let can_use_tool = crate::forked::create_flush_can_use_tool();
-        let tool_schemas = crate::forked::build_flush_tool_schemas();
-
-        let mut params = crate::forked::ForkedAgentParams::new(
-            self.provider_pool.clone(),
-            flush_messages,
-            cache_safe,
-        )
-        .with_can_use_tool(can_use_tool)
-        .with_tool_schemas(tool_schemas)
-        .with_query_source("memory_flush")
-        .with_fork_label("memory_flush")
-        .with_max_turns(1); // 与 Hermes 一致: flush 仅单次 API 调用, 无需多轮
-
-        if let Some(store) = &self.memory_store {
-            params = params.with_memory_store(store.clone());
-        }
-        if let Some(store) = &self.memory_file_store {
-            params = params.with_memory_file_store(store.clone());
-        }
-
-        match crate::forked::run_forked_agent(params).await {
-            Ok(result) => {
-                if result.truncated {
-                    tracing::warn!("[flush] Memory flush 结果被截断");
-                }
-                tracing::info!(
-                    tokens_out = result.total_usage.output_tokens,
-                    "[flush] Memory flush 完成"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "[flush] Memory flush 失败, 继续压缩");
-            }
-        }
-    }
-
     /// Initialize and load Layer 5 memory injector (7-layer memory system).
     /// This consolidates legacy Layer 5 files and loads only USER.md and MEMORY.md.
     pub async fn init_memory_injector(&mut self) -> std::io::Result<()> {
@@ -545,6 +480,53 @@ impl super::AgentRuntime {
         )
     }
 
+    fn coordinate_boundary_job(
+        &self,
+        session_key: &str,
+        boundary: &str,
+        messages: &[ChatMessage],
+    ) -> LearningBoundaryJob {
+        let history_snapshot = messages.iter().map(chat_message_text).collect::<Vec<_>>();
+        for output in [
+            LearningOutputRequest::SessionSummary,
+            LearningOutputRequest::DurableMemory,
+            LearningOutputRequest::UserPreferences,
+            LearningOutputRequest::SkillCandidate,
+        ] {
+            self.learning_coordinator
+                .enqueue_boundary_job(LearningBoundaryJob::new(
+                    session_key,
+                    boundary,
+                    history_snapshot.clone(),
+                    output,
+                ));
+        }
+        self.learning_coordinator
+            .take_boundary_job(session_key, boundary)
+            .expect("boundary job was just enqueued")
+    }
+
+    fn attach_boundary_job(
+        &self,
+        episode_id: Option<&str>,
+        job: &LearningBoundaryJob,
+    ) -> Result<()> {
+        let Some(episode_id) = episode_id else {
+            return Ok(());
+        };
+        let ledger = blockcell_storage::GhostLedger::open(&self.paths.ghost_ledger_db())?;
+        ledger.merge_episode_metadata(
+            episode_id,
+            &serde_json::json!({
+                "learningJob": job,
+                "requestedOutputs": job.requested_outputs,
+                "classifierCallCount": 0,
+                "skillDeepeningCallCount": 0,
+            }),
+        )?;
+        Ok(())
+    }
+
     fn detect_correction_signal_count(user_text: &str) -> u32 {
         let lower = user_text.to_lowercase();
         let cues = [
@@ -707,9 +689,7 @@ impl super::AgentRuntime {
         if !self.ghost_learning_enabled() {
             return Ok(None);
         }
-        let memory_write_count = self
-            .flush_memories(session_key, messages, "pre_compress")
-            .await?;
+        let job = self.coordinate_boundary_job(session_key, "pre_compress", messages);
         let provider_pre_compress_context = if let Some(manager) =
             self.ghost_memory_lifecycle.as_ref()
         {
@@ -737,7 +717,7 @@ impl super::AgentRuntime {
                 .iter()
                 .filter_map(|msg| msg.tool_calls.as_ref().map(|calls| calls.len() as u32))
                 .sum(),
-            memory_write_count,
+            memory_write_count: 0,
             correction_count: 0,
             preference_correction_count: 0,
             success: true,
@@ -745,14 +725,16 @@ impl super::AgentRuntime {
             reusable_lesson: provider_pre_compress_context,
         };
 
-        self.persist_ghost_learning_boundary(
+        let episode_id = self.persist_ghost_learning_boundary(
             boundary,
             vec![GhostEpisodeSource {
                 source_type: "session".to_string(),
                 source_key: session_key.to_string(),
                 role: "primary".to_string(),
             }],
-        )
+        )?;
+        self.attach_boundary_job(episode_id.as_deref(), &job)?;
+        Ok(episode_id)
     }
 
     pub(super) async fn capture_main_session_end_learning_boundary(
@@ -769,9 +751,7 @@ impl super::AgentRuntime {
         if history.is_empty() {
             return Ok(None);
         }
-        let memory_write_count = self
-            .flush_memories(&target.session_key, &history, "session_end")
-            .await?;
+        let job = self.coordinate_boundary_job(&target.session_key, "session_end", &history);
         let provider_session_end_context =
             if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
                 let message_texts = history.iter().map(chat_message_text).collect::<Vec<_>>();
@@ -799,7 +779,7 @@ impl super::AgentRuntime {
                 .iter()
                 .filter_map(|msg| msg.tool_calls.as_ref().map(|calls| calls.len() as u32))
                 .sum(),
-            memory_write_count,
+            memory_write_count: 0,
             correction_count: 0,
             preference_correction_count: 0,
             success: true,
@@ -807,14 +787,16 @@ impl super::AgentRuntime {
             reusable_lesson: provider_session_end_context,
         };
 
-        self.persist_ghost_learning_boundary(
+        let episode_id = self.persist_ghost_learning_boundary(
             boundary,
             vec![GhostEpisodeSource {
                 source_type: "session".to_string(),
                 source_key: target.session_key.clone(),
                 role: "primary".to_string(),
             }],
-        )
+        )?;
+        self.attach_boundary_job(episode_id.as_deref(), &job)?;
+        Ok(episode_id)
     }
 
     pub(super) async fn capture_session_rotate_learning_boundary(
@@ -830,9 +812,7 @@ impl super::AgentRuntime {
         if history.is_empty() {
             return Ok(None);
         }
-        let memory_write_count = self
-            .flush_memories(&previous.session_key, &history, "session_rotate")
-            .await?;
+        let job = self.coordinate_boundary_job(&previous.session_key, "session_rotate", &history);
         let provider_session_end_context =
             if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
                 let message_texts = history.iter().map(chat_message_text).collect::<Vec<_>>();
@@ -860,7 +840,7 @@ impl super::AgentRuntime {
                 .iter()
                 .filter_map(|msg| msg.tool_calls.as_ref().map(|calls| calls.len() as u32))
                 .sum(),
-            memory_write_count,
+            memory_write_count: 0,
             correction_count: 0,
             preference_correction_count: 0,
             success: true,
@@ -877,7 +857,7 @@ impl super::AgentRuntime {
             }),
         };
 
-        self.persist_ghost_learning_boundary(
+        let episode_id = self.persist_ghost_learning_boundary(
             boundary,
             vec![
                 GhostEpisodeSource {
@@ -896,172 +876,9 @@ impl super::AgentRuntime {
                     role: "next".to_string(),
                 },
             ],
-        )
-    }
-
-    async fn flush_memories(
-        &self,
-        session_key: &str,
-        messages: &[ChatMessage],
-        boundary: &str,
-    ) -> Result<u32> {
-        if messages.is_empty() {
-            return Ok(0);
-        }
-        let Some((provider_idx, provider)) = self.provider_pool.acquire() else {
-            warn!(session_key = %session_key, boundary = %boundary, "Ghost memory flush skipped: no provider available");
-            return Ok(0);
-        };
-
-        let mut loop_messages = Self::build_memory_flush_messages(session_key, messages, boundary);
-        let registry = Self::restricted_memory_flush_tool_registry();
-        let tools = registry.get_filtered_schemas(&["memory_manage"]);
-        let mut writes = 0u32;
-
-        for _round in 0..2 {
-            let response = match provider.chat(&loop_messages, &tools).await {
-                Ok(response) => {
-                    self.provider_pool.report(provider_idx, CallResult::Success);
-                    response
-                }
-                Err(err) => {
-                    self.provider_pool
-                        .report(provider_idx, ProviderPool::classify_error(&err.to_string()));
-                    warn!(error = %err, session_key = %session_key, boundary = %boundary, "Ghost memory flush provider call failed");
-                    return Ok(writes);
-                }
-            };
-            if response.tool_calls.is_empty() {
-                return Ok(writes);
-            }
-
-            let mut assistant = ChatMessage::assistant(response.content.as_deref().unwrap_or(""));
-            assistant.tool_calls = Some(response.tool_calls.clone());
-            loop_messages.push(assistant);
-
-            for call in response.tool_calls {
-                if call.name != "memory_manage" {
-                    let result = serde_json::json!({
-                        "error": format!("tool '{}' is not allowed during memory flush", call.name),
-                    });
-                    loop_messages.push(Self::memory_flush_tool_result_message(&call, &result));
-                    continue;
-                }
-                let result = registry
-                    .execute(
-                        &call.name,
-                        self.memory_flush_tool_context(session_key)?,
-                        call.arguments.clone(),
-                    )
-                    .await;
-                match result {
-                    Ok(value) => {
-                        if value
-                            .get("success")
-                            .and_then(|success| success.as_bool())
-                            .unwrap_or(false)
-                        {
-                            writes += 1;
-                        }
-                        loop_messages.push(Self::memory_flush_tool_result_message(&call, &value));
-                    }
-                    Err(err) => {
-                        let result = serde_json::json!({"error": err.to_string()});
-                        loop_messages.push(Self::memory_flush_tool_result_message(&call, &result));
-                    }
-                }
-            }
-        }
-
-        Ok(writes)
-    }
-
-    fn memory_flush_tool_context(&self, session_key: &str) -> Result<ToolContext> {
-        Ok(ToolContext {
-            workspace: self.paths.workspace(),
-            base: self.paths.base.clone(),
-            builtin_skills_dir: Some(self.paths.builtin_skills_dir()),
-            active_skill_dir: None,
-            session_key: session_key.to_string(),
-            channel: "ghost".to_string(),
-            account_id: None,
-            sender_id: None,
-            chat_id: session_key.to_string(),
-            config: self.config.clone(),
-            permissions: blockcell_core::types::PermissionSet::new(),
-            task_manager: None,
-            memory_store: None,
-            memory_file_store: Some({
-                let mut mfs = MemoryFileStore::open(&self.paths)?;
-                mfs.set_write_guard(Arc::clone(&self.write_guard));
-                Arc::new(mfs)
-            }),
-            ghost_memory_lifecycle: self.ghost_memory_lifecycle.clone().map(|manager| {
-                manager as Arc<dyn blockcell_tools::GhostMemoryLifecycleOps + Send + Sync>
-            }),
-            skill_file_store: None,
-            session_search: None,
-            outbound_tx: None,
-            spawn_handle: None,
-            capability_registry: None,
-            core_evolution: None,
-            event_emitter: None,
-            channel_contacts_file: Some(self.paths.channel_contacts_file()),
-            response_cache: None,
-            skill_mutex: None,
-            agent_type_registry: None,
-            evolution_workflow_store: None,
-            runtime_handle: self.runtime_handle.clone(),
-            agent_identity: blockcell_core::current_agent_context(),
-        })
-    }
-
-    fn restricted_memory_flush_tool_registry() -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(blockcell_tools::memory::MemoryManageTool));
-        registry
-    }
-
-    fn build_memory_flush_messages(
-        session_key: &str,
-        messages: &[ChatMessage],
-        boundary: &str,
-    ) -> Vec<ChatMessage> {
-        let mut flush_messages = messages.iter().rev().take(24).cloned().collect::<Vec<_>>();
-        flush_messages.reverse();
-
-        let sentinel = format!(
-            "__ghost_memory_flush_sentinel:{}:{}",
-            session_key,
-            chrono::Utc::now().timestamp_millis()
-        );
-        flush_messages.push(ChatMessage::user(
-            &serde_json::json!({
-                "_flush_sentinel": sentinel,
-                "task": "The session is reaching a compression/session boundary. Save anything worth remembering before context is lost.",
-                "boundary": boundary,
-                "sessionKey": session_key,
-                "allowedTools": ["memory_manage"],
-                "rules": [
-                    "Use only memory_manage.",
-                    "Save durable user preferences, recurring corrections, stable project facts, reusable non-procedural lessons, and environment constraints.",
-                    "Do not save task progress, temporary TODOs, completed-work logs, one-off outcomes, or short-lived status.",
-                    "If nothing durable should be saved, make no tool calls."
-                ]
-            })
-            .to_string(),
-        ));
-
-        flush_messages
-    }
-
-    fn memory_flush_tool_result_message(
-        call: &ToolCallRequest,
-        result: &serde_json::Value,
-    ) -> ChatMessage {
-        let mut message = ChatMessage::tool_result(&call.id, &result.to_string());
-        message.name = Some(call.name.clone());
-        message
+        )?;
+        self.attach_boundary_job(episode_id.as_deref(), &job)?;
+        Ok(episode_id)
     }
 
     /// Create a restricted tool registry for subagents (no spawn, no message, no cron).
