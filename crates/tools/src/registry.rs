@@ -25,6 +25,7 @@ use crate::file_ops::FileOpsTool;
 use crate::fs::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 use crate::http_request::HttpRequestTool;
 use crate::image_understand::ImageUnderstandTool;
+use crate::knowledge_forget::KnowledgeForgetTool;
 use crate::knowledge_graph::KnowledgeGraphTool;
 use crate::memory::{MemoryForgetTool, MemoryManageTool, MemoryQueryTool, MemoryUpsertTool};
 use crate::memory_maintenance::MemoryMaintenanceTool;
@@ -52,6 +53,7 @@ pub const GLOBAL_CORE_TOOL_NAMES: &[&str] = &[
     "memory_manage",
     "memory_upsert",
     "memory_forget",
+    "knowledge_forget",
     "spawn",
     "agent",
     "list_tasks",
@@ -128,6 +130,7 @@ impl ToolRegistry {
         registry.register(Arc::new(MemoryManageTool));
         registry.register(Arc::new(MemoryUpsertTool));
         registry.register(Arc::new(MemoryForgetTool));
+        registry.register(Arc::new(KnowledgeForgetTool));
         registry.register(Arc::new(SessionSearchTool));
 
         // Skill evolution tools

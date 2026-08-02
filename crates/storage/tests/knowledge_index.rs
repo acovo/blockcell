@@ -148,8 +148,44 @@ fn knowledge_index_conflict_prefers_active_explicit_newer_entry() {
 
     assert_eq!(hits.len(), 1, "duplicate content should collapse");
     assert_eq!(hits[0].id, "pref-new");
+    assert_eq!(
+        index
+            .get_by_id("pref-new")
+            .expect("lookup by ID")
+            .expect("entry by ID")
+            .content,
+        "用户偏好简洁回答"
+    );
     assert!(index
         .search("用户偏好详细回答", 10)
         .expect("search superseded preference")
+        .is_empty());
+}
+
+#[test]
+fn forgotten_content_tombstone_round_trip() {
+    let paths = test_paths("forgotten");
+    paths.ensure_dirs().expect("ensure paths");
+    let index = KnowledgeIndex::open(&paths.knowledge_index_db()).expect("open index");
+
+    assert!(!index
+        .is_forgotten_content("User prefers concise replies.")
+        .expect("check initial tombstone"));
+    index
+        .record_forgotten_content("  User prefers concise replies.  ", "user request")
+        .expect("record tombstone");
+    assert!(index
+        .is_forgotten_content("User   prefers concise replies.")
+        .expect("check normalized tombstone"));
+
+    std::fs::write(
+        paths.user_md(),
+        "- [id:pref-forgotten] [scope:user] [source:user_statement] [updated:2026-08-01] User   prefers concise replies.\n",
+    )
+    .expect("write tombstoned canonical content");
+    index.rebuild_from_files(&paths).expect("rebuild index");
+    assert!(index
+        .search("concise replies", 10)
+        .expect("search tombstoned content")
         .is_empty());
 }

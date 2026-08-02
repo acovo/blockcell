@@ -22,6 +22,7 @@ pub mod fuzzy_match;
 pub mod html_to_md;
 pub mod http_request;
 pub mod image_understand;
+pub mod knowledge_forget;
 pub mod knowledge_graph;
 pub mod mcp;
 pub mod memory;

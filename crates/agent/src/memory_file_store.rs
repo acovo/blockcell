@@ -174,6 +174,7 @@ impl MemoryFileStore {
 
     pub fn add(&self, target: MemoryFileTarget, content: &str) -> Result<MemoryFileMutation> {
         let content = normalize_entry(content)?;
+        self.ensure_not_forgotten(&content)?;
         scan_learned_memory_content(&content)?;
         let _wg = self.acquire_write_guard(target)?;
         let _guard = self
@@ -215,6 +216,7 @@ impl MemoryFileStore {
             return Err(Error::Validation("old_text cannot be empty".to_string()));
         }
         let content = normalize_entry(content)?;
+        self.ensure_not_forgotten(&content)?;
         scan_learned_memory_content(&content)?;
         let _wg = self.acquire_write_guard(target)?;
         let _guard = self
@@ -298,8 +300,15 @@ impl MemoryFileStore {
             )));
         };
         let path = self.path_for(target);
-        let current_snapshot = self.snapshot_before_write(target, path)?;
         let restored_content = fs::read_to_string(&snapshot_path)?;
+        for entry in restored_content
+            .split(ENTRY_SEPARATOR)
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            self.ensure_not_forgotten(entry)?;
+        }
+        let current_snapshot = self.snapshot_before_write(target, path)?;
         atomic_write_text(path, &restored_content)?;
         self.sync_knowledge_index(target)?;
         Ok(MemoryFileMutation {
@@ -365,6 +374,17 @@ impl MemoryFileStore {
             MemoryFileTarget::Memory => (&self.memory_index_file, "workspace"),
         };
         index.rebuild_file(file, self.path_for(target), scope)?;
+        Ok(())
+    }
+
+    fn ensure_not_forgotten(&self, content: &str) -> Result<()> {
+        if let Some(index) = self.knowledge_index.as_ref() {
+            if index.is_forgotten_content(content)? {
+                return Err(Error::Validation(
+                    "memory content was explicitly forgotten and cannot be recreated".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -658,6 +678,57 @@ mod tests {
             .remove(MemoryFileTarget::User, "terse release summaries")
             .unwrap();
         assert!(index.search("terse", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn forgotten_memory_is_not_recreated() {
+        let paths = test_paths("forgotten-memory");
+        paths.ensure_dirs().unwrap();
+        let index =
+            Arc::new(blockcell_storage::KnowledgeIndex::open(&paths.knowledge_index_db()).unwrap());
+        index
+            .record_forgotten_content("User prefers concise replies.", "user request")
+            .unwrap();
+        let mut store = MemoryFileStore::open(&paths).unwrap();
+        store.set_knowledge_index(index, "USER.md", "memory/MEMORY.md");
+
+        let error = store
+            .add(
+                MemoryFileTarget::User,
+                "- [id:pref-copy] [scope:user] [source:inferred] [updated:2026-08-02] User   prefers concise replies.",
+            )
+            .expect_err("tombstoned memory must not be recreated");
+
+        assert!(error.to_string().contains("forgotten"));
+        assert!(!paths.user_md().exists());
+    }
+
+    #[test]
+    fn forgotten_memory_cannot_be_restored_from_snapshot() {
+        let paths = test_paths("forgotten-restore");
+        paths.ensure_dirs().unwrap();
+        let index =
+            Arc::new(blockcell_storage::KnowledgeIndex::open(&paths.knowledge_index_db()).unwrap());
+        let mut store = MemoryFileStore::open(&paths).unwrap();
+        store.set_knowledge_index(index.clone(), "USER.md", "memory/MEMORY.md");
+        store
+            .add(MemoryFileTarget::User, "User prefers concise replies.")
+            .unwrap();
+        store
+            .remove(MemoryFileTarget::User, "concise replies")
+            .unwrap();
+        index
+            .record_forgotten_content("User prefers concise replies.", "user request")
+            .unwrap();
+
+        let error = store
+            .restore_latest(MemoryFileTarget::User)
+            .expect_err("snapshot restore must respect tombstones");
+
+        assert!(error.to_string().contains("forgotten"));
+        assert!(!std::fs::read_to_string(paths.user_md())
+            .unwrap_or_default()
+            .contains("concise replies"));
     }
 
     #[test]

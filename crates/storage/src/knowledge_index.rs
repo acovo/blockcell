@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use blockcell_core::{Error, Paths, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -208,10 +208,20 @@ impl KnowledgeIndex {
         for id in superseded_rows {
             superseded.insert(id.map_err(map_sqlite_error)?);
         }
+        let mut forgotten = HashSet::new();
+        let mut forgotten_stmt = conn
+            .prepare("SELECT dedup_key FROM forgotten")
+            .map_err(map_sqlite_error)?;
+        let forgotten_rows = forgotten_stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite_error)?;
+        for key in forgotten_rows {
+            forgotten.insert(key.map_err(map_sqlite_error)?);
+        }
 
         let mut by_hash: HashMap<String, (KnowledgeIndexEntry, f64)> = HashMap::new();
         for (entry, relevance) in candidates {
-            if superseded.contains(&entry.id) {
+            if superseded.contains(&entry.id) || forgotten.contains(&entry.content_hash) {
                 continue;
             }
             match by_hash.get(&entry.content_hash) {
@@ -226,6 +236,67 @@ impl KnowledgeIndex {
         results.sort_by(|left, right| compare_ranked_entries(right, left));
         results.truncate(limit.min(100));
         Ok(results.into_iter().map(|(entry, _)| entry).collect())
+    }
+
+    pub fn record_forgotten_content(&self, content: &str, reason: &str) -> Result<String> {
+        let dedup_key = knowledge_dedup_key(content);
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Storage("Knowledge index lock poisoned".to_string()))?;
+        conn.execute(
+            "INSERT INTO forgotten (dedup_key, reason, forgotten_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(dedup_key) DO UPDATE SET
+                reason = excluded.reason,
+                forgotten_at = excluded.forgotten_at",
+            params![dedup_key, reason, Utc::now().to_rfc3339()],
+        )
+        .map_err(map_sqlite_error)?;
+        Ok(dedup_key)
+    }
+
+    pub fn get_by_id(&self, id: &str) -> Result<Option<KnowledgeIndexEntry>> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Storage("Knowledge index lock poisoned".to_string()))?;
+        conn.query_row(
+            "SELECT id, file, anchor, content, content_hash, scope, source, updated_at, supersedes
+             FROM knowledge_entries WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(KnowledgeIndexEntry {
+                    id: row.get(0)?,
+                    file: row.get(1)?,
+                    anchor: row.get(2)?,
+                    content: row.get(3)?,
+                    content_hash: row.get(4)?,
+                    scope: row.get(5)?,
+                    source: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    supersedes: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_error)
+    }
+
+    pub fn is_forgotten_content(&self, content: &str) -> Result<bool> {
+        let dedup_key = knowledge_dedup_key(content);
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Storage("Knowledge index lock poisoned".to_string()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM forgotten WHERE dedup_key = ?1",
+                params![dedup_key],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(count > 0)
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -280,6 +351,11 @@ impl KnowledgeIndex {
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(entry_id) REFERENCES knowledge_entries(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS forgotten (
+                dedup_key TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                forgotten_at TEXT NOT NULL
+            );
             CREATE TRIGGER IF NOT EXISTS knowledge_vector_ad AFTER DELETE ON knowledge_entries BEGIN
                 DELETE FROM knowledge_vectors WHERE entry_id = old.id;
             END;",
@@ -287,6 +363,24 @@ impl KnowledgeIndex {
         .map_err(map_sqlite_error)?;
         Ok(())
     }
+}
+
+pub fn knowledge_dedup_key(content: &str) -> String {
+    let mut semantic = content.trim().trim_start_matches('-').trim();
+    while semantic.starts_with('[') {
+        let Some(end) = semantic.find(']') else {
+            break;
+        };
+        semantic = semantic[end + 1..].trim_start();
+    }
+    semantic = strip_migration_provenance(semantic);
+    sha256_hex(
+        semantic
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .as_bytes(),
+    )
 }
 
 fn source_priority(source: &str) -> u8 {
@@ -359,7 +453,7 @@ fn build_entry(file: &str, anchor: &str, raw: &str, default_scope: &str) -> Know
         content = content[end + 1..].trim_start().to_string();
     }
     content = strip_migration_provenance(&content).to_string();
-    let content_hash = sha256_hex(content.as_bytes());
+    let content_hash = knowledge_dedup_key(&content);
     let id = metadata.remove("id").unwrap_or_else(|| {
         format!(
             "legacy-{}",
