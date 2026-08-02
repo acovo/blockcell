@@ -327,7 +327,7 @@ mod tests {
                 Json(json!({
                     "title": "Pinned fact",
                     "content": "User prefers concise answers",
-                    "scope": "long_term",
+                    "scope": "short_term",
                     "type": "fact",
                     "source": "user",
                     "channel": "ghost",
@@ -350,6 +350,31 @@ mod tests {
                 &memory_gateway_chat_id("default")
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_memory_create_rejects_long_term_in_favor_of_canonical_files() {
+        let store = Arc::new(CaptureMemoryStore::new());
+        let state = test_gateway_state(store.clone());
+
+        let body = response_json(
+            handle_memory_create(
+                State(state),
+                Query(AgentScopedQuery::default()),
+                Json(json!({
+                    "content": "User prefers concise answers",
+                    "scope": "long_term",
+                    "type": "preference"
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains("memory_manage"));
+        assert!(error.contains("canonical"));
+        assert_eq!(store.upsert_calls(), 0);
     }
 
     #[tokio::test]

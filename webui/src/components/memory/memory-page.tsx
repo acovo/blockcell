@@ -14,7 +14,7 @@ export function MemoryPage() {
   const [scope, setScope] = useState('');
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
-  const [newMemory, setNewMemory] = useState({ title: '', content: '', scope: 'long_term', type: 'note', tags: '' });
+  const [newMemory, setNewMemory] = useState({ title: '', content: '', scope: 'short_term', type: 'note', tags: '' });
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; title: string } | null>(null);
   const selectedAgentRef = useRef(selectedAgentId);
 
@@ -70,7 +70,7 @@ export function MemoryPage() {
         tags: newMemory.tags,
       }, selectedAgentId);
       setShowCreate(false);
-      setNewMemory({ title: '', content: '', scope: 'long_term', type: 'note', tags: '' });
+      setNewMemory({ title: '', content: '', scope: 'short_term', type: 'note', tags: '' });
       fetchMemories();
       fetchStats();
     } catch {
@@ -158,7 +158,6 @@ export function MemoryPage() {
               onChange={(e) => setNewMemory({ ...newMemory, scope: e.target.value })}
               className="px-3 py-1.5 text-sm bg-background border border-border rounded-lg outline-none"
             >
-              <option value="long_term">Long-term</option>
               <option value="short_term">Short-term</option>
             </select>
             <select
