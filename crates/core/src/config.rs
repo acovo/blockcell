@@ -954,6 +954,50 @@ mod tests {
             .allows(MemoryRecallMode::General, "system"));
     }
 
+    #[test]
+    fn three_subsystem_config_prefers_new_forked_agent_over_legacy_layer7() {
+        let legacy: Config = json5::from_str(
+            r#"{
+                memory: {
+                    memorySystem: {
+                        layer7: { enabled: false, maxTurns: 6, timeoutSecs: 90 }
+                    }
+                }
+            }"#,
+        )
+        .expect("parse legacy layer7 config");
+        let legacy_effective = legacy.memory.effective_forked_agent();
+        assert!(!legacy_effective.enabled);
+        assert_eq!(legacy_effective.max_turns, 6);
+        assert_eq!(legacy_effective.timeout_secs, 90);
+
+        let modern: Config = json5::from_str(
+            r#"{
+                memory: {
+                    memorySystem: {
+                        layer7: { enabled: false, maxTurns: 6, timeoutSecs: 90 }
+                    },
+                    contextManagement: {
+                        forkedAgent: { enabled: true, maxTurns: 12, timeoutSecs: 150 }
+                    },
+                    knowledgeSystem: {
+                        promptBudget: { total: 8000 },
+                        memoryRecall: { chat: false }
+                    },
+                    learningSystem: { enabled: false }
+                }
+            }"#,
+        )
+        .expect("parse three subsystem config");
+        let modern_effective = modern.memory.effective_forked_agent();
+        assert!(modern_effective.enabled);
+        assert_eq!(modern_effective.max_turns, 12);
+        assert_eq!(modern_effective.timeout_secs, 150);
+        assert_eq!(modern.memory.effective_prompt_budget().total, 8000);
+        assert!(!modern.memory.effective_memory_recall().chat);
+        assert!(!modern.memory.learning_system.enabled());
+    }
+
     fn temp_config_path(name: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("blockcell-config-tests-{}", uuid::Uuid::new_v4()));

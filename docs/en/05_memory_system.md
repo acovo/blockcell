@@ -12,6 +12,39 @@ A new model conversation does not inherently remember user preferences, project 
 
 ## Memory system architecture
 
+BlockCell exposes three operational subsystems:
+
+| Subsystem | Responsibility |
+|---|---|
+| Context Management | tool-result cache, micro/full compact, recovery budgets, and forked-agent execution |
+| Knowledge System | durable files, short-term memory, indexes, unified retrieval, and prompt budgets |
+| Learning System | boundary capture, coordinated review, skill learning, and low-frequency Dream maintenance |
+
+Recommended configuration:
+
+```json5
+memory: {
+  contextManagement: {
+    forkedAgent: { enabled: true, maxTurns: 10, timeoutSecs: 120 }
+  },
+  knowledgeSystem: {
+    promptBudget: {
+      total: 12000,
+      rules: 2000,
+      userProfile: 800,
+      retrieved: 3000,
+      activeSkill: 4000,
+      sessionRecovery: 2000
+    },
+    memoryRecall: { chat: true, general: true, skill: true, internal: false }
+  },
+  learningSystem: { enabled: true }
+}
+```
+
+The legacy `memory.memorySystem.layer7` key is supported for one compatibility
+version and maps to `memory.contextManagement.forkedAgent`; explicit new keys win.
+
 blockcell uses **files as the durable source of truth, with SQLite for rebuildable indexes, short-term storage, and audit**:
 
 ```text
@@ -167,6 +200,15 @@ Confirmation removes the matches, rebuilds the index, records forget tombstones,
 ---
 
 ## How durable knowledge is recalled
+
+The system prompt contains one source-tagged `<retrieved-context>` block. Candidates
+are deduplicated and ordered as `user-profile > knowledge > session > short-term >
+skill-index`, then constrained by the global prompt budget. Recall is configurable for
+Chat, General, and Skill modes; internal `ghost`, `cron`, `system`, and `subagent`
+traffic is excluded by default.
+
+Both `knowledge_fts` and `memory_fts` use the trigram tokenizer. Legacy indexes are
+rebuilt on startup, while contiguous CJK queries are expanded into overlapping bigrams.
 
 `KnowledgeIndex` incrementally indexes `USER.md` and `memory/MEMORY.md`. Candidates converge through this order:
 

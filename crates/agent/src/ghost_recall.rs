@@ -12,7 +12,10 @@ pub(crate) fn should_inject_ghost_recall(
 ) -> bool {
     config.agents.ghost.learning.recall_enabled()
         && config.agents.ghost.learning.recall_max_items > 0
-        && config.memory.memory_recall.allows(mode, &msg.channel)
+        && config
+            .memory
+            .effective_memory_recall()
+            .allows(mode, &msg.channel)
 }
 
 pub fn build_ghost_recall_context_block(

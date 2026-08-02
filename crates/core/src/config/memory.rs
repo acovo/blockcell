@@ -347,7 +347,7 @@ impl Default for Layer6Config {
     }
 }
 
-// === Layer 7: Forked Agent 配置 ===
+// === Legacy Layer 7: Forked Agent 配置 ===
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Layer7Config {
@@ -505,6 +505,7 @@ pub struct MemorySystemConfig {
     pub layer5: Layer5Config,
     #[serde(default)]
     pub layer6: Layer6Config,
+    /// **Deprecated compatibility key.** Use `memory.contextManagement.forkedAgent`.
     #[serde(default)]
     pub layer7: Layer7Config,
     #[serde(
@@ -763,6 +764,35 @@ impl Default for MemoryRecallConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct ContextManagementConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_agent: Option<Layer7Config>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeSystemConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_budget: Option<PromptBudgetConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_recall: Option<MemoryRecallConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningSystemConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl LearningSystemConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryConfig {
     #[serde(default)]
     pub vector: MemoryVectorConfig,
@@ -775,6 +805,38 @@ pub struct MemoryConfig {
     /// Recall policy by interaction mode and internal channel.
     #[serde(default)]
     pub memory_recall: MemoryRecallConfig,
+    /// Public context-window management subsystem.
+    #[serde(default)]
+    pub context_management: ContextManagementConfig,
+    /// Public durable/short-term knowledge and retrieval subsystem.
+    #[serde(default)]
+    pub knowledge_system: KnowledgeSystemConfig,
+    /// Public background learning subsystem.
+    #[serde(default)]
+    pub learning_system: LearningSystemConfig,
+}
+
+impl MemoryConfig {
+    pub fn effective_forked_agent(&self) -> Layer7Config {
+        self.context_management
+            .forked_agent
+            .clone()
+            .unwrap_or_else(|| self.memory_system.layer7.clone())
+    }
+
+    pub fn effective_prompt_budget(&self) -> PromptBudgetConfig {
+        self.knowledge_system
+            .prompt_budget
+            .clone()
+            .unwrap_or_else(|| self.prompt_budget.clone())
+    }
+
+    pub fn effective_memory_recall(&self) -> MemoryRecallConfig {
+        self.knowledge_system
+            .memory_recall
+            .clone()
+            .unwrap_or_else(|| self.memory_recall.clone())
+    }
 }
 
 /// Self-Improve 配置 — Nudge + Review 子系统

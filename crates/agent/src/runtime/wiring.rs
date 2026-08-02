@@ -378,7 +378,8 @@ impl AgentRuntime {
     pub async fn init_memory_system(&mut self, session_id: String) -> std::io::Result<()> {
         use crate::memory_system::MemorySystem;
 
-        let config = self.config.memory.memory_system.clone();
+        let mut config = self.config.memory.memory_system.clone();
+        config.layer7 = self.config.memory.effective_forked_agent();
         // Use paths.base as both workspace and config directory
         let base_dir = self.paths.base.clone();
 

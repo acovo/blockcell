@@ -11,6 +11,11 @@ Ghost 学习的产品目标是让助手在真实使用中持续变聪明：记�
 
 当前实现不再走“生成中间资产、等待审批、再发布”的旧式流水线。Ghost 学习不是独立 daemon 主导的训练系统，而是 agent runtime 的嵌入式工作流，触发点来自 turn end、pre-compress、session rotate、session end、delegation end 等生命周期边界。
 
+pre-compress、session rotate、session end 与 delegation end 使用统一的边界学习任务：
+一次读取并冻结历史快照，合并 session summary、durable memory、user preferences 和
+skill candidate 请求。后台提供方调用总预算最多为 2 次（一次分类，最多一次深化），Dream
+仍保持独立的低频维护节奏。审计记录包含请求输出、调用次数、成功分发目标、部分失败与停止原因。
+
 ---
 
 ## 1. 目标与非目标
@@ -42,7 +47,7 @@ Ghost 学习的产品目标是让助手在真实使用中持续变聪明：记�
 
 - 在 runtime 边界构建 `GhostEpisodeSnapshot`。
 - 触发 background review。
-- 在 pre-compress/session 边界运行 memory flush。
+- 在 pre-compress/session 边界排入一个合并学习任务，不再额外运行独立 memory flush。
 - 为普通工具调用和后台 review 注入 `memory_file_store`、`skill_file_store`、`session_search`。
 
 关键文件：

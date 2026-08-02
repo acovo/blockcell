@@ -2,6 +2,11 @@
 
 > 注意：当前实现使用内存计数器，SQLite/jsonl 持久化暂未实现。
 
+> 架构更新（2026-08）：本文保留 7 Layer 作为内部实现分解；公共配置与产品概念统一为
+> Context Management、Knowledge System、Learning System 三个子系统。原
+> `memorySystem.layer7` 已弃用，并在一个兼容版本内映射到
+> `contextManagement.forkedAgent`，显式新配置优先。
+
 ---
 
 ## 目录

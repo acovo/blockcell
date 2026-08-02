@@ -12,6 +12,39 @@
 
 ## 记忆系统的架构
 
+从配置和运维视角，BlockCell 只暴露三个子系统：
+
+| 子系统 | 职责 |
+|---|---|
+| Context Management | 工具结果缓存、micro/full compact、恢复预算与 Forked Agent 执行 |
+| Knowledge System | `USER.md`/`MEMORY.md`、短期记忆、FTS/向量索引、统一召回与 Prompt Budget |
+| Learning System | 边界捕获、合并审查、Skill 学习和低频 Dream 维护 |
+
+推荐配置：
+
+```json5
+memory: {
+  contextManagement: {
+    forkedAgent: { enabled: true, maxTurns: 10, timeoutSecs: 120 }
+  },
+  knowledgeSystem: {
+    promptBudget: {
+      total: 12000,
+      rules: 2000,
+      userProfile: 800,
+      retrieved: 3000,
+      activeSkill: 4000,
+      sessionRecovery: 2000
+    },
+    memoryRecall: { chat: true, general: true, skill: true, internal: false }
+  },
+  learningSystem: { enabled: true }
+}
+```
+
+旧 `memory.memorySystem.layer7` 仅保留一个兼容版本，并映射到
+`memory.contextManagement.forkedAgent`；同时配置时新键优先。
+
 blockcell 采用“**文件作为长期事实源，SQLite 作为可重建索引、短期存储和审计**”的架构：
 
 ```text
@@ -169,6 +202,14 @@ blockcell 采用“**文件作为长期事实源，SQLite 作为可重建索引�
 ---
 
 ## 长期知识如何召回
+
+系统提示词只生成一个 `<retrieved-context>` 区块，所有来源先标注、去重并按
+`user-profile > knowledge > session > short-term > skill-index` 解决冲突，然后服从全局
+Prompt Budget。Chat、General、Skill 可分别开关；`ghost`、`cron`、`system`、`subagent`
+默认视为内部流量，不召回用户知识。
+
+`knowledge_fts` 与 `memory_fts` 使用 trigram tokenizer。旧索引在启动时自动重建；连续中文
+查询会展开为重叠 bigram，因此“发版检查什么”可以命中“发布前需要检查 changelog 和版本号”。
 
 `KnowledgeIndex` 增量索引 `USER.md` 和 `memory/MEMORY.md`。召回候选按以下规则收敛：
 

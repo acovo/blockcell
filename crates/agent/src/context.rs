@@ -132,10 +132,11 @@ impl ContextBuilder {
         Self {
             paths,
             skill_manager: Some(skill_manager),
-            ghost_learning_enabled: config.agents.ghost.learning.capture_enabled(),
+            ghost_learning_enabled: config.memory.learning_system.enabled()
+                && config.agents.ghost.learning.capture_enabled(),
             memory_recall_enabled: config.agents.ghost.learning.recall_enabled(),
-            memory_recall_policy: config.memory.memory_recall.clone(),
-            prompt_budget: config.memory.prompt_budget.clone(),
+            memory_recall_policy: config.memory.effective_memory_recall(),
+            prompt_budget: config.memory.effective_prompt_budget(),
             file_memory_snapshots: Mutex::new(HashMap::new()),
             memory_store: None,
             memory_injector: None,
