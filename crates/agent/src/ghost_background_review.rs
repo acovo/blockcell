@@ -1291,6 +1291,9 @@ mod tests {
 
         let durable_user = std::fs::read_to_string(paths.user_md()).expect("global USER.md");
         assert!(durable_user.contains("canary-first rollout"));
+        let index = blockcell_storage::KnowledgeIndex::open(&paths.knowledge_index_db())
+            .expect("open knowledge index");
+        assert_eq!(index.search("canary-first", 10).unwrap().len(), 1);
         let old_session = MemoryFileStore::open_for_session(&paths, "cli:ghost-review")
             .expect("open original session store")
             .load_snapshot()

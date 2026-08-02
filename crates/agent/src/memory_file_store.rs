@@ -59,6 +59,9 @@ pub struct MemoryFileStore {
     /// Unified write guard for coordinated write protection across memory + skill files
     write_guard: Option<Arc<WriteGuard>>,
     write_lock: Arc<Mutex<()>>,
+    knowledge_index: Option<Arc<blockcell_storage::KnowledgeIndex>>,
+    user_index_file: String,
+    memory_index_file: String,
 }
 
 #[derive(Debug, Clone)]
@@ -69,11 +72,18 @@ pub struct MemoryFileStoreRouter {
 
 impl MemoryFileStoreRouter {
     pub fn open(paths: &Paths, session_key: Option<&str>, write_enabled: bool) -> Result<Self> {
-        let durable = if write_enabled {
+        let mut durable = if write_enabled {
             MemoryFileStore::open(paths)?
         } else {
             MemoryFileStore::open_shadow(paths)?
         };
+        if write_enabled {
+            let index = Arc::new(blockcell_storage::KnowledgeIndex::open(
+                &paths.knowledge_index_db(),
+            )?);
+            index.rebuild_from_files(paths)?;
+            durable.set_knowledge_index(index, "USER.md", "memory/MEMORY.md");
+        }
         let session = match (write_enabled, session_key) {
             (true, Some(session_key)) => MemoryFileStore::open_for_session(paths, session_key)?,
             (false, Some(session_key)) => {
@@ -138,7 +148,21 @@ impl MemoryFileStore {
             lock_path: state_dir.join(".memory_file_store.lockdir"),
             write_guard: None,
             write_lock: Arc::new(Mutex::new(())),
+            knowledge_index: None,
+            user_index_file: "USER.md".to_string(),
+            memory_index_file: "memory/MEMORY.md".to_string(),
         })
+    }
+
+    pub fn set_knowledge_index(
+        &mut self,
+        index: Arc<blockcell_storage::KnowledgeIndex>,
+        user_file: impl Into<String>,
+        memory_file: impl Into<String>,
+    ) {
+        self.knowledge_index = Some(index);
+        self.user_index_file = user_file.into();
+        self.memory_index_file = memory_file.into();
     }
 
     pub fn load_snapshot(&self) -> Result<MemoryFileSnapshot> {
@@ -171,6 +195,7 @@ impl MemoryFileStore {
         ensure_char_budget(target, &entries)?;
         let snapshot_ref = self.snapshot_before_write(target, path)?;
         atomic_write_entries(path, &entries)?;
+        self.sync_knowledge_index(target)?;
         Ok(MemoryFileMutation {
             target,
             action: "add".to_string(),
@@ -214,6 +239,7 @@ impl MemoryFileStore {
         ensure_char_budget(target, &entries)?;
         let snapshot_ref = self.snapshot_before_write(target, path)?;
         atomic_write_entries(path, &entries)?;
+        self.sync_knowledge_index(target)?;
         Ok(MemoryFileMutation {
             target,
             action: "replace".to_string(),
@@ -249,6 +275,7 @@ impl MemoryFileStore {
         entries.remove(matches[0]);
         let snapshot_ref = self.snapshot_before_write(target, path)?;
         atomic_write_entries(path, &entries)?;
+        self.sync_knowledge_index(target)?;
         Ok(MemoryFileMutation {
             target,
             action: "remove".to_string(),
@@ -274,6 +301,7 @@ impl MemoryFileStore {
         let current_snapshot = self.snapshot_before_write(target, path)?;
         let restored_content = fs::read_to_string(&snapshot_path)?;
         atomic_write_text(path, &restored_content)?;
+        self.sync_knowledge_index(target)?;
         Ok(MemoryFileMutation {
             target,
             action: "restore_latest".to_string(),
@@ -326,6 +354,18 @@ impl MemoryFileStore {
             MemoryFileTarget::User => &self.user_path,
             MemoryFileTarget::Memory => &self.memory_path,
         }
+    }
+
+    fn sync_knowledge_index(&self, target: MemoryFileTarget) -> Result<()> {
+        let Some(index) = self.knowledge_index.as_ref() else {
+            return Ok(());
+        };
+        let (file, scope) = match target {
+            MemoryFileTarget::User => (&self.user_index_file, "user"),
+            MemoryFileTarget::Memory => (&self.memory_index_file, "workspace"),
+        };
+        index.rebuild_file(file, self.path_for(target), scope)?;
+        Ok(())
     }
 
     fn snapshot_before_write(
@@ -595,6 +635,29 @@ mod tests {
             .user_block
             .unwrap()
             .contains("User prefers concise Chinese updates."));
+    }
+
+    #[test]
+    fn memory_file_store_syncs_canonical_mutations_to_knowledge_index() {
+        let paths = test_paths("knowledge-index-sync");
+        paths.ensure_dirs().unwrap();
+        let index =
+            Arc::new(blockcell_storage::KnowledgeIndex::open(&paths.knowledge_index_db()).unwrap());
+        let mut store = MemoryFileStore::open(&paths).unwrap();
+        store.set_knowledge_index(index.clone(), "USER.md", "memory/MEMORY.md");
+
+        store
+            .add(
+                MemoryFileTarget::User,
+                "User prefers terse release summaries.",
+            )
+            .unwrap();
+        assert_eq!(index.search("terse", 10).unwrap().len(), 1);
+
+        store
+            .remove(MemoryFileTarget::User, "terse release summaries")
+            .unwrap();
+        assert!(index.search("terse", 10).unwrap().is_empty());
     }
 
     #[test]

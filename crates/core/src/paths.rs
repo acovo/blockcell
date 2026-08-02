@@ -262,6 +262,10 @@ impl Paths {
         self.memory_dir().join("MEMORY.md")
     }
 
+    pub fn knowledge_index_db(&self) -> PathBuf {
+        self.memory_dir().join("knowledge_index.db")
+    }
+
     pub fn daily_memory(&self, date: &str) -> PathBuf {
         self.memory_dir().join(format!("{}.md", date))
     }

@@ -720,11 +720,19 @@ impl AgentRuntime {
     }
 
     pub fn init_memory_file_store(&mut self) -> Result<()> {
-        let mut store = if self.config.agents.ghost.learning.write_enabled() {
+        let write_enabled = self.config.agents.ghost.learning.write_enabled();
+        let mut store = if write_enabled {
             MemoryFileStore::open(&self.paths)?
         } else {
             MemoryFileStore::open_shadow(&self.paths)?
         };
+        if write_enabled {
+            let index = Arc::new(blockcell_storage::KnowledgeIndex::open(
+                &self.paths.knowledge_index_db(),
+            )?);
+            index.rebuild_from_files(&self.paths)?;
+            store.set_knowledge_index(index, "USER.md", "memory/MEMORY.md");
+        }
         store.set_write_guard(Arc::clone(&self.write_guard));
         self.memory_file_store = Some(Arc::new(store));
         Ok(())
