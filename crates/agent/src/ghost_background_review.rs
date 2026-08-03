@@ -1386,18 +1386,25 @@ mod tests {
         assert!(old_session.user_block.is_none());
 
         let builder = ContextBuilder::new(paths, config);
-        let prompt = builder.build_system_prompt_for_mode_with_channel_and_session(
+        let messages = builder.build_messages_for_session_mode_with_channel(
+            "cli:new-session",
+            &[],
+            "canary-first",
+            &[],
             InteractionMode::General,
             None,
             &HashSet::new(),
             &HashSet::new(),
             "cli",
-            "canary-first",
+            false,
             &[],
             &[],
-            Some("cli:new-session"),
         );
-        assert!(prompt.contains("canary-first rollout"));
+        let runtime_context = messages[messages.len() - 2]
+            .content
+            .as_str()
+            .expect("runtime context");
+        assert!(runtime_context.contains("canary-first rollout"));
     }
 
     #[tokio::test]

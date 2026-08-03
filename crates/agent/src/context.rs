@@ -9,10 +9,11 @@ use blockcell_skills::manager::SkillSource;
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig, LLMProvider, SkillManager};
 use blockcell_tools::MemoryStoreHandle;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InteractionMode {
     Skill,
     Chat,
@@ -92,6 +93,7 @@ pub struct ContextBuilder {
     memory_recall_policy: MemoryRecallConfig,
     prompt_budget: blockcell_core::config::PromptBudgetConfig,
     file_memory_snapshots: Mutex<HashMap<String, FrozenFileMemorySnapshot>>,
+    system_prompt_snapshots: Mutex<HashMap<String, String>>,
     memory_store: Option<MemoryStoreHandle>,
     /// Layer 5 记忆注入器 (7 层记忆系统)
     memory_injector: Option<MemoryInjector>,
@@ -138,6 +140,7 @@ impl ContextBuilder {
             memory_recall_policy: config.memory.effective_memory_recall(),
             prompt_budget: config.memory.effective_prompt_budget(),
             file_memory_snapshots: Mutex::new(HashMap::new()),
+            system_prompt_snapshots: Mutex::new(HashMap::new()),
             memory_store: None,
             memory_injector: None,
             capability_brief: None,
@@ -300,6 +303,45 @@ impl ContextBuilder {
             .clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn frozen_system_prompt(
+        &self,
+        session_key: &str,
+        mode: InteractionMode,
+        active_skill: Option<&ActiveSkillContext>,
+        available_tool_names: &[String],
+        tool_prompt_rules: &[String],
+    ) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        mode.hash(&mut hasher);
+        available_tool_names.hash(&mut hasher);
+        tool_prompt_rules.hash(&mut hasher);
+        self.capability_brief.hash(&mut hasher);
+        self.memory_store.is_some().hash(&mut hasher);
+        if let Some(skill) = active_skill {
+            skill.name.hash(&mut hasher);
+            skill.prompt_md.hash(&mut hasher);
+            skill.inject_prompt_md.hash(&mut hasher);
+            skill.fallback_message.hash(&mut hasher);
+        }
+        let cache_key = format!("{session_key}:{:016x}", hasher.finish());
+        let mut snapshots = self
+            .system_prompt_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshots
+            .entry(cache_key)
+            .or_insert_with(|| {
+                self.build_system_prompt_inner(
+                    mode,
+                    active_skill,
+                    available_tool_names,
+                    tool_prompt_rules,
+                )
+            })
+            .clone()
+    }
+
     pub fn resolve_active_skill(
         &self,
         user_input: &str,
@@ -377,48 +419,28 @@ impl ContextBuilder {
         &self,
         mode: InteractionMode,
         active_skill: Option<&ActiveSkillContext>,
-        disabled_skills: &HashSet<String>,
-        disabled_tools: &HashSet<String>,
-        channel: &str,
-        user_query: &str,
+        _disabled_skills: &HashSet<String>,
+        _disabled_tools: &HashSet<String>,
+        _channel: &str,
+        _user_query: &str,
         available_tool_names: &[String],
         tool_prompt_rules: &[String],
-        session_key: Option<&str>,
+        _session_key: Option<&str>,
     ) -> String {
-        self.build_system_prompt_inner(
-            mode,
-            active_skill,
-            disabled_skills,
-            disabled_tools,
-            channel,
-            user_query,
-            available_tool_names,
-            tool_prompt_rules,
-            session_key,
-            None,
-        )
+        self.build_system_prompt_inner(mode, active_skill, available_tool_names, tool_prompt_rules)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_system_prompt_inner(
         &self,
         mode: InteractionMode,
         active_skill: Option<&ActiveSkillContext>,
-        disabled_skills: &HashSet<String>,
-        disabled_tools: &HashSet<String>,
-        channel: &str,
-        user_query: &str,
         available_tool_names: &[String],
         tool_prompt_rules: &[String],
-        session_key: Option<&str>,
-        memory_snapshot: Option<&FrozenFileMemorySnapshot>,
     ) -> String {
         let mut prompt = String::new();
         let is_chat = matches!(mode, InteractionMode::Chat);
         let is_skill_mode = matches!(mode, InteractionMode::Skill);
         let is_general = matches!(mode, InteractionMode::General);
-        let mut user_profile_context = String::new();
-        let mut retrieved_context = String::new();
         let mut active_skill_context = String::new();
 
         prompt.push_str("You are blockcell, an AI assistant with access to tools.\n\n");
@@ -497,82 +519,6 @@ impl ContextBuilder {
             prompt.push('\n');
         }
 
-        let now = chrono::Utc::now();
-        let local_time = chrono::Local::now();
-        prompt.push_str(&format!(
-            "Current time: {} ({} UTC)\n",
-            local_time.format("%Y-%m-%d %H:%M:%S"),
-            now.format("%Y-%m-%d %H:%M:%S")
-        ));
-        prompt.push_str(&format!(
-            "Workspace: {}\n\n",
-            self.paths.workspace().display()
-        ));
-
-        let recall_mode = match mode {
-            InteractionMode::Chat => MemoryRecallMode::Chat,
-            InteractionMode::General => MemoryRecallMode::General,
-            InteractionMode::Skill => MemoryRecallMode::Skill,
-        };
-        if self.memory_recall_enabled
-            && self.memory_recall_policy.allows(recall_mode, channel)
-            && !user_query.is_empty()
-        {
-            let skill_summary = self
-                .skill_index_summary
-                .read()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone();
-            let snapshot = memory_snapshot
-                .map(|snapshot| (snapshot.user.as_deref(), snapshot.memory.as_deref()));
-            if let Ok(items) = RetrievalOrchestrator::retrieve_with_snapshot(
-                &self.paths,
-                self.memory_store.as_ref(),
-                session_key,
-                user_query,
-                skill_summary.as_deref(),
-                snapshot,
-                20,
-            ) {
-                let (profile, retrieved): (Vec<_>, Vec<_>) = items
-                    .into_iter()
-                    .partition(|item| item.source == RetrievalSource::UserProfile);
-                user_profile_context = RetrievalOrchestrator::render(&profile);
-                retrieved_context = RetrievalOrchestrator::render(&retrieved);
-            }
-        }
-
-        if !disabled_skills.is_empty() || !disabled_tools.is_empty() {
-            prompt.push_str("## ⚠️ Disabled Items\n");
-            prompt.push_str("The following items have been disabled by the user via toggle.\n");
-            prompt.push_str("IMPORTANT: When user asks to 打开/开启/启用/enable any of these, you MUST call `toggle_manage` tool with action='set', category, name, enabled=true. Do NOT use list_skills.\n");
-            if !disabled_skills.is_empty() {
-                let mut names: Vec<&String> = disabled_skills.iter().collect();
-                names.sort();
-                prompt.push_str(&format!(
-                    "Disabled skills: {}\n",
-                    names
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            if !disabled_tools.is_empty() {
-                let mut names: Vec<&String> = disabled_tools.iter().collect();
-                names.sort();
-                prompt.push_str(&format!(
-                    "Disabled tools: {}\n",
-                    names
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            prompt.push('\n');
-        }
-
         if is_skill_mode {
             if let Some(ref brief) = self.capability_brief {
                 prompt.push_str("## Dynamic Evolved Tools\n");
@@ -617,39 +563,100 @@ impl ContextBuilder {
 
         PromptBudgetAllocator::new(self.prompt_budget.clone()).assemble(PromptSections {
             rules: prompt,
-            user_profile: user_profile_context,
-            retrieved: retrieved_context,
+            user_profile: String::new(),
+            retrieved: String::new(),
             active_skill: active_skill_context,
             session_recovery: String::new(),
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_system_prompt_for_mode_with_channel_and_memory_snapshot(
+    fn build_runtime_context(
         &self,
         mode: InteractionMode,
-        active_skill: Option<&ActiveSkillContext>,
         disabled_skills: &HashSet<String>,
         disabled_tools: &HashSet<String>,
         channel: &str,
         user_query: &str,
-        available_tool_names: &[String],
-        tool_prompt_rules: &[String],
-        memory_snapshot: Option<&FrozenFileMemorySnapshot>,
         session_key: Option<&str>,
+        memory_snapshot: Option<&FrozenFileMemorySnapshot>,
     ) -> String {
-        self.build_system_prompt_inner(
-            mode,
-            active_skill,
-            disabled_skills,
-            disabled_tools,
-            channel,
-            user_query,
-            available_tool_names,
-            tool_prompt_rules,
-            session_key,
-            memory_snapshot,
-        )
+        let now = chrono::Utc::now();
+        let local_time = chrono::Local::now();
+        let mut runtime_rules = format!(
+            "Current time: {} ({} UTC)\nWorkspace: {}\n",
+            local_time.format("%Y-%m-%d %H:%M"),
+            now.format("%Y-%m-%d %H:%M"),
+            self.paths.workspace().display()
+        );
+
+        if !disabled_skills.is_empty() || !disabled_tools.is_empty() {
+            runtime_rules.push_str("\n## ⚠️ Disabled Items\n");
+            runtime_rules
+                .push_str("The following items have been disabled by the user via toggle.\n");
+            runtime_rules.push_str("IMPORTANT: When user asks to 打开/开启/启用/enable any of these, call `toggle_manage` with action='set', the matching category and name, and enabled=true.\n");
+            if !disabled_skills.is_empty() {
+                let mut names = disabled_skills
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                names.sort_unstable();
+                runtime_rules.push_str(&format!("Disabled skills: {}\n", names.join(", ")));
+            }
+            if !disabled_tools.is_empty() {
+                let mut names = disabled_tools
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                names.sort_unstable();
+                runtime_rules.push_str(&format!("Disabled tools: {}\n", names.join(", ")));
+            }
+        }
+
+        let mut user_profile_context = String::new();
+        let mut retrieved_context = String::new();
+        let recall_mode = match mode {
+            InteractionMode::Chat => MemoryRecallMode::Chat,
+            InteractionMode::General => MemoryRecallMode::General,
+            InteractionMode::Skill => MemoryRecallMode::Skill,
+        };
+        if self.memory_recall_enabled
+            && self.memory_recall_policy.allows(recall_mode, channel)
+            && !user_query.is_empty()
+        {
+            let skill_summary = self
+                .skill_index_summary
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            let snapshot = memory_snapshot
+                .map(|snapshot| (snapshot.user.as_deref(), snapshot.memory.as_deref()));
+            if let Ok(items) = RetrievalOrchestrator::retrieve_with_snapshot(
+                &self.paths,
+                self.memory_store.as_ref(),
+                session_key,
+                user_query,
+                skill_summary.as_deref(),
+                snapshot,
+                20,
+            ) {
+                let (profile, retrieved): (Vec<_>, Vec<_>) = items
+                    .into_iter()
+                    .partition(|item| item.source == RetrievalSource::UserProfile);
+                user_profile_context = RetrievalOrchestrator::render(&profile);
+                retrieved_context = RetrievalOrchestrator::render(&retrieved);
+            }
+        }
+
+        let rendered =
+            PromptBudgetAllocator::new(self.prompt_budget.clone()).assemble(PromptSections {
+                rules: runtime_rules,
+                user_profile: user_profile_context,
+                retrieved: retrieved_context,
+                active_skill: String::new(),
+                session_recovery: String::new(),
+            });
+        format!("<runtime-context>\n{}</runtime-context>", rendered.trim())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -687,6 +694,16 @@ impl ContextBuilder {
             media,
             pending_intent,
         );
+        let runtime_context = self.build_runtime_context(
+            mode,
+            disabled_skills,
+            disabled_tools,
+            channel,
+            user_content,
+            None,
+            None,
+        );
+        Self::insert_ephemeral_context(&mut messages, &runtime_context);
         messages
     }
 
@@ -708,17 +725,12 @@ impl ContextBuilder {
     ) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
         let memory_snapshot = self.frozen_file_memory_snapshot(session_key);
-        let system_prompt = self.build_system_prompt_for_mode_with_channel_and_memory_snapshot(
+        let system_prompt = self.frozen_system_prompt(
+            session_key,
             mode,
             active_skill,
-            disabled_skills,
-            disabled_tools,
-            channel,
-            user_content,
             available_tool_names,
             tool_prompt_rules,
-            Some(&memory_snapshot),
-            Some(session_key),
         );
         messages.push(ChatMessage::system(&system_prompt));
         self.append_history_and_user_message(
@@ -728,7 +740,28 @@ impl ContextBuilder {
             media,
             pending_intent,
         );
+        let runtime_context = self.build_runtime_context(
+            mode,
+            disabled_skills,
+            disabled_tools,
+            channel,
+            user_content,
+            Some(session_key),
+            Some(&memory_snapshot),
+        );
+        Self::insert_ephemeral_context(&mut messages, &runtime_context);
         messages
+    }
+
+    fn insert_ephemeral_context(messages: &mut Vec<ChatMessage>, content: &str) {
+        if content.trim().is_empty() {
+            return;
+        }
+        let insert_at = messages
+            .iter()
+            .rposition(|message| message.role == "user")
+            .unwrap_or(messages.len());
+        messages.insert(insert_at, ChatMessage::user(content));
     }
 
     fn append_history_and_user_message(
@@ -1065,16 +1098,19 @@ mod tests {
         let mut builder = ContextBuilder::new(paths, config);
         builder.set_memory_store(store.clone());
 
-        builder.build_system_prompt_for_mode_with_channel_and_session(
+        builder.build_messages_for_session_mode_with_channel(
+            "ws:account:3:opschat-a",
+            &[],
+            "remember language",
+            &[],
             InteractionMode::General,
             None,
             &HashSet::new(),
             &HashSet::new(),
             "ws",
-            "remember language",
+            false,
             &[],
             &[],
-            Some("ws:account:3:opschat-a"),
         );
 
         assert_eq!(
@@ -1308,16 +1344,21 @@ description: deploy demo
         let mut builder = ContextBuilder::new(paths, config);
         builder.set_memory_store(Arc::new(EmptyMemoryStore));
 
-        let prompt = builder.build_system_prompt_for_mode_with_channel(
+        let messages = builder.build_messages_for_session_mode_with_channel(
+            "cli:file-memory",
+            &[],
+            "release verification",
+            &[],
             InteractionMode::General,
             None,
             &HashSet::new(),
             &HashSet::new(),
             "cli",
-            "release verification",
+            false,
             &[],
             &[],
         );
+        let prompt = test_chat_message_text(&messages[messages.len() - 2]);
 
         assert!(prompt.contains("<retrieved-context>"));
         assert!(prompt.contains("[knowledge]"));
@@ -1339,16 +1380,21 @@ description: deploy demo
         config.agents.ghost.learning.recall_enabled = Some(true);
         let builder = ContextBuilder::new(paths, config);
 
-        let prompt = builder.build_system_prompt_for_mode_with_channel(
+        let messages = builder.build_messages_for_session_mode_with_channel(
+            "cli:deduplicated-retrieval",
+            &[],
+            "concise code replies",
+            &[],
             InteractionMode::General,
             None,
             &HashSet::new(),
             &HashSet::new(),
             "cli",
-            "concise code replies",
+            false,
             &[],
             &[],
         );
+        let prompt = test_chat_message_text(&messages[messages.len() - 2]);
 
         assert!(prompt.contains("<retrieved-context>"));
         assert!(prompt.contains("[user-profile]"));
@@ -1469,18 +1515,9 @@ description: deploy demo
             &[],
         );
 
-        let first_prompt = first
-            .first()
-            .map(test_chat_message_text)
-            .unwrap_or_default();
-        let same_prompt = same_session
-            .first()
-            .map(test_chat_message_text)
-            .unwrap_or_default();
-        let next_prompt = next_session
-            .first()
-            .map(test_chat_message_text)
-            .unwrap_or_default();
+        let first_prompt = test_chat_message_text(&first[first.len() - 2]);
+        let same_prompt = test_chat_message_text(&same_session[same_session.len() - 2]);
+        let next_prompt = test_chat_message_text(&next_session[next_session.len() - 2]);
         assert!(first_prompt.contains("Initial durable memory."));
         assert!(same_prompt.contains("Initial durable memory."));
         assert!(!same_prompt.contains("Updated durable memory."));
@@ -1539,16 +1576,21 @@ description: deploy demo
         config.memory.memory_recall.chat = true;
         let builder = ContextBuilder::new(paths, config);
 
-        let prompt = builder.build_system_prompt_for_mode_with_channel(
+        let messages = builder.build_messages_for_session_mode_with_channel(
+            "cli:chat-recall",
+            &[],
+            "concise",
+            &[],
             InteractionMode::Chat,
             None,
             &HashSet::new(),
             &HashSet::new(),
             "cli",
-            "concise",
+            false,
             &[],
             &[],
         );
+        let prompt = test_chat_message_text(&messages[messages.len() - 2]);
 
         assert!(prompt.contains("<retrieved-context>"));
         assert!(prompt.contains("[user-profile]"));
@@ -1574,4 +1616,112 @@ description: deploy demo
         assert_eq!(messages[0].content.as_str(), Some(user_content.as_str()));
         assert!(messages[0].content.as_str().unwrap().contains(marker));
     }
+}
+#[test]
+fn session_messages_keep_dynamic_context_out_of_system_prompt() {
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-stable-system-prompt-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let paths = Paths::with_base(base);
+    paths.ensure_dirs().expect("ensure dirs");
+    std::fs::write(
+        paths.memory_md(),
+        "Release verification requires a rollback checklist.",
+    )
+    .expect("write memory");
+    let mut config = Config::default();
+    config.agents.ghost.learning.recall_enabled = Some(true);
+    let builder = ContextBuilder::new(paths.clone(), config);
+    let disabled_tools = HashSet::from(["shell".to_string()]);
+
+    let messages = builder.build_messages_for_session_mode_with_channel(
+        "cli:stable-prefix",
+        &[],
+        "release verification",
+        &[],
+        InteractionMode::General,
+        None,
+        &HashSet::new(),
+        &disabled_tools,
+        "cli",
+        false,
+        &[],
+        &[],
+    );
+
+    let system = messages[0].content.as_str().expect("system prompt");
+    assert!(!system.contains("Current time:"));
+    assert!(!system.contains("<retrieved-context>"));
+    assert!(!system.contains("Disabled tools:"));
+
+    let ephemeral = messages[messages.len() - 2]
+        .content
+        .as_str()
+        .expect("ephemeral context");
+    assert_eq!(messages[messages.len() - 2].role, "user");
+    assert!(ephemeral.contains("<runtime-context>"));
+    assert!(ephemeral.contains("Current time:"));
+    assert!(ephemeral.contains(&format!("Workspace: {}", paths.workspace().display())));
+    assert!(ephemeral.contains("<retrieved-context>"));
+    assert!(ephemeral.contains("rollback checklist"));
+    assert!(ephemeral.contains("Disabled tools: shell"));
+    assert_eq!(
+        messages.last().unwrap().content.as_str(),
+        Some("release verification")
+    );
+}
+
+#[test]
+fn session_system_prompt_snapshot_ignores_agents_file_changes() {
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-frozen-system-prompt-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let paths = Paths::with_base(base);
+    paths.ensure_dirs().expect("ensure dirs");
+    std::fs::write(paths.agents_md(), "Initial agent rule.").expect("write agents md");
+    let builder = ContextBuilder::new(paths.clone(), Config::default());
+
+    let first = builder.build_messages_for_session_mode_with_channel(
+        "cli:frozen-prefix",
+        &[],
+        "first",
+        &[],
+        InteractionMode::General,
+        None,
+        &HashSet::new(),
+        &HashSet::new(),
+        "cli",
+        false,
+        &[],
+        &[],
+    );
+    std::fs::write(paths.agents_md(), "Changed agent rule.").expect("update agents md");
+    let second = builder.build_messages_for_session_mode_with_channel(
+        "cli:frozen-prefix",
+        &[],
+        "second",
+        &[],
+        InteractionMode::General,
+        None,
+        &HashSet::new(),
+        &HashSet::new(),
+        "cli",
+        false,
+        &[],
+        &[],
+    );
+
+    assert_eq!(first[0].content, second[0].content);
+    assert!(first[0]
+        .content
+        .as_str()
+        .unwrap()
+        .contains("Initial agent rule."));
+    assert!(!second[0]
+        .content
+        .as_str()
+        .unwrap()
+        .contains("Changed agent rule."));
 }

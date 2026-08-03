@@ -1462,7 +1462,10 @@ fn test_build_script_skill_summary_prompt_includes_skill_md_brief() {
 
 #[test]
 fn test_skill_prompt_injection_keeps_activate_skill_mainline() {
-    let mut messages = vec![ChatMessage::system("You are BlockCell.")];
+    let mut messages = vec![
+        ChatMessage::system("You are BlockCell."),
+        ChatMessage::user("run the local demo"),
+    ];
     let skill_cards = vec![SkillCard {
         name: "local_demo".to_string(),
         description: "Local demo skill".to_string(),
@@ -1476,7 +1479,12 @@ fn test_skill_prompt_injection_keeps_activate_skill_mainline() {
 
     inject_skill_cards_into_system_prompt(&mut messages, &skill_cards, Some("local_demo"));
 
-    let prompt = messages[0].content.as_str().unwrap_or_default();
+    assert_eq!(messages[0].content.as_str(), Some("You are BlockCell."));
+    let prompt = messages[messages.len() - 2]
+        .content
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(messages[messages.len() - 2].role, "user");
     assert!(prompt.contains("## Installed Skills"));
     assert!(prompt.contains(
         "Use `activate_skill` when one installed skill is a better fit than general tools."
@@ -1487,6 +1495,10 @@ fn test_skill_prompt_injection_keeps_activate_skill_mainline() {
     assert!(prompt.contains("Recent active skill: `local_demo`"));
     assert!(prompt.contains("布局: PromptTool + LocalScript"));
     assert!(prompt.contains("本地入口: scripts/hello.sh"));
+    assert_eq!(
+        messages.last().unwrap().content.as_str(),
+        Some("run the local demo")
+    );
 }
 
 #[test]
@@ -4416,11 +4428,32 @@ async fn test_completed_agent_prompt_injection_does_not_mark_before_response() {
             .unwrap()
             .result_injected
     );
-    assert!(messages[0]
+    assert_eq!(messages[0].content.as_str(), Some("base prompt"));
+    assert!(messages[messages.len() - 2]
         .content
         .as_str()
         .unwrap()
         .contains("Completed Agent Results"));
+    assert_eq!(
+        messages.last().unwrap().content.as_str(),
+        Some("summarize the agent result")
+    );
+}
+
+#[tokio::test]
+async fn test_no_background_tasks_adds_no_prompt_noise() {
+    let task_manager = TaskManager::new();
+    let mut messages = vec![
+        ChatMessage::system("base prompt"),
+        ChatMessage::user("continue"),
+    ];
+
+    let injected_ids = inject_running_tasks_into_system_prompt(&mut messages, &task_manager).await;
+
+    assert!(injected_ids.is_empty());
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].content.as_str(), Some("base prompt"));
+    assert_eq!(messages[1].content.as_str(), Some("continue"));
 }
 
 // ========== Mock Provider for Inter-Agent Tests ==========

@@ -393,7 +393,7 @@ fn build_activate_skill_tool_schema(skill_cards: &[SkillCard]) -> Option<serde_j
 }
 
 fn inject_skill_cards_into_system_prompt(
-    messages: &mut [ChatMessage],
+    messages: &mut Vec<ChatMessage>,
     skill_cards: &[SkillCard],
     recent_skill_name: Option<&str>,
 ) {
@@ -401,19 +401,8 @@ fn inject_skill_cards_into_system_prompt(
         return;
     }
 
-    let Some(system_message) = messages.first_mut() else {
-        return;
-    };
-    if system_message.role != "system" {
-        return;
-    }
-
-    let Some(existing_prompt) = system_message.content.as_str() else {
-        return;
-    };
-
     let mut section = String::from(
-        "\n\n## Installed Skills\nUse `activate_skill` when one installed skill is a better fit than general tools.\nIf you call `activate_skill`, do not call any other tools in the same assistant turn.\n",
+        "## Installed Skills\nUse `activate_skill` when one installed skill is a better fit than general tools.\nIf you call `activate_skill`, do not call any other tools in the same assistant turn.\n",
     );
     section.push_str(
         "If a skill is relevant but you need to inspect the learned procedure before using or patching it, inspect it with `skill_view`. If a loaded skill is stale, incomplete, or wrong, patch it with `skill_manage(action=\"patch\")` before finishing.\n",
@@ -451,7 +440,42 @@ fn inject_skill_cards_into_system_prompt(
         ));
     }
 
-    system_message.content = serde_json::Value::String(format!("{}{}", existing_prompt, section));
+    append_ephemeral_user_context(messages, &section);
+}
+
+fn append_ephemeral_user_context(messages: &mut Vec<ChatMessage>, section: &str) {
+    let Some(current_user_index) = messages.iter().rposition(|message| message.role == "user")
+    else {
+        return;
+    };
+    if current_user_index > 0 {
+        let ephemeral = &mut messages[current_user_index - 1];
+        if ephemeral.role == "user" {
+            if let Some(existing) = ephemeral.content.as_str() {
+                if existing.starts_with("<runtime-context>") {
+                    let updated = if let Some(prefix) = existing.strip_suffix("</runtime-context>")
+                    {
+                        format!(
+                            "{}\n{}\n</runtime-context>",
+                            prefix.trim_end(),
+                            section.trim()
+                        )
+                    } else {
+                        format!("{}\n{}", existing, section.trim())
+                    };
+                    ephemeral.content = serde_json::Value::String(updated);
+                    return;
+                }
+            }
+        }
+    }
+    messages.insert(
+        current_user_index,
+        ChatMessage::user(&format!(
+            "<runtime-context>\n{}\n</runtime-context>",
+            section.trim()
+        )),
+    );
 }
 
 /// Inject current running typed-agent tasks into the system prompt.
@@ -462,7 +486,7 @@ fn inject_skill_cards_into_system_prompt(
 /// message tasks (msg_*) are excluded since they are just conversation sessions,
 /// not actual background work.
 async fn inject_running_tasks_into_system_prompt(
-    messages: &mut [ChatMessage],
+    messages: &mut Vec<ChatMessage>,
     task_manager: &TaskManager,
 ) -> Vec<String> {
     let task_list = task_manager.list_tasks(Some(&TaskStatus::Running)).await;
@@ -486,46 +510,10 @@ async fn inject_running_tasks_into_system_prompt(
         .collect();
 
     if running_agents.is_empty() && uninject_completed.is_empty() {
-        // 没有运行中的后台任务，注入明确信息到 system prompt
-        let Some(system_message) = messages.first_mut() else {
-            return Vec::new();
-        };
-        if system_message.role != "system" {
-            return Vec::new();
-        }
-        let Some(existing_prompt) = system_message.content.as_str() else {
-            return Vec::new();
-        };
-        let section = "\n\n## Background Tasks\nNo background agent tasks are currently running. You can safely start new tasks using the `agent` tool.\n";
-        system_message.content =
-            serde_json::Value::String(format!("{}{}", existing_prompt, section));
-
-        // 在用户消息末尾追加实时状态覆盖，防止 LLM 基于对话历史中的过时信息误判任务状态
-        // 仅靠 system prompt 头部的注入不够——LLM 对对话末尾的消息更敏感，
-        // 如果历史中 assistant 曾提到 "task is running"，LLM 会忽略 system prompt 而采信历史
-        if let Some(user_msg) = messages.last_mut() {
-            if user_msg.role == "user" {
-                if let Some(text) = user_msg.content.as_str() {
-                    let override_notice = "\n\n[系统实时状态：当前没有任何后台 agent 任务在运行。对话历史中提到的所有任务已完成或已取消，请勿引用任何过时的任务状态。]";
-                    user_msg.content =
-                        serde_json::Value::String(format!("{}{}", text, override_notice));
-                }
-            }
-        }
         return Vec::new();
     }
 
-    let Some(system_message) = messages.first_mut() else {
-        return Vec::new();
-    };
-    if system_message.role != "system" {
-        return Vec::new();
-    }
-    let Some(existing_prompt) = system_message.content.as_str() else {
-        return Vec::new();
-    };
-
-    let mut section = String::from("\n\n## Background Tasks\n");
+    let mut section = String::from("## Background Tasks\n");
     let injected_completed_task_ids: Vec<String> =
         uninject_completed.iter().map(|t| t.id.clone()).collect();
 
@@ -607,7 +595,7 @@ async fn inject_running_tasks_into_system_prompt(
         // 只返回已注入的任务 ID，调用方在主响应成功后再标记 result_injected。
     }
 
-    system_message.content = serde_json::Value::String(format!("{}{}", existing_prompt, section));
+    append_ephemeral_user_context(messages, &section);
     injected_completed_task_ids
 }
 
