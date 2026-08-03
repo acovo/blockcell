@@ -654,6 +654,25 @@ fn extract_llm_usage_tokens(usage: &serde_json::Value) -> (u64, u64) {
     (input, output)
 }
 
+fn extract_llm_cache_tokens(usage: &serde_json::Value) -> (u64, u64) {
+    fn read_u64(usage: &serde_json::Value, key: &str) -> u64 {
+        usage
+            .get(key)
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+                    .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    (
+        read_u64(usage, "cache_read_input_tokens"),
+        read_u64(usage, "cache_creation_input_tokens"),
+    )
+}
+
 fn summarize_tool_args(args: &serde_json::Value) -> String {
     let summary = compact_json_value(args, 0);
     let text = serde_json::to_string(&summary).unwrap_or_else(|_| "<unserializable>".to_string());

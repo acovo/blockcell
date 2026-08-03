@@ -27,6 +27,20 @@ pub struct OpenAIResponsesProvider {
 }
 
 impl OpenAIResponsesProvider {
+    fn normalize_usage(mut usage: Value) -> Value {
+        let cached_tokens = usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64);
+        if let (Some(cached_tokens), Some(object)) = (cached_tokens, usage.as_object_mut()) {
+            object.insert(
+                "cache_read_input_tokens".to_string(),
+                Value::from(cached_tokens),
+            );
+        }
+        usage
+    }
+
     fn request_text_part(role: &str, text: &str) -> Value {
         let part_type = if role == "assistant" {
             "output_text"
@@ -289,6 +303,7 @@ impl OpenAIResponsesProvider {
             },
             max_output_tokens: self.max_tokens,
             temperature: self.temperature,
+            prompt_cache_key: crate::prompt_utils::prompt_cache_key(messages),
         };
 
         let request_body = serde_json::to_string(&request).map_err(|e| {
@@ -451,7 +466,7 @@ impl OpenAIResponsesProvider {
             },
             tool_calls,
             finish_reason,
-            usage: response.get("usage").cloned().unwrap_or(Value::Null),
+            usage: Self::normalize_usage(response.get("usage").cloned().unwrap_or(Value::Null)),
         })
     }
 }
@@ -465,6 +480,8 @@ struct ResponsesRequest {
     max_output_tokens: u32,
     #[serde(serialize_with = "serialize_temperature")]
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 fn serialize_temperature<S>(
@@ -654,6 +671,7 @@ mod tests {
             tools: Vec::new(),
             max_output_tokens: 128,
             temperature: 0.7,
+            prompt_cache_key: None,
         };
 
         let value = serde_json::to_value(request).unwrap();

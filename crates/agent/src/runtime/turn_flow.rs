@@ -39,6 +39,12 @@ impl AgentRuntime {
         response: &LLMResponse,
     ) -> std::result::Result<(), BudgetExhaustedError> {
         let (input_tokens, output_tokens) = extract_llm_usage_tokens(&response.usage);
+        let (cache_read_tokens, cache_creation_tokens) = extract_llm_cache_tokens(&response.usage);
+        crate::ghost_metrics::get_ghost_metrics(&self.paths).record_prompt_cache_usage(
+            input_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        );
         if input_tokens == 0 && output_tokens == 0 {
             return Ok(());
         }

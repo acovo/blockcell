@@ -328,6 +328,27 @@ impl OpenAIProvider {
         }
     }
 
+    fn normalize_usage(usage: Option<Value>) -> Value {
+        let mut usage = usage.unwrap_or(Value::Null);
+        let cached_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(Value::as_u64)
+            });
+        if let (Some(cached_tokens), Some(object)) = (cached_tokens, usage.as_object_mut()) {
+            object.insert(
+                "cache_read_input_tokens".to_string(),
+                Value::from(cached_tokens),
+            );
+        }
+        usage
+    }
+
     /// Send a chat request to the API.
     async fn send_request(
         &self,
@@ -360,6 +381,7 @@ impl OpenAIProvider {
             },
             max_tokens: self.max_tokens,
             temperature: self.temperature,
+            prompt_cache_key: crate::prompt_utils::prompt_cache_key(messages),
         };
 
         let mode = if use_native_tools && !tools.is_empty() {
@@ -436,6 +458,8 @@ struct ChatRequest {
     tool_choice: Option<String>,
     max_tokens: u32,
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,7 +579,7 @@ fn finalize_stream_response(
         },
         tool_calls,
         finish_reason: final_finish_reason,
-        usage,
+        usage: OpenAIProvider::normalize_usage(Some(usage)),
     }
 }
 
@@ -573,6 +597,8 @@ struct StreamRequest {
     /// 流式请求中包含 token 用量统计（DeepSeek V4 等）。
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 /// 流式请求选项：让服务端在最后一个 chunk 中返回 usage 统计。
@@ -637,7 +663,7 @@ impl Provider for OpenAIProvider {
                     reasoning_content,
                     tool_calls: native_tool_calls,
                     finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
-                    usage: chat_response.usage.unwrap_or(Value::Null),
+                    usage: Self::normalize_usage(chat_response.usage),
                 });
             }
 
@@ -660,7 +686,7 @@ impl Provider for OpenAIProvider {
                     reasoning_content,
                     tool_calls: parsed_calls,
                     finish_reason: "tool_calls".to_string(),
-                    usage: chat_response.usage.unwrap_or(Value::Null),
+                    usage: Self::normalize_usage(chat_response.usage),
                 });
             }
 
@@ -670,7 +696,7 @@ impl Provider for OpenAIProvider {
                     reasoning_content,
                     tool_calls: vec![],
                     finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
-                    usage: chat_response.usage.unwrap_or(Value::Null),
+                    usage: Self::normalize_usage(chat_response.usage),
                 });
             }
 
@@ -714,7 +740,7 @@ impl Provider for OpenAIProvider {
             reasoning_content: choice.message.reasoning_content,
             tool_calls,
             finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
-            usage: chat_response.usage.unwrap_or(Value::Null),
+            usage: Self::normalize_usage(chat_response.usage),
         })
     }
 
@@ -756,6 +782,7 @@ impl Provider for OpenAIProvider {
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
+            prompt_cache_key: crate::prompt_utils::prompt_cache_key(messages),
         };
 
         // 序列化为 Value 以便注入 reasoning_effort/thinking/chat_template_kwargs
@@ -1469,4 +1496,16 @@ ls -la
         assert_eq!(sanitized[2].role, "tool");
         assert_eq!(sanitized[2].tool_call_id.as_deref(), Some("call-1"));
     }
+}
+#[test]
+fn openai_usage_normalizes_cached_prompt_tokens() {
+    let usage = serde_json::json!({
+        "prompt_tokens": 120,
+        "completion_tokens": 30,
+        "prompt_tokens_details": {"cached_tokens": 90}
+    });
+
+    let normalized = OpenAIProvider::normalize_usage(Some(usage));
+    assert_eq!(normalized["cache_read_input_tokens"], 90);
+    assert_eq!(normalized["prompt_tokens"], 120);
 }

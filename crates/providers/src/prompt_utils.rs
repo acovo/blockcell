@@ -1,4 +1,16 @@
+use blockcell_core::types::ChatMessage;
 use serde_json::Value;
+use std::hash::{Hash, Hasher};
+
+pub fn prompt_cache_key(messages: &[ChatMessage]) -> Option<String> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut found_system = false;
+    for message in messages.iter().filter(|message| message.role == "system") {
+        message.content.to_string().hash(&mut hasher);
+        found_system = true;
+    }
+    found_system.then(|| format!("blockcell-{:016x}", hasher.finish()))
+}
 
 /// 构建工具描述文本，注入到 system prompt 中。
 /// 用于不支持原生 tool calling 的模型（回退到文本格式）。
@@ -37,4 +49,29 @@ pub fn build_tools_prompt(tools: &[Value]) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_cache_key_tracks_stable_system_prefix() {
+        let first = vec![
+            ChatMessage::system("stable rules"),
+            ChatMessage::user("first dynamic query"),
+        ];
+        let second = vec![
+            ChatMessage::system("stable rules"),
+            ChatMessage::user("second dynamic query"),
+        ];
+        let changed = vec![
+            ChatMessage::system("changed rules"),
+            ChatMessage::user("second dynamic query"),
+        ];
+
+        assert_eq!(prompt_cache_key(&first), prompt_cache_key(&second));
+        assert_ne!(prompt_cache_key(&first), prompt_cache_key(&changed));
+        assert!(prompt_cache_key(&first).unwrap().starts_with("blockcell-"));
+    }
 }

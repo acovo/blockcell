@@ -333,6 +333,59 @@ impl AnthropicProvider {
         result
     }
 
+    fn mark_content_cacheable(content: &mut Value) {
+        let cache_control = serde_json::json!({"type": "ephemeral"});
+        match content {
+            Value::String(text) => {
+                *content = serde_json::json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": cache_control,
+                }]);
+            }
+            Value::Array(blocks) => {
+                if let Some(last) = blocks.last_mut().and_then(Value::as_object_mut) {
+                    last.insert("cache_control".to_string(), cache_control);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_prompt_cache_breakpoints(request: &mut Value) {
+        if let Some(system) = request.get_mut("system") {
+            Self::mark_content_cacheable(system);
+        }
+        if let Some(last_tool) = request
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .and_then(|tools| tools.last_mut())
+            .and_then(Value::as_object_mut)
+        {
+            last_tool.insert(
+                "cache_control".to_string(),
+                serde_json::json!({"type": "ephemeral"}),
+            );
+        }
+        if let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) {
+            if messages.len() >= 2 {
+                let cache_index = messages.len() - 2;
+                if let Some(content) = messages[cache_index].get_mut("content") {
+                    Self::mark_content_cacheable(content);
+                }
+            }
+        }
+    }
+
+    fn normalize_usage(usage: Option<&AnthropicUsage>) -> Value {
+        serde_json::json!({
+            "prompt_tokens": usage.and_then(|value| value.input_tokens),
+            "completion_tokens": usage.and_then(|value| value.output_tokens),
+            "cache_creation_input_tokens": usage.and_then(|value| value.cache_creation_input_tokens),
+            "cache_read_input_tokens": usage.and_then(|value| value.cache_read_input_tokens),
+        })
+    }
+
     /// Strip the "anthropic/" or "claude-" prefix from model names for the API.
     /// Config may store "anthropic/claude-opus-4-8" but the API expects "claude-opus-4-8".
     fn normalize_model(model: &str) -> &str {
@@ -363,6 +416,7 @@ impl Provider for AnthropicProvider {
         if !anthropic_tools.is_empty() {
             request["tools"] = Value::Array(anthropic_tools);
         }
+        Self::apply_prompt_cache_breakpoints(&mut request);
 
         info!(
             url = %redact_url(&url),
@@ -447,10 +501,7 @@ impl Provider for AnthropicProvider {
             None => "stop".to_string(),
         };
 
-        let usage = serde_json::json!({
-            "prompt_tokens": resp.usage.as_ref().and_then(|u| u.input_tokens),
-            "completion_tokens": resp.usage.as_ref().and_then(|u| u.output_tokens),
-        });
+        let usage = Self::normalize_usage(resp.usage.as_ref());
 
         info!(
             content_len = content_text.as_ref().map(|c| c.len()).unwrap_or(0),
@@ -494,6 +545,7 @@ impl Provider for AnthropicProvider {
         if !anthropic_tools.is_empty() {
             request["tools"] = Value::Array(anthropic_tools);
         }
+        Self::apply_prompt_cache_breakpoints(&mut request);
 
         info!(url = %redact_url(&url), model = %model, "Starting Anthropic streaming call");
 
@@ -643,6 +695,16 @@ impl Provider for AnthropicProvider {
                                         "content_block_stop" => {
                                             // 内容块结束
                                         }
+                                        "message_start" => {
+                                            if let Some(u) = &event.usage {
+                                                usage = serde_json::json!({
+                                                    "prompt_tokens": u.input_tokens,
+                                                    "completion_tokens": u.output_tokens,
+                                                    "cache_creation_input_tokens": u.cache_creation_input_tokens,
+                                                    "cache_read_input_tokens": u.cache_read_input_tokens,
+                                                });
+                                            }
+                                        }
                                         "message_delta" => {
                                             if let Some(delta) = &event.delta {
                                                 if let Some(fr) = &delta.stop_reason {
@@ -658,6 +720,8 @@ impl Provider for AnthropicProvider {
                                                 usage = serde_json::json!({
                                                     "prompt_tokens": u.input_tokens,
                                                     "completion_tokens": u.output_tokens,
+                                                    "cache_creation_input_tokens": u.cache_creation_input_tokens,
+                                                    "cache_read_input_tokens": u.cache_read_input_tokens,
                                                 });
                                             }
                                         }
@@ -773,6 +837,8 @@ struct ContentBlock {
 struct AnthropicUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
 }
 
 /// Anthropic 流式事件
@@ -818,6 +884,8 @@ struct AnthropicStreamContentBlock {
 struct AnthropicStreamUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -868,6 +936,49 @@ mod tests {
         assert_eq!(system, Some("You are helpful".to_string()));
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "user");
+    }
+
+    #[test]
+    fn prompt_cache_breakpoints_cover_system_tools_and_recent_history() {
+        let mut request = serde_json::json!({
+            "system": "stable system",
+            "tools": [
+                {"name": "read_file", "input_schema": {"type": "object"}},
+                {"name": "write_file", "input_schema": {"type": "object"}}
+            ],
+            "messages": [
+                {"role": "user", "content": "old history"},
+                {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
+                {"role": "user", "content": "current query"}
+            ]
+        });
+
+        AnthropicProvider::apply_prompt_cache_breakpoints(&mut request);
+
+        assert_eq!(request["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(request["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            request["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(request["messages"][2]["content"].is_string());
+    }
+
+    #[test]
+    fn anthropic_usage_preserves_cache_token_metrics() {
+        let usage: AnthropicUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 100,
+            "output_tokens": 25,
+            "cache_creation_input_tokens": 80,
+            "cache_read_input_tokens": 60
+        }))
+        .expect("parse usage");
+
+        let normalized = AnthropicProvider::normalize_usage(Some(&usage));
+        assert_eq!(normalized["prompt_tokens"], 100);
+        assert_eq!(normalized["completion_tokens"], 25);
+        assert_eq!(normalized["cache_creation_input_tokens"], 80);
+        assert_eq!(normalized["cache_read_input_tokens"], 60);
     }
 
     #[test]
