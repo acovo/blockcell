@@ -27,6 +27,7 @@ pub struct LightweightRuntimeHandle {
     memory_store: Option<MemoryStoreHandle>,
     memory_file_store: Option<blockcell_tools::MemoryFileStoreHandle>,
     skill_file_store: Option<blockcell_tools::SkillFileStoreHandle>,
+    system_prompt_snapshots: crate::context::SystemPromptSnapshotReader,
 }
 
 impl LightweightRuntimeHandle {
@@ -47,6 +48,7 @@ impl LightweightRuntimeHandle {
             memory_store: runtime.memory_store.clone(),
             memory_file_store: runtime.memory_file_store.clone(),
             skill_file_store: runtime.skill_file_store.clone(),
+            system_prompt_snapshots: runtime.context_builder.system_prompt_snapshot_reader(),
         }
     }
 
@@ -197,7 +199,6 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
             .as_ref()
             .map(|t| t.session_key.clone())
             .unwrap_or_else(|| "internal:default".to_string());
-
         // 加载父对话历史（用于 fork 上下文继承）
         let parent_history = self
             .session_store
@@ -360,6 +361,10 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
             .as_ref()
             .map(|t| t.session_key.clone())
             .unwrap_or_else(|| "internal:default".to_string());
+        let parent_system_prompt = self
+            .system_prompt_snapshots
+            .get(&parent_session_id)
+            .unwrap_or_default();
 
         let identity =
             AgentIdentity::typed(task_id.clone(), agent_type.to_string(), parent_session_id);
@@ -410,6 +415,7 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
         let one_shot = def.one_shot;
         let tools = def.tools.clone();
         let model = def.model.clone();
+        let cache_model = model.clone().unwrap_or_default();
         let skills = def.skills.clone();
         let mcp_servers = def.mcp_servers.clone();
         let initial_prompt = def.initial_prompt.clone();
@@ -488,7 +494,7 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                         ChatMessage::user(&prompt_clone),
                     ];
 
-                    let cache_safe_params = CacheSafeParams::default();
+                    let cache_safe_params = CacheSafeParams::new(parent_system_prompt, cache_model);
 
                     // Build SubagentOverrides with AbortToken from context
                     let overrides = SubagentOverrides {

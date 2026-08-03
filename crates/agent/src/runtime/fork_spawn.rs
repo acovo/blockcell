@@ -18,6 +18,7 @@ pub(crate) fn resolve_typed_workspace_scope(
 }
 
 pub(crate) fn normalize_typed_agent_result(agent_type: &str, content: &str) -> String {
+    const MAX_SUMMARY_CHARS: usize = 2_000;
     let trimmed = content.trim();
     let json_text = trimmed
         .strip_prefix("```json")
@@ -51,6 +52,12 @@ pub(crate) fn normalize_typed_agent_result(agent_type: &str, content: &str) -> S
     {
         summary.push_str("\nfindings: ");
         summary.push_str(&findings.to_string());
+    }
+    if summary.chars().count() > MAX_SUMMARY_CHARS {
+        summary = format!(
+            "{}... [truncated typed-agent summary]",
+            summary.chars().take(MAX_SUMMARY_CHARS).collect::<String>()
+        );
     }
     let status = parsed
         .as_ref()
@@ -113,7 +120,6 @@ impl AgentRuntime {
             .as_ref()
             .map(|t| t.session_key.clone())
             .unwrap_or_else(|| "internal:default".to_string());
-
         // 加载父对话历史（用于 fork 上下文继承）
         let parent_history = self
             .session_store
@@ -277,6 +283,11 @@ impl AgentRuntime {
             .as_ref()
             .map(|t| t.session_key.clone())
             .unwrap_or_else(|| "internal:default".to_string());
+        let parent_system_prompt = self
+            .context_builder
+            .system_prompt_snapshot_reader()
+            .get(&parent_session_id)
+            .unwrap_or_default();
 
         // 创建 Typed identity（用于后续执行时设置上下文）
         let identity =
@@ -342,6 +353,7 @@ impl AgentRuntime {
         let one_shot = def.one_shot;
         let tools = def.tools.clone();
         let model = def.model.clone();
+        let cache_model = model.clone().unwrap_or_default();
         let skills = def.skills.clone();
         let mcp_servers = def.mcp_servers.clone();
         let initial_prompt = def.initial_prompt.clone();
@@ -424,7 +436,7 @@ impl AgentRuntime {
                     ];
 
                     // 构建缓存安全参数
-                    let cache_safe_params = CacheSafeParams::default();
+                    let cache_safe_params = CacheSafeParams::new(parent_system_prompt, cache_model);
 
                     // 构建 ForkedAgentParams
                     // 使用 "typed" 作为静态 fork_label，实际的 agent_type 通过 agent_type() 方法设置

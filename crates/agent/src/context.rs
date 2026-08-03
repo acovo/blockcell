@@ -118,7 +118,7 @@ pub struct ContextBuilder {
     memory_recall_enabled: bool,
     memory_recall_policy: MemoryRecallConfig,
     prompt_budget: blockcell_core::config::PromptBudgetConfig,
-    session_cache: Mutex<SessionContextCache>,
+    session_cache: Arc<Mutex<SessionContextCache>>,
     memory_store: Option<MemoryStoreHandle>,
     /// Layer 5 记忆注入器 (7 层记忆系统)
     memory_injector: Option<MemoryInjector>,
@@ -157,6 +157,21 @@ struct SessionContextCache {
     project_command_cache: HashMap<String, Vec<String>>,
     recency: VecDeque<String>,
     capacity: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct SystemPromptSnapshotReader {
+    cache: Arc<Mutex<SessionContextCache>>,
+}
+
+impl SystemPromptSnapshotReader {
+    pub(crate) fn get(&self, session_key: &str) -> Option<String> {
+        let cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        cache
+            .system_prompt_snapshots
+            .get(session_key)
+            .map(|snapshot| snapshot.prompt.clone())
+    }
 }
 
 impl SessionContextCache {
@@ -345,7 +360,7 @@ impl ContextBuilder {
             memory_recall_enabled: config.agents.ghost.learning.recall_enabled(),
             memory_recall_policy: config.memory.effective_memory_recall(),
             prompt_budget: config.memory.effective_prompt_budget(),
-            session_cache: Mutex::new(SessionContextCache::new(capacity)),
+            session_cache: Arc::new(Mutex::new(SessionContextCache::new(capacity))),
             memory_store: None,
             memory_injector: None,
             capability_brief: None,
@@ -389,6 +404,12 @@ impl ContextBuilder {
             .project_environment_snapshots
             .insert(session_key.to_string(), snapshot);
         Some(rendered)
+    }
+
+    pub(crate) fn system_prompt_snapshot_reader(&self) -> SystemPromptSnapshotReader {
+        SystemPromptSnapshotReader {
+            cache: self.session_cache.clone(),
+        }
     }
 
     pub fn set_skill_manager(&mut self, manager: SkillManager) {
@@ -2479,4 +2500,36 @@ fn session_system_prompt_snapshot_ignores_agents_file_changes() {
         .as_str()
         .unwrap()
         .contains("Changed agent rule."));
+}
+
+#[test]
+fn frozen_system_prompt_reader_exposes_parent_prefix_for_typed_agents() {
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-parent-prompt-reader-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let paths = Paths::with_base(base);
+    paths.ensure_dirs().unwrap();
+    let builder = ContextBuilder::new(paths, Config::default());
+    let session_key = "cli:parent-prefix";
+    let messages = builder.build_messages_for_session_mode_with_channel(
+        session_key,
+        &[],
+        "implement feature",
+        &[],
+        InteractionMode::Coding,
+        None,
+        &HashSet::new(),
+        &HashSet::new(),
+        "cli",
+        false,
+        &[],
+        &[],
+    );
+
+    let frozen = builder
+        .system_prompt_snapshot_reader()
+        .get(session_key)
+        .expect("frozen prompt should be shared");
+    assert_eq!(frozen, messages[0].content.as_str().unwrap());
 }

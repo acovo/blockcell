@@ -4680,6 +4680,16 @@ fn typed_agent_results_are_normalized_for_parent_injection() {
     assert!(value["tests_run"].is_array());
 }
 
+#[test]
+fn typed_agent_free_text_results_are_bounded_before_parent_injection() {
+    let normalized = super::normalize_typed_agent_result("explore", &"x".repeat(10_000));
+    let value: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+    let summary = value["summary"].as_str().unwrap();
+
+    assert!(summary.chars().count() <= 2_100);
+    assert!(summary.contains("truncated"));
+}
+
 // ========== 端到端测试: execute_fork_mode ==========
 
 /// 测试 execute_fork_mode 的上下文继承
