@@ -98,9 +98,16 @@ impl RetrievalOrchestrator {
     }
 
     pub fn render(items: &[RetrievedItem]) -> String {
+        Self::render_with_item_cap(items, usize::MAX)
+    }
+
+    pub fn render_with_item_cap(items: &[RetrievedItem], item_token_cap: usize) -> String {
         items
             .iter()
-            .map(|item| format!("- [{}] {}", item.source.label(), item.content))
+            .map(|item| {
+                let content = truncate_to_token_budget(&item.content, item_token_cap);
+                format!("- [{}] {}", item.source.label(), content.trim())
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -347,7 +354,7 @@ impl PromptBudgetAllocator {
     }
 }
 
-fn truncate_to_token_budget(text: &str, budget: usize) -> String {
+pub(crate) fn truncate_to_token_budget(text: &str, budget: usize) -> String {
     if budget == 0 || text.is_empty() {
         return String::new();
     }
@@ -415,5 +422,19 @@ mod tests {
         let prompt = PromptBudgetAllocator::new(config).assemble(sections);
 
         assert!(estimate_tokens(&prompt) <= 8_000);
+    }
+
+    #[test]
+    fn retrieval_render_caps_each_item_before_section_budgeting() {
+        let oversized = format!("release {} RETRIEVED_ITEM_END", "detail ".repeat(2_000));
+        let items = vec![RetrievedItem::new(
+            RetrievalSource::CanonicalKnowledge,
+            oversized,
+        )];
+
+        let rendered = RetrievalOrchestrator::render_with_item_cap(&items, 500);
+
+        assert!(estimate_tokens(&rendered) <= 510);
+        assert!(!rendered.contains("RETRIEVED_ITEM_END"));
     }
 }

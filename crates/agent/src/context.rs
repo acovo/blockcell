@@ -13,6 +13,12 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
+const MAX_AGENTS_MD_TOKENS: usize = 4_000;
+const MAX_SOUL_MD_TOKENS: usize = 2_000;
+const MAX_RETRIEVED_ITEM_TOKENS: usize = 500;
+const MAX_ACTIVE_SKILL_TOKENS: usize = 10_000;
+const MAX_TOOL_RULE_TOKENS: usize = 1_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InteractionMode {
     Skill,
@@ -467,13 +473,19 @@ impl ContextBuilder {
 
         if let Some(content) = self.load_file_if_exists(self.paths.agents_md()) {
             prompt.push_str("## Agent Guidelines\n");
-            prompt.push_str(&content);
+            prompt.push_str(&crate::retrieval::truncate_to_token_budget(
+                &content,
+                MAX_AGENTS_MD_TOKENS,
+            ));
             prompt.push_str("\n\n");
         }
 
         if let Some(content) = self.load_file_if_exists(self.paths.soul_md()) {
             prompt.push_str("## Personality\n");
-            prompt.push_str(&content);
+            prompt.push_str(&crate::retrieval::truncate_to_token_budget(
+                &content,
+                MAX_SOUL_MD_TOKENS,
+            ));
             prompt.push_str("\n\n");
         }
 
@@ -517,7 +529,8 @@ impl ContextBuilder {
                 prompt.push_str("- The current callable tools are defined by the attached tool schemas. When asked about capabilities, answer only from those schemas.\n");
             }
             for rule in tool_prompt_rules {
-                prompt.push_str(rule);
+                let rule = crate::retrieval::truncate_to_token_budget(rule, MAX_TOOL_RULE_TOKENS);
+                prompt.push_str(&rule);
                 if !rule.ends_with('\n') {
                     prompt.push('\n');
                 }
@@ -538,7 +551,10 @@ impl ContextBuilder {
             active_skill_context.push_str(&format!("## Active Skill: {}\n", skill.name));
             if skill.inject_prompt_md {
                 active_skill_context.push_str("The user's input matches this installed skill. Follow the skill's instructions below. Prefer the skill's scoped tools and avoid unrelated tools.\n\n");
-                active_skill_context.push_str(&skill.prompt_md);
+                active_skill_context.push_str(&crate::retrieval::truncate_to_token_budget(
+                    &skill.prompt_md,
+                    MAX_ACTIVE_SKILL_TOKENS,
+                ));
                 active_skill_context.push_str("\n\n");
             } else {
                 active_skill_context.push_str("The user's input matches this installed skill. Use the skill's scoped tools and avoid unrelated tools.\n\n");
@@ -657,8 +673,14 @@ impl ContextBuilder {
                 let (profile, retrieved): (Vec<_>, Vec<_>) = items
                     .into_iter()
                     .partition(|item| item.source == RetrievalSource::UserProfile);
-                user_profile_context = RetrievalOrchestrator::render(&profile);
-                retrieved_context = RetrievalOrchestrator::render(&retrieved);
+                user_profile_context = RetrievalOrchestrator::render_with_item_cap(
+                    &profile,
+                    MAX_RETRIEVED_ITEM_TOKENS,
+                );
+                retrieved_context = RetrievalOrchestrator::render_with_item_cap(
+                    &retrieved,
+                    MAX_RETRIEVED_ITEM_TOKENS,
+                );
             }
         }
 
@@ -1520,6 +1542,56 @@ description: deploy demo
         );
 
         assert!(crate::token::estimate_tokens(&prompt) <= 8_000);
+    }
+
+    #[test]
+    fn individual_system_prompt_items_have_hard_caps() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-context-item-cap-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        std::fs::write(
+            paths.agents_md(),
+            format!("{} AGENTS_ITEM_END", "agent-rule ".repeat(8_000)),
+        )
+        .expect("write agents");
+        std::fs::write(
+            paths.soul_md(),
+            format!("{} SOUL_ITEM_END", "personality ".repeat(5_000)),
+        )
+        .expect("write soul");
+        let mut config = Config::default();
+        config.memory.prompt_budget.total = 40_000;
+        config.memory.prompt_budget.rules = 30_000;
+        config.memory.prompt_budget.active_skill = 20_000;
+        let builder = ContextBuilder::new(paths, config);
+        let active_skill = ActiveSkillContext {
+            name: "oversized".to_string(),
+            prompt_md: format!("{} ACTIVE_SKILL_END", "procedure ".repeat(15_000)),
+            inject_prompt_md: true,
+            tools: vec![],
+            fallback_message: None,
+            source: SkillSource::BlockCell,
+        };
+        let tool_rule = format!("{} TOOL_RULE_END", "tool-rule ".repeat(3_000));
+
+        let prompt = builder.build_system_prompt_for_mode_with_channel(
+            InteractionMode::Skill,
+            Some(&active_skill),
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "",
+            &["read_file".to_string()],
+            &[tool_rule],
+        );
+
+        assert!(!prompt.contains("AGENTS_ITEM_END"));
+        assert!(!prompt.contains("SOUL_ITEM_END"));
+        assert!(!prompt.contains("ACTIVE_SKILL_END"));
+        assert!(!prompt.contains("TOOL_RULE_END"));
     }
 
     #[test]

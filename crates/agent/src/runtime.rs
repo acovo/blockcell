@@ -429,7 +429,7 @@ fn inject_skill_cards_into_system_prompt(
             String::new()
         };
 
-        section.push_str(&format!(
+        let card_text = format!(
             "- `{}`: {} | 布局: {}{} | 适合: {} | 输出: {}\n",
             card.name,
             card.description,
@@ -437,7 +437,11 @@ fn inject_skill_cards_into_system_prompt(
             local_exec_note,
             card.when_to_use,
             card.outputs
-        ));
+        );
+        section.push_str(&crate::retrieval::truncate_to_token_budget(&card_text, 300));
+        if !section.ends_with('\n') {
+            section.push('\n');
+        }
     }
 
     append_ephemeral_user_context(messages, &section);

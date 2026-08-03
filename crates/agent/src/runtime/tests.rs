@@ -1502,6 +1502,33 @@ fn test_skill_prompt_injection_keeps_activate_skill_mainline() {
 }
 
 #[test]
+fn skill_card_prompt_caps_each_card() {
+    let mut messages = vec![
+        ChatMessage::system("stable"),
+        ChatMessage::user("run skill"),
+    ];
+    let skill_cards = vec![SkillCard {
+        name: "oversized".to_string(),
+        description: format!("{} SKILL_CARD_END", "description ".repeat(2_000)),
+        execution_layout: "PromptTool".to_string(),
+        when_to_use: "large task".to_string(),
+        outputs: "result".to_string(),
+        allowed_tools: vec![],
+        local_exec_entrypoints: vec![],
+        supports_local_exec: false,
+    }];
+
+    inject_skill_cards_into_system_prompt(&mut messages, &skill_cards, None);
+
+    let context = messages[messages.len() - 2]
+        .content
+        .as_str()
+        .expect("skill context");
+    assert!(!context.contains("SKILL_CARD_END"));
+    assert!(crate::token::estimate_tokens(context) < 700);
+}
+
+#[test]
 fn test_markdown_skill_executor_limits_tools_to_skill_scope() {
     let available: HashSet<String> = ["web_search", "read_file", "spawn", "memory_query"]
         .into_iter()
