@@ -8,7 +8,7 @@ use blockcell_core::{Config, Paths};
 use blockcell_skills::manager::SkillSource;
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig, LLMProvider, SkillManager};
 use blockcell_tools::MemoryStoreHandle;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -18,6 +18,7 @@ const MAX_SOUL_MD_TOKENS: usize = 2_000;
 const MAX_RETRIEVED_ITEM_TOKENS: usize = 500;
 const MAX_ACTIVE_SKILL_TOKENS: usize = 10_000;
 const MAX_TOOL_RULE_TOKENS: usize = 1_000;
+const MAX_CACHED_SESSIONS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InteractionMode {
@@ -92,9 +93,7 @@ pub struct ContextBuilder {
     memory_recall_enabled: bool,
     memory_recall_policy: MemoryRecallConfig,
     prompt_budget: blockcell_core::config::PromptBudgetConfig,
-    file_memory_snapshots: Mutex<HashMap<String, FrozenFileMemorySnapshot>>,
-    system_prompt_snapshots: Mutex<HashMap<String, String>>,
-    injected_retrieval_items: Mutex<HashMap<String, HashSet<u64>>>,
+    session_cache: Mutex<SessionContextCache>,
     memory_store: Option<MemoryStoreHandle>,
     /// Layer 5 记忆注入器 (7 层记忆系统)
     memory_injector: Option<MemoryInjector>,
@@ -111,6 +110,45 @@ struct FrozenFileMemorySnapshot {
     memory: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct FrozenSystemPromptSnapshot {
+    fingerprint: u64,
+    prompt: String,
+}
+
+struct SessionContextCache {
+    file_memory_snapshots: HashMap<String, FrozenFileMemorySnapshot>,
+    system_prompt_snapshots: HashMap<String, FrozenSystemPromptSnapshot>,
+    injected_retrieval_items: HashMap<String, HashSet<u64>>,
+    recency: VecDeque<String>,
+    capacity: usize,
+}
+
+impl SessionContextCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            file_memory_snapshots: HashMap::new(),
+            system_prompt_snapshots: HashMap::new(),
+            injected_retrieval_items: HashMap::new(),
+            recency: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn touch(&mut self, session_key: &str) {
+        self.recency.retain(|key| key != session_key);
+        self.recency.push_back(session_key.to_string());
+
+        while self.recency.len() > self.capacity {
+            if let Some(evicted) = self.recency.pop_front() {
+                self.file_memory_snapshots.remove(&evicted);
+                self.system_prompt_snapshots.remove(&evicted);
+                self.injected_retrieval_items.remove(&evicted);
+            }
+        }
+    }
+}
+
 impl FrozenFileMemorySnapshot {
     fn load(paths: &Paths) -> Self {
         Self {
@@ -122,6 +160,10 @@ impl FrozenFileMemorySnapshot {
 
 impl ContextBuilder {
     pub fn new(paths: Paths, config: Config) -> Self {
+        Self::new_with_session_cache_capacity(paths, config, MAX_CACHED_SESSIONS)
+    }
+
+    fn new_with_session_cache_capacity(paths: Paths, config: Config, capacity: usize) -> Self {
         let skills_dir = paths.skills_dir();
         let mut skill_manager = SkillManager::new()
             .with_versioning(skills_dir.clone())
@@ -140,9 +182,7 @@ impl ContextBuilder {
             memory_recall_enabled: config.agents.ghost.learning.recall_enabled(),
             memory_recall_policy: config.memory.effective_memory_recall(),
             prompt_budget: config.memory.effective_prompt_budget(),
-            file_memory_snapshots: Mutex::new(HashMap::new()),
-            system_prompt_snapshots: Mutex::new(HashMap::new()),
-            injected_retrieval_items: Mutex::new(HashMap::new()),
+            session_cache: Mutex::new(SessionContextCache::new(capacity)),
             memory_store: None,
             memory_injector: None,
             capability_brief: None,
@@ -295,11 +335,13 @@ impl ContextBuilder {
     }
 
     fn frozen_file_memory_snapshot(&self, session_key: &str) -> FrozenFileMemorySnapshot {
-        let mut snapshots = self
-            .file_memory_snapshots
+        let mut cache = self
+            .session_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        snapshots
+        cache.touch(session_key);
+        cache
+            .file_memory_snapshots
             .entry(session_key.to_string())
             .or_insert_with(|| FrozenFileMemorySnapshot::load(&self.paths))
             .clone()
@@ -326,22 +368,38 @@ impl ContextBuilder {
             skill.inject_prompt_md.hash(&mut hasher);
             skill.fallback_message.hash(&mut hasher);
         }
-        let cache_key = format!("{session_key}:{:016x}", hasher.finish());
-        let mut snapshots = self
-            .system_prompt_snapshots
+        let fingerprint = hasher.finish();
+        let mut cache = self
+            .session_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        snapshots
-            .entry(cache_key)
-            .or_insert_with(|| {
-                self.build_system_prompt_inner(
-                    mode,
-                    active_skill,
-                    available_tool_names,
-                    tool_prompt_rules,
-                )
-            })
-            .clone()
+        cache.touch(session_key);
+        if let Some(snapshot) = cache.system_prompt_snapshots.get(session_key) {
+            if snapshot.fingerprint == fingerprint {
+                return snapshot.prompt.clone();
+            }
+        }
+        drop(cache);
+
+        let prompt = self.build_system_prompt_inner(
+            mode,
+            active_skill,
+            available_tool_names,
+            tool_prompt_rules,
+        );
+        let mut cache = self
+            .session_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.touch(session_key);
+        cache.system_prompt_snapshots.insert(
+            session_key.to_string(),
+            FrozenSystemPromptSnapshot {
+                fingerprint,
+                prompt: prompt.clone(),
+            },
+        );
+        prompt
     }
 
     fn filter_incremental_retrieval(
@@ -352,11 +410,15 @@ impl ContextBuilder {
         let Some(session_key) = session_key else {
             return (items, false);
         };
-        let mut sessions = self
-            .injected_retrieval_items
+        let mut cache = self
+            .session_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let seen = sessions.entry(session_key.to_string()).or_default();
+        cache.touch(session_key);
+        let seen = cache
+            .injected_retrieval_items
+            .entry(session_key.to_string())
+            .or_default();
         let original_len = items.len();
         items.retain(|item| {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -369,9 +431,10 @@ impl ContextBuilder {
     }
 
     pub(crate) fn clear_injected_retrieval_for_session(&self, session_key: &str) {
-        self.injected_retrieval_items
+        self.session_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .injected_retrieval_items
             .remove(session_key);
     }
 
@@ -1546,6 +1609,46 @@ description: deploy demo
         assert_eq!(first, vec![item.clone()]);
         assert!(repeated.is_empty());
         assert_eq!(after_compact, vec![item]);
+    }
+
+    #[test]
+    fn session_context_cache_evicts_least_recent_session_from_all_maps() {
+        let builder = ContextBuilder::new_with_session_cache_capacity(
+            Paths::with_base(std::env::temp_dir().join(format!(
+                "blockcell-context-session-cache-lru-test-{}",
+                uuid::Uuid::new_v4()
+            ))),
+            Config::default(),
+            2,
+        );
+        let item = crate::retrieval::RetrievedItem::new(
+            RetrievalSource::CanonicalKnowledge,
+            "A bounded session cache must evict old entries.",
+        );
+        let populate = |session_key: &str| {
+            builder.frozen_file_memory_snapshot(session_key);
+            builder.frozen_system_prompt(session_key, InteractionMode::General, None, &[], &[]);
+            builder.filter_incremental_retrieval(Some(session_key), vec![item.clone()]);
+        };
+
+        populate("session-a");
+        populate("session-b");
+        builder.frozen_file_memory_snapshot("session-a");
+        populate("session-c");
+
+        let cache = builder
+            .session_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            cache.recency.iter().cloned().collect::<Vec<_>>(),
+            vec!["session-a", "session-c"]
+        );
+        assert!(!cache.file_memory_snapshots.contains_key("session-b"));
+        assert!(!cache.system_prompt_snapshots.contains_key("session-b"));
+        assert!(!cache.injected_retrieval_items.contains_key("session-b"));
+        assert!(cache.file_memory_snapshots.contains_key("session-a"));
+        assert!(cache.file_memory_snapshots.contains_key("session-c"));
     }
 
     #[test]
