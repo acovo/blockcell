@@ -363,12 +363,16 @@ impl AgentTypeRegistry {
 
     /// Iterate over all types
     pub fn iter(&self) -> impl Iterator<Item = (&String, &AgentTypeDefinition)> {
-        self.types.iter()
+        let mut types: Vec<_> = self.types.iter().collect();
+        types.sort_by(|a, b| a.0.cmp(b.0));
+        types.into_iter()
     }
 
     /// Get type names (for schema enum)
     pub fn type_names(&self) -> Vec<&str> {
-        self.types.keys().map(|s| s.as_str()).collect()
+        let mut names: Vec<&str> = self.types.keys().map(|s| s.as_str()).collect();
+        names.sort();
+        names
     }
 
     /// 验证 disallowed_tools 中的工具名是否存在于工具注册表
@@ -403,7 +407,9 @@ impl Default for AgentTypeRegistry {
 /// 避免循环依赖：tools crate 定义 trait，agent crate 实现 trait
 impl blockcell_tools::AgentTypeRegistryOps for AgentTypeRegistry {
     fn type_names(&self) -> Vec<String> {
-        self.types.keys().cloned().collect()
+        let mut names: Vec<String> = self.types.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     fn has_type(&self, agent_type: &str) -> bool {
@@ -524,6 +530,25 @@ mod tests {
         assert!(registry.get("verification").is_some());
         assert!(registry.get("viper").is_some());
         assert!(registry.get("general").is_some());
+    }
+
+    #[test]
+    fn test_agent_type_registry_outputs_names_in_stable_order() {
+        let registry = AgentTypeRegistry::new();
+
+        let names = registry.type_names();
+        let iter_names = registry
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        let trait_names = blockcell_tools::AgentTypeRegistryOps::type_names(&registry);
+
+        assert_eq!(
+            names,
+            vec!["explore", "general", "plan", "verification", "viper"]
+        );
+        assert_eq!(iter_names, names);
+        assert_eq!(trait_names, names);
     }
 
     #[test]

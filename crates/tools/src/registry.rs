@@ -260,7 +260,8 @@ impl ToolRegistry {
     }
 
     pub fn get_tool_schemas(&self) -> Vec<Value> {
-        self.tools
+        let mut schemas: Vec<Value> = self
+            .tools
             .values()
             .map(|tool| {
                 let schema = tool.schema();
@@ -273,13 +274,16 @@ impl ToolRegistry {
                     }
                 })
             })
-            .collect()
+            .collect();
+        sort_schemas_by_name(&mut schemas);
+        schemas
     }
 
     /// Get tool schemas filtered by a list of tool names.
     /// Only returns schemas for tools whose names are in the provided list.
     pub fn get_filtered_schemas(&self, names: &[&str]) -> Vec<Value> {
-        self.tools
+        let mut schemas: Vec<Value> = self
+            .tools
             .iter()
             .filter(|(name, _)| names.contains(&name.as_str()))
             .map(|(_, tool)| {
@@ -293,7 +297,9 @@ impl ToolRegistry {
                     }
                 })
             })
-            .collect()
+            .collect();
+        sort_schemas_by_name(&mut schemas);
+        schemas
     }
 
     /// Get tiered schemas: full schemas for core tools, lightweight (name+description only) for others.
@@ -303,7 +309,8 @@ impl ToolRegistry {
     /// When the LLM tries to call a lightweight tool, the runtime dynamically supplements
     /// the full schema and retries.
     pub fn get_tiered_schemas(&self, names: &[&str], core_tools: &[&str]) -> Vec<Value> {
-        self.tools
+        let mut schemas: Vec<Value> = self
+            .tools
             .iter()
             .filter(|(name, _)| names.contains(&name.as_str()))
             .map(|(name, tool)| {
@@ -336,21 +343,28 @@ impl ToolRegistry {
                     })
                 }
             })
-            .collect()
+            .collect();
+        sort_schemas_by_name(&mut schemas);
+        schemas
     }
 
     /// Get all registered tool names.
     pub fn tool_names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        let mut names: Vec<String> = self.tools.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Get names of tools that should be visible in the initial model prompt.
     pub fn model_visible_tool_names(&self) -> Vec<String> {
-        self.tools
+        let mut names: Vec<String> = self
+            .tools
             .keys()
             .filter(|name| !self.model_hidden_tools.contains(*name))
             .cloned()
-            .collect()
+            .collect();
+        names.sort();
+        names
     }
 
     pub fn is_model_hidden(&self, name: &str) -> bool {
@@ -394,6 +408,14 @@ impl ToolRegistry {
         debug!(tool = name, "Executing tool");
         tool.execute(ctx, params).await
     }
+}
+
+fn sort_schemas_by_name(schemas: &mut [Value]) {
+    schemas.sort_by(|a, b| {
+        let a_name = a["function"]["name"].as_str().unwrap_or_default();
+        let b_name = b["function"]["name"].as_str().unwrap_or_default();
+        a_name.cmp(b_name)
+    });
 }
 
 impl Default for ToolRegistry {
@@ -476,6 +498,41 @@ mod tests {
             assert!(schema["function"]["name"].is_string());
             assert!(schema["function"]["description"].is_string());
         }
+    }
+
+    #[test]
+    fn test_registry_schema_and_name_outputs_are_sorted() {
+        let reg = ToolRegistry::with_defaults();
+        let schema_names = |schemas: Vec<Value>| {
+            schemas
+                .into_iter()
+                .map(|schema| {
+                    schema["function"]["name"]
+                        .as_str()
+                        .expect("tool schema should have a name")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let assert_sorted = |values: Vec<String>| {
+            let mut expected = values.clone();
+            expected.sort();
+            assert_eq!(values, expected);
+        };
+
+        assert_sorted(schema_names(reg.get_tool_schemas()));
+        assert_sorted(schema_names(reg.get_filtered_schemas(&[
+            "write_file",
+            "exec",
+            "read_file",
+            "web_fetch",
+        ])));
+        assert_sorted(schema_names(reg.get_tiered_schemas(
+            &["write_file", "exec", "read_file", "web_fetch"],
+            GLOBAL_CORE_TOOL_NAMES,
+        )));
+        assert_sorted(reg.tool_names());
+        assert_sorted(reg.model_visible_tool_names());
     }
 
     #[test]
