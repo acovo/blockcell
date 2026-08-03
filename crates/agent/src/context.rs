@@ -683,6 +683,12 @@ impl ContextBuilder {
             self.paths.workspace().display()
         );
 
+        if let Some(plan) = session_key.and_then(blockcell_tools::plan::take_changed_plan_context) {
+            runtime_rules.push('\n');
+            runtime_rules.push_str(&plan);
+            runtime_rules.push('\n');
+        }
+
         if !disabled_skills.is_empty() || !disabled_tools.is_empty() {
             runtime_rules.push_str("\n## ⚠️ Disabled Items\n");
             runtime_rules
@@ -1551,6 +1557,50 @@ description: deploy demo
         assert!(!repeated_context.contains(fact));
         assert!(repeated_context.contains("Previously provided memory remains valid"));
         assert!(other_context.contains(fact));
+    }
+
+    #[test]
+    fn changed_plan_is_incremental_in_runtime_context() {
+        let session_key = format!("cli:plan-context-{}", uuid::Uuid::new_v4());
+        blockcell_tools::plan::replace_plan_for_session(
+            &session_key,
+            &serde_json::json!({"plan": [
+                {"step": "inspect", "status": "completed"},
+                {"step": "implement", "status": "in_progress"}
+            ]}),
+        )
+        .expect("store plan");
+        let builder = ContextBuilder::new(
+            Paths::with_base(std::env::temp_dir().join(format!(
+                "blockcell-plan-context-test-{}",
+                uuid::Uuid::new_v4()
+            ))),
+            Config::default(),
+        );
+        let build = || {
+            builder.build_messages_for_session_mode_with_channel(
+                &session_key,
+                &[],
+                "continue coding",
+                &[],
+                InteractionMode::General,
+                None,
+                &HashSet::new(),
+                &HashSet::new(),
+                "cli",
+                false,
+                &[],
+                &[],
+            )
+        };
+
+        let first = build();
+        let second = build();
+        let first_context = test_chat_message_text(&first[first.len() - 2]);
+        let second_context = test_chat_message_text(&second[second.len() - 2]);
+        assert!(first_context.contains("## Current Plan"));
+        assert!(first_context.contains("[in_progress] implement"));
+        assert!(!second_context.contains("## Current Plan"));
     }
 
     #[test]

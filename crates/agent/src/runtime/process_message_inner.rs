@@ -669,6 +669,15 @@ impl AgentRuntime {
             // Learning Coordinator: record iteration (replaces skill_nudge_engine.record_iteration)
             self.learning_coordinator.record_iteration();
 
+            if let Some(plan) =
+                blockcell_tools::plan::take_changed_plan_context(&persist_session_key)
+            {
+                current_messages.push(ChatMessage::user(&format!(
+                    "<runtime-context>\n{}\n</runtime-context>",
+                    plan
+                )));
+            }
+
             debug!(
                 iteration = ?tool_call_counts,
                 current_messages_len = current_messages.len(),

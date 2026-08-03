@@ -35,6 +35,7 @@ pub mod network_monitor;
 pub mod ocr;
 pub mod office;
 pub mod office_write;
+pub mod plan;
 mod process;
 pub mod registry;
 pub mod registry_builder;

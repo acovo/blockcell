@@ -124,6 +124,13 @@ impl AgentRuntime {
         let mut trace_messages = Vec::new();
 
         let final_response = loop {
+            if let Some(plan) = blockcell_tools::plan::take_changed_plan_context(&msg.session_key())
+            {
+                current_messages.push(ChatMessage::user(&format!(
+                    "<runtime-context>\n{}\n</runtime-context>",
+                    plan
+                )));
+            }
             let response = self.chat_with_provider(&current_messages, &tools).await?;
 
             if response.tool_calls.is_empty() {

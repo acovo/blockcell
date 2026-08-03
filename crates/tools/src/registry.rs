@@ -34,6 +34,7 @@ use crate::message::MessageTool;
 use crate::network_monitor::NetworkMonitorTool;
 use crate::ocr::OcrTool;
 use crate::office_write::OfficeWriteTool;
+use crate::plan::UpdatePlanTool;
 use crate::send_message::SendMessageTool;
 use crate::session_recall::SessionRecallTool;
 use crate::session_search::SessionSearchTool;
@@ -102,6 +103,7 @@ impl ToolRegistry {
         registry.register(Arc::new(ListDirTool));
         registry.register(Arc::new(GrepTool));
         registry.register(Arc::new(GlobTool));
+        registry.register(Arc::new(UpdatePlanTool));
 
         // Exec tool
         registry.register(Arc::new(ExecTool));

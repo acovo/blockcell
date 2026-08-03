@@ -426,6 +426,7 @@ impl AgentRuntime {
         } else {
             String::new()
         };
+        append_plan_recovery(&mut recovery_message, _session_key);
 
         // ========== 8. 构建 CompactResult（初始 token 估算） ==========
         let mut post_compact_tokens = estimate_messages_tokens(&[
@@ -541,6 +542,16 @@ impl AgentRuntime {
     }
 }
 
+fn append_plan_recovery(recovery_message: &mut String, session_key: &str) {
+    let Some(plan) = blockcell_tools::plan::render_plan_for_recovery(session_key) else {
+        return;
+    };
+    if !recovery_message.is_empty() {
+        recovery_message.push_str("\n\n");
+    }
+    recovery_message.push_str(&plan);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,5 +590,25 @@ mod tests {
         assert_eq!(recent[0].role, "assistant");
         assert_eq!(recent[1].tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(recent[3].tool_call_id.as_deref(), Some("call-3"));
+    }
+
+    #[test]
+    fn compact_recovery_appends_complete_current_plan() {
+        let session_key = format!("compact-plan-{}", uuid::Uuid::new_v4());
+        blockcell_tools::plan::replace_plan_for_session(
+            &session_key,
+            &serde_json::json!({"plan": [
+                {"step": "implement", "status": "in_progress"},
+                {"step": "verify", "status": "pending"}
+            ]}),
+        )
+        .expect("store plan");
+        let mut recovery = "## Files Previously Read\n- src/lib.rs".to_string();
+
+        append_plan_recovery(&mut recovery, &session_key);
+
+        assert!(recovery.contains("Files Previously Read"));
+        assert!(recovery.contains("Current Plan (Recovery)"));
+        assert!(recovery.contains("[pending] verify"));
     }
 }
