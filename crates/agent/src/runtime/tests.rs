@@ -2136,6 +2136,52 @@ fn test_determine_interaction_mode_falls_back_to_general_without_skill() {
 }
 
 #[test]
+fn test_determine_interaction_mode_uses_coding_for_code_changes() {
+    let mode = determine_interaction_mode(false, &[IntentCategory::Coding]);
+    assert_eq!(mode, InteractionMode::Coding);
+}
+
+#[test]
+fn test_coding_mode_uses_shell_and_code_tools_without_legacy_exec() {
+    let available: HashSet<String> = [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "grep",
+        "glob",
+        "shell",
+        "exec",
+        "update_plan",
+        "file_ops",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    let tools = resolve_effective_tool_names(
+        &Config::default(),
+        InteractionMode::Coding,
+        None,
+        None,
+        &[IntentCategory::Coding],
+        &available,
+    );
+
+    for required in [
+        "read_file",
+        "edit_file",
+        "grep",
+        "glob",
+        "shell",
+        "update_plan",
+    ] {
+        assert!(tools.contains(&required.to_string()), "missing {required}");
+    }
+    assert!(!tools.contains(&"exec".to_string()));
+}
+
+#[test]
 fn test_skill_summary_formatter_uses_brief_md_and_result() {
     let prompt = crate::skill_summary::SkillSummaryFormatter::build_prompt(
         "帮我搜一下 AI 新闻",

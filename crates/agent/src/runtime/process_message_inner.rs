@@ -331,6 +331,7 @@ impl AgentRuntime {
                 .map(|skill| vec![format!("Skill:{}", skill.name)])
                 .unwrap_or_else(|| vec!["Skill".to_string()]),
             InteractionMode::Chat => vec!["Chat".to_string()],
+            InteractionMode::Coding => vec!["Coding".to_string()],
             InteractionMode::General => vec!["General".to_string()],
         };
         let prompt_ctx = blockcell_tools::PromptContext {
@@ -608,7 +609,9 @@ impl AgentRuntime {
 
         let recall_mode = match decision.mode {
             InteractionMode::Chat => blockcell_core::config::MemoryRecallMode::Chat,
-            InteractionMode::General => blockcell_core::config::MemoryRecallMode::General,
+            InteractionMode::General | InteractionMode::Coding => {
+                blockcell_core::config::MemoryRecallMode::General
+            }
             InteractionMode::Skill => blockcell_core::config::MemoryRecallMode::Skill,
         };
         let ghost_recall_context_block =

@@ -290,8 +290,13 @@ impl AgentRuntime {
             });
         }
 
+        let mode = if chat_intents.contains(&IntentCategory::Coding) {
+            InteractionMode::Coding
+        } else {
+            InteractionMode::General
+        };
         info!(
-            mode = ?InteractionMode::General,
+            mode = ?mode,
             intents = ?chat_intents,
             recent_skill = session_skill_name.as_deref(),
             "Interaction mode resolved from unified entry"
@@ -299,7 +304,7 @@ impl AgentRuntime {
         Ok(InteractionDecision {
             active_skill: None,
             chat_intents,
-            mode: InteractionMode::General,
+            mode,
         })
     }
 

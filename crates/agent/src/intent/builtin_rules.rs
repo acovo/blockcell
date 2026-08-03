@@ -10,6 +10,27 @@ use super::{IntentCategory, IntentRule};
 /// 返回内置意图规则表（静态数据）。
 pub(super) fn builtin_rules() -> Vec<IntentRule> {
     vec![
+            // ── Coding (priority 80) ──
+            IntentRule {
+                category: IntentCategory::Coding,
+                keywords: vec![
+                    "修复代码", "修改代码", "创建代码", "实现功能", "新增功能", "代码重构", "调试代码",
+                    "写测试", "跑测试", "运行测试", "编译项目", "构建项目", "代码审查",
+                    "fix bug", "fix the bug", "modify code", "edit code", "create code", "implement feature",
+                    "add feature", "refactor", "debug code", "write tests", "run tests",
+                    "code review", "cargo test", "go test", "pytest", "npm test",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)(修复|修改|编辑|创建|实现|新增|重构|调试|测试|编译|构建|fix|modify|edit|create|implement|add|refactor|debug|test|build).{0,80}([A-Za-z0-9_./\\-]+\.(rs|py|go|js|jsx|ts|tsx|java|kt|c|cc|cpp|h|hpp|rb|php|swift|toml|yaml|yml|json|md|sh)|\b(cargo|npm|pnpm|yarn|pytest|make|cmake)\b)").unwrap(),
+                    Regex::new(r"(?i)\b(cargo\s+(test|build|check|clippy)|go\s+test|pytest|npm\s+(test|run\s+(build|lint)))\b").unwrap(),
+                ],
+                negative: vec!["解释", "介绍", "是什么", "如何", "怎么做", "what is", "how to"],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
+                priority: 80,
+            },
             // ── Chat (highest priority) ──
             IntentRule {
                 category: IntentCategory::Chat,

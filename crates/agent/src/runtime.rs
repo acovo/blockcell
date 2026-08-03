@@ -1368,6 +1368,49 @@ fn global_core_tool_names() -> Vec<String> {
         .collect()
 }
 
+const CODING_DEFAULT_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "grep",
+    "glob",
+    "shell",
+    "update_plan",
+    "file_ops",
+];
+
+fn apply_coding_tool_defaults(
+    config: &Config,
+    mode: InteractionMode,
+    agent_id: Option<&str>,
+    available_tools: &HashSet<String>,
+    tool_names: &mut Vec<String>,
+) {
+    if !matches!(mode, InteractionMode::Coding) {
+        return;
+    }
+    tool_names.retain(|name| name != "exec");
+    let denied = config
+        .intent_router
+        .as_ref()
+        .and_then(|router| {
+            config
+                .resolve_intent_profile_id(agent_id)
+                .and_then(|profile_id| router.profiles.get(&profile_id))
+        })
+        .map(|profile| profile.deny_tools.as_slice())
+        .unwrap_or(&[]);
+    for name in CODING_DEFAULT_TOOL_NAMES {
+        if available_tools.contains(*name)
+            && !denied.iter().any(|denied_name| denied_name == name)
+            && !tool_names.iter().any(|tool_name| tool_name == name)
+        {
+            tool_names.push((*name).to_string());
+        }
+    }
+}
+
 fn normalize_ghost_memory_provider_tool_schema(
     schema: serde_json::Value,
 ) -> Option<serde_json::Value> {
@@ -1478,6 +1521,7 @@ fn resolve_effective_tool_names(
             if let Some(skill) = active_skill {
                 tool_names.extend(skill.tools.iter().cloned());
             }
+            apply_coding_tool_defaults(config, mode, agent_id, available_tools, &mut tool_names);
             tool_names.sort();
             tool_names.dedup();
             return tool_names;
@@ -1492,7 +1536,7 @@ fn resolve_effective_tool_names(
         InteractionMode::Chat => {
             resolve_profile_tool_names(config, agent_id, &[IntentCategory::Chat], available_tools)
         }
-        InteractionMode::General | InteractionMode::Skill => {
+        InteractionMode::General | InteractionMode::Coding | InteractionMode::Skill => {
             resolve_profile_tool_names(config, agent_id, intents, available_tools)
         }
     };
@@ -1510,6 +1554,8 @@ fn resolve_effective_tool_names(
     if !config.channels.napcat.enabled {
         tool_names.retain(|name| !name.starts_with("napcat_"));
     }
+
+    apply_coding_tool_defaults(config, mode, agent_id, available_tools, &mut tool_names);
 
     tool_names.sort();
     tool_names.dedup();
@@ -1618,6 +1664,10 @@ fn determine_interaction_mode(
 
     if chat_intents.len() == 1 && matches!(chat_intents[0], IntentCategory::Chat) {
         return InteractionMode::Chat;
+    }
+
+    if chat_intents.contains(&IntentCategory::Coding) {
+        return InteractionMode::Coding;
     }
 
     InteractionMode::General

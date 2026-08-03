@@ -12,6 +12,8 @@ use tracing::warn;
 pub enum IntentCategory {
     /// 日常闲聊、问候、闲谈 — 不需要任何工具
     Chat,
+    /// 代码修改、调试、测试与构建
+    Coding,
     /// 文件/代码操作 — read_file, write_file, edit_file, list_dir, exec, file_ops
     FileOps,
     /// 网页/搜索 — web_search, web_fetch, browse
@@ -44,6 +46,7 @@ impl IntentCategory {
     pub fn as_str(&self) -> &'static str {
         match self {
             IntentCategory::Chat => "Chat",
+            IntentCategory::Coding => "Coding",
             IntentCategory::FileOps => "FileOps",
             IntentCategory::WebSearch => "WebSearch",
             IntentCategory::Finance => "Finance",
@@ -63,6 +66,7 @@ impl IntentCategory {
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim() {
             "Chat" => Some(IntentCategory::Chat),
+            "Coding" => Some(IntentCategory::Coding),
             "FileOps" => Some(IntentCategory::FileOps),
             "WebSearch" => Some(IntentCategory::WebSearch),
             "Finance" => Some(IntentCategory::Finance),
@@ -611,14 +615,12 @@ mod tests {
             c.classify("列出当前目录的文件"),
             vec![IntentCategory::FileOps]
         );
-        assert_eq!(
-            c.classify("edit the README.md file"),
-            vec![IntentCategory::FileOps]
-        );
-        assert_eq!(
-            c.classify("创建一个新的 main.rs 文件"),
-            vec![IntentCategory::FileOps]
-        );
+        let edit_code = c.classify("edit the README.md file");
+        assert_eq!(edit_code[0], IntentCategory::Coding);
+        assert!(edit_code.contains(&IntentCategory::FileOps));
+        let create_code = c.classify("创建一个新的 main.rs 文件");
+        assert_eq!(create_code[0], IntentCategory::Coding);
+        assert!(create_code.contains(&IntentCategory::FileOps));
         // 负例：URL 中的文件扩展名（无空格边界）不应触发 FileOps
         assert_ne!(
             c.classify("打开 https://example.com/main.rs 看看"),
@@ -783,6 +785,16 @@ mod tests {
         );
         // 负例：问 curl 命令是什么不应触发 DevOps（是问问题，不是用工具）
         assert_ne!(c.classify("curl 命令是什么"), vec![IntentCategory::DevOps]);
+    }
+
+    #[test]
+    fn test_coding_classification_uses_action_and_path_features() {
+        let c = IntentClassifier::new();
+        let result = c.classify("修复 crates/agent/src/runtime.rs 中的 bug，然后运行 cargo test");
+        assert_eq!(result[0], IntentCategory::Coding);
+        assert!(!c
+            .classify("解释一下 Rust 所有权")
+            .contains(&IntentCategory::Coding));
     }
 
     #[test]

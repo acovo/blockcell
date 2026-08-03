@@ -24,8 +24,27 @@ const MAX_CACHED_SESSIONS: usize = 256;
 pub enum InteractionMode {
     Skill,
     Chat,
+    Coding,
     General,
 }
+
+const CODING_MODE_PROMPT: &str = r#"
+## Editing Discipline
+- Read relevant files before editing. Make the smallest coherent diff and do not modify unrelated files.
+- Preserve user changes in a dirty worktree. If an edit fails, reread the current file before retrying.
+
+## Git Discipline
+- Inspect `git status` and the relevant diff before and after changes.
+- Never discard changes you did not create. Do not use `git reset --hard` or destructive checkout commands unless the user explicitly requests them.
+
+## Verification Discipline
+- After every meaningful edit, run the most relevant test, lint, or build command.
+- If verification fails, diagnose and fix it before claiming completion. Report any verification that could not be run.
+
+## Plan Discipline
+- For tasks with three or more steps, call `update_plan` before implementation.
+- Keep exactly one step in progress and update the plan whenever a step is completed.
+"#;
 
 #[derive(Debug, Clone)]
 pub struct ActiveSkillContext {
@@ -536,7 +555,8 @@ impl ContextBuilder {
         let mut prompt = String::new();
         let is_chat = matches!(mode, InteractionMode::Chat);
         let is_skill_mode = matches!(mode, InteractionMode::Skill);
-        let is_general = matches!(mode, InteractionMode::General);
+        let is_coding = matches!(mode, InteractionMode::Coding);
+        let is_general = matches!(mode, InteractionMode::General | InteractionMode::Coding);
         let mut active_skill_context = String::new();
 
         prompt.push_str("You are blockcell, an AI assistant with access to tools.\n\n");
@@ -605,6 +625,11 @@ impl ContextBuilder {
                     prompt.push('\n');
                 }
             }
+            prompt.push('\n');
+        }
+
+        if is_coding {
+            prompt.push_str(CODING_MODE_PROMPT);
             prompt.push('\n');
         }
 
@@ -716,7 +741,7 @@ impl ContextBuilder {
         let mut retrieved_context = String::new();
         let recall_mode = match mode {
             InteractionMode::Chat => MemoryRecallMode::Chat,
-            InteractionMode::General => MemoryRecallMode::General,
+            InteractionMode::General | InteractionMode::Coding => MemoryRecallMode::General,
             InteractionMode::Skill => MemoryRecallMode::Skill,
         };
         if self.memory_recall_enabled
@@ -1997,6 +2022,35 @@ description: deploy demo
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content.as_str(), Some(user_content.as_str()));
         assert!(messages[0].content.as_str().unwrap().contains(marker));
+    }
+
+    #[test]
+    fn coding_mode_prompt_contains_edit_git_verification_and_plan_disciplines() {
+        let builder = ContextBuilder::new(
+            Paths::with_base(std::env::temp_dir().join(format!(
+                "blockcell-coding-prompt-test-{}",
+                uuid::Uuid::new_v4()
+            ))),
+            Config::default(),
+        );
+
+        let prompt = builder.build_system_prompt_for_mode_with_channel(
+            InteractionMode::Coding,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "fix src/lib.rs",
+            &[],
+            &[],
+        );
+
+        assert!(prompt.contains("## Editing Discipline"));
+        assert!(prompt.contains("## Git Discipline"));
+        assert!(prompt.contains("## Verification Discipline"));
+        assert!(prompt.contains("## Plan Discipline"));
+        assert!(prompt.contains("update_plan"));
+        assert!(prompt.contains("reset --hard"));
     }
 }
 #[test]
