@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "tasks": [
+    {"id":"bugfix-01-divide","category":"bugfix","prompt":"修复 safe_divide 在除数为零时抛异常的问题，保持现有 API。完成后运行测试。","fixture":"tasks/bugfix-01-divide/repo","acceptance":"tasks/bugfix-01-divide/verify.py"},
+    {"id":"bugfix-02-slug","category":"bugfix","prompt":"修复 slugify 对连续空白和首尾连字符处理错误的问题。完成后运行测试。","fixture":"tasks/bugfix-02-slug/repo","acceptance":"tasks/bugfix-02-slug/verify.py"},
+    {"id":"bugfix-03-dedupe","category":"bugfix","prompt":"修复 dedupe，使其去重时保持首次出现顺序。完成后运行测试。","fixture":"tasks/bugfix-03-dedupe/repo","acceptance":"tasks/bugfix-03-dedupe/verify.py"},
+    {"id":"bugfix-04-parse-bool","category":"bugfix","prompt":"修复 parse_bool 的大小写、空白和非法值处理。完成后运行测试。","fixture":"tasks/bugfix-04-parse-bool/repo","acceptance":"tasks/bugfix-04-parse-bool/verify.py"},
+    {"id":"bugfix-05-chunks","category":"bugfix","prompt":"修复 chunks 在非法 size 和尾块场景的行为。完成后运行测试。","fixture":"tasks/bugfix-05-chunks/repo","acceptance":"tasks/bugfix-05-chunks/verify.py"},
+    {"id":"bugfix-06-csv-average","category":"bugfix","prompt":"修复 CSV 平均值计算对表头、空行和非法数字的处理。完成后运行测试。","fixture":"tasks/bugfix-06-csv-average/repo","acceptance":"tasks/bugfix-06-csv-average/verify.py"},
+    {"id":"feature-01-batch","category":"feature","prompt":"新增 batched(iterable, size) API，并补齐边界行为。完成后运行测试。","fixture":"tasks/feature-01-batch/repo","acceptance":"tasks/feature-01-batch/verify.py"},
+    {"id":"feature-02-cli-upper","category":"feature","prompt":"为现有 CLI 新增 --upper 选项，不影响默认输出。完成后运行测试。","fixture":"tasks/feature-02-cli-upper/repo","acceptance":"tasks/feature-02-cli-upper/verify.py"},
+    {"id":"feature-03-ttl-cache","category":"feature","prompt":"实现 TTLCache，支持 set/get、过期清理和可注入时钟。完成后运行测试。","fixture":"tasks/feature-03-ttl-cache/repo","acceptance":"tasks/feature-03-ttl-cache/verify.py"},
+    {"id":"feature-04-jsonl","category":"feature","prompt":"新增 read_jsonl，逐行解析并在错误中报告行号。完成后运行测试。","fixture":"tasks/feature-04-jsonl/repo","acceptance":"tasks/feature-04-jsonl/verify.py"},
+    {"id":"feature-05-retry","category":"feature","prompt":"新增 retry 函数，支持最大次数和指定异常类型。完成后运行测试。","fixture":"tasks/feature-05-retry/repo","acceptance":"tasks/feature-05-retry/verify.py"},
+    {"id":"feature-06-deep-merge","category":"feature","prompt":"新增递归 deep_merge，不能修改输入对象。完成后运行测试。","fixture":"tasks/feature-06-deep-merge/repo","acceptance":"tasks/feature-06-deep-merge/verify.py"},
+    {"id":"refactor-01-user-service","category":"refactor","prompt":"把用户格式化逻辑抽到 formatter 模块，并保持跨文件公共 API 与测试兼容。完成后运行测试。","fixture":"tasks/refactor-01-user-service/repo","acceptance":"tasks/refactor-01-user-service/verify.py"},
+    {"id":"refactor-02-rename-api","category":"refactor","prompt":"将 normalize_name 重命名为 canonical_name，更新所有生产调用方并保留兼容别名。完成后运行测试。","fixture":"tasks/refactor-02-rename-api/repo","acceptance":"tasks/refactor-02-rename-api/verify.py"},
+    {"id":"refactor-03-repository","category":"refactor","prompt":"把订单服务从全局字典改为注入 repository，保持行为不变。完成后运行测试。","fixture":"tasks/refactor-03-repository/repo","acceptance":"tasks/refactor-03-repository/verify.py"},
+    {"id":"refactor-04-result-model","category":"refactor","prompt":"将跨三个文件传递的结果字典重构为 dataclass，同时保持 JSON 输出。完成后运行测试。","fixture":"tasks/refactor-04-result-model/repo","acceptance":"tasks/refactor-04-result-model/verify.py"},
+    {"id":"greenfield-01-wordcount","category":"greenfield","prompt":"从零实现 wordcount CLI、README 和单元测试，支持文件与标准输入。","fixture":"tasks/greenfield-01-wordcount/repo","acceptance":"tasks/greenfield-01-wordcount/verify.py"},
+    {"id":"greenfield-02-todo","category":"greenfield","prompt":"从零实现可持久化的 TodoStore、README 和单元测试。","fixture":"tasks/greenfield-02-todo/repo","acceptance":"tasks/greenfield-02-todo/verify.py"},
+    {"id":"greenfield-03-kv-cli","category":"greenfield","prompt":"从零实现 JSON 文件键值 CLI，支持 set/get/delete，并补 README 与测试。","fixture":"tasks/greenfield-03-kv-cli/repo","acceptance":"tasks/greenfield-03-kv-cli/verify.py"},
+    {"id":"greenfield-04-links","category":"greenfield","prompt":"从零实现 Markdown 链接提取库与 CLI，补 README 和测试。","fixture":"tasks/greenfield-04-links/repo","acceptance":"tasks/greenfield-04-links/verify.py"}
+  ]
+}
