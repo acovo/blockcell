@@ -4931,6 +4931,113 @@ async fn tool_policy_ask_uses_existing_confirmation_flow() {
 }
 
 #[tokio::test]
+async fn shell_full_access_requires_confirmation_before_execution() {
+    let mut runtime = test_runtime();
+    runtime
+        .tool_registry
+        .register(Arc::new(blockcell_tools::shell_session::ShellTool));
+    let (confirm_tx, mut confirm_rx) = mpsc::channel(1);
+    runtime.confirm_tx = Some(confirm_tx);
+    let msg = test_main_session_inbound("cli", "sandbox-full-access");
+    let call = tool_call(
+        "shell",
+        serde_json::json!({
+            "command": "echo approved-shell",
+            "sandbox_policy": "full-access"
+        }),
+    );
+    let handle = tokio::spawn(async move { runtime.execute_tool_call(&call, &msg, None).await });
+
+    let request = tokio::time::timeout(std::time::Duration::from_secs(1), confirm_rx.recv())
+        .await
+        .expect("full-access shell should request approval")
+        .expect("confirmation channel should stay open");
+    assert_eq!(request.tool_name, "shell");
+    assert!(request
+        .paths
+        .iter()
+        .any(|item| item.contains("full-access")));
+    request.response_tx.send(true).expect("approve shell");
+
+    let result = handle.await.expect("shell task should finish");
+    assert!(result.contains("approved-shell"), "result: {result}");
+}
+
+#[tokio::test]
+async fn unavailable_native_sandbox_can_be_approved_and_retried_full_access() {
+    if blockcell_tools::sandbox::native_backend(
+        blockcell_tools::sandbox::SandboxPolicy::WorkspaceWrite,
+    ) != blockcell_tools::sandbox::SandboxBackend::ApprovalRequired
+    {
+        return;
+    }
+    let mut runtime = test_runtime();
+    runtime
+        .tool_registry
+        .register(Arc::new(blockcell_tools::shell_session::ShellTool));
+    let (confirm_tx, mut confirm_rx) = mpsc::channel(1);
+    runtime.confirm_tx = Some(confirm_tx);
+    let msg = test_main_session_inbound("cli", "sandbox-fallback");
+    let call = tool_call(
+        "shell",
+        serde_json::json!({"command": "echo fallback-approved"}),
+    );
+    let handle = tokio::spawn(async move { runtime.execute_tool_call(&call, &msg, None).await });
+
+    let request = tokio::time::timeout(std::time::Duration::from_secs(1), confirm_rx.recv())
+        .await
+        .expect("sandbox fallback should request approval")
+        .expect("confirmation channel should stay open");
+    assert!(request.paths.iter().any(|item| item.contains("sandbox")));
+    request.response_tx.send(true).expect("approve fallback");
+
+    let result = handle.await.expect("shell task should finish");
+    assert!(result.contains("fallback-approved"), "result: {result}");
+    assert!(result.contains("full-access"), "result: {result}");
+}
+
+#[tokio::test]
+async fn rejected_shell_full_access_does_not_execute_command() {
+    let mut runtime = test_runtime();
+    runtime
+        .tool_registry
+        .register(Arc::new(blockcell_tools::shell_session::ShellTool));
+    let marker = runtime.paths.workspace().join("rejected-shell-marker");
+    let (confirm_tx, mut confirm_rx) = mpsc::channel(1);
+    runtime.confirm_tx = Some(confirm_tx);
+    let msg = test_main_session_inbound("cli", "sandbox-rejected");
+    let call = tool_call(
+        "shell",
+        serde_json::json!({
+            "command": format!("touch {}", marker.display()),
+            "sandbox_policy": "full-access"
+        }),
+    );
+    let handle = tokio::spawn(async move { runtime.execute_tool_call(&call, &msg, None).await });
+
+    let request = confirm_rx.recv().await.expect("approval request");
+    request.response_tx.send(false).expect("reject shell");
+    let result = handle.await.expect("shell task should finish");
+
+    assert!(result.contains("not approved"), "result: {result}");
+    assert!(!marker.exists());
+}
+
+#[test]
+fn sandbox_permission_failure_is_classified_for_escalation() {
+    let result = Ok(serde_json::json!({
+        "sandbox_policy": "workspace-write",
+        "exit_code": 1,
+        "output": "write failed: Operation not permitted"
+    }));
+
+    assert_eq!(
+        super::tool_exec::shell_sandbox_escalation_reason(&result).as_deref(),
+        Some("operation not permitted")
+    );
+}
+
+#[tokio::test]
 async fn tool_policy_ask_confirmation_skips_duplicate_path_confirmation() {
     use blockcell_core::tool_policy::{
         ToolPolicy, ToolPolicyCondition, ToolPolicyConfig, ToolPolicyDecision,

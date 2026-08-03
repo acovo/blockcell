@@ -376,13 +376,45 @@ impl AgentRuntime {
             }),
         };
 
+        let mut effective_args = tool_call.arguments.clone();
+        if tool_call.name == "shell"
+            && shell_action_is_run(&effective_args)
+            && shell_requests_full_access(&effective_args)
+            && !policy_confirmed
+        {
+            let approved = if self.confirm_tx.is_none() {
+                user_explicitly_confirms_dangerous_op(&msg.content)
+            } else {
+                self.confirm_dangerous_operation(
+                    "shell",
+                    vec![format!(
+                        "full-access command: {}",
+                        effective_args
+                            .get("command")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                    )],
+                    msg,
+                )
+                .await
+            };
+            if !approved {
+                return serde_json::json!({
+                    "error": "full-access shell execution was not approved",
+                    "tool": "shell",
+                    "sandbox_policy": "full-access"
+                })
+                .to_string();
+            }
+        }
+
         if !self.hook_manager.is_empty() {
             let _ = self
                 .hook_manager
                 .fire(&HookContext {
                     event: HookEvent::PreToolUse,
                     tool_name: Some(tool_call.name.clone()),
-                    tool_args: tool_call.arguments.clone(),
+                    tool_args: effective_args.clone(),
                     result: None,
                     is_error: false,
                     session_id: msg.session_key(),
@@ -401,15 +433,46 @@ impl AgentRuntime {
                 "task_id": "",
                 "tool": tool_call.name,
                 "call_id": tool_call.id,
-                "params": tool_call.arguments,
+                "params": effective_args,
             });
             let _ = event_tx.send(event.to_string());
         }
 
         let start = std::time::Instant::now();
-        let result = self
-            .execute_runtime_tool_call(&tool_call.name, ctx, tool_call.arguments.clone())
+        let mut result = self
+            .execute_runtime_tool_call(&tool_call.name, ctx.clone(), effective_args.clone())
             .await;
+        if tool_call.name == "shell" && shell_action_is_run(&effective_args) {
+            if let Some(reason) = shell_sandbox_escalation_reason(&result) {
+                let approved = policy_confirmed
+                    || if self.confirm_tx.is_none() {
+                        user_explicitly_confirms_dangerous_op(&msg.content)
+                    } else {
+                        self.confirm_dangerous_operation(
+                            "shell",
+                            vec![format!(
+                                "sandbox escalation ({reason}): {}",
+                                effective_args
+                                    .get("command")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_default()
+                            )],
+                            msg,
+                        )
+                        .await
+                    };
+                if approved {
+                    effective_args = full_access_retry_args(&effective_args);
+                    result = self
+                        .execute_runtime_tool_call(&tool_call.name, ctx, effective_args.clone())
+                        .await;
+                } else {
+                    result = Err(blockcell_core::Error::PermissionDenied(format!(
+                        "sandbox escalation was not approved: {reason}"
+                    )));
+                }
+            }
+        }
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let is_error = result.is_err();
@@ -427,7 +490,7 @@ impl AgentRuntime {
                 .fire(&HookContext {
                     event: HookEvent::PostToolUse,
                     tool_name: Some(tool_call.name.clone()),
-                    tool_args: tool_call.arguments.clone(),
+                    tool_args: effective_args.clone(),
                     result: Some(result_str.clone()),
                     is_error,
                     session_id: msg.session_key(),
@@ -584,7 +647,7 @@ impl AgentRuntime {
         self.audit_logger.set_session_id(&msg.session_key());
         let _ = self.audit_logger.log_tool_call(
             &tool_call.name,
-            tool_call.arguments.clone(),
+            effective_args.clone(),
             result_json,
             &msg.session_key(),
             None, // trace_id can be added later
@@ -667,4 +730,67 @@ impl AgentRuntime {
             None => result_str,
         }
     }
+}
+
+fn shell_action_is_run(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("action")
+        .and_then(|value| value.as_str())
+        .unwrap_or("run")
+        == "run"
+}
+
+fn shell_requests_full_access(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("sandbox_policy")
+        .and_then(|value| value.as_str())
+        == Some("full-access")
+}
+
+pub(super) fn shell_sandbox_escalation_reason(
+    result: &blockcell_core::Result<serde_json::Value>,
+) -> Option<String> {
+    match result {
+        Err(blockcell_core::Error::PermissionDenied(message))
+            if message.contains("sandbox") && message.contains("approval required") =>
+        {
+            Some(message.clone())
+        }
+        Ok(value)
+            if value.get("sandbox_policy").and_then(|item| item.as_str())
+                != Some("full-access")
+                && value
+                    .get("exit_code")
+                    .and_then(|item| item.as_i64())
+                    .is_some_and(|code| code != 0) =>
+        {
+            let output = value
+                .get("output")
+                .and_then(|item| item.as_str())
+                .unwrap_or_default();
+            let lower = output.to_ascii_lowercase();
+            [
+                "operation not permitted",
+                "permission denied",
+                "network is unreachable",
+                "sandbox violation",
+            ]
+            .iter()
+            .find(|marker| lower.contains(**marker))
+            .map(|marker| (*marker).to_string())
+        }
+        _ => None,
+    }
+}
+
+fn full_access_retry_args(arguments: &serde_json::Value) -> serde_json::Value {
+    let mut retry = arguments.clone();
+    if let Some(object) = retry.as_object_mut() {
+        object.remove("session_id");
+        object.insert(
+            "sandbox_policy".to_string(),
+            serde_json::Value::String("full-access".to_string()),
+        );
+    }
+    retry
 }
