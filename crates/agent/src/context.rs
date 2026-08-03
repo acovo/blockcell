@@ -135,10 +135,20 @@ struct FrozenSystemPromptSnapshot {
     prompt: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectEnvironmentSnapshot {
+    git_branch: Option<String>,
+    dirty_entries: Vec<String>,
+    dirty_total: usize,
+    commands: Vec<String>,
+}
+
 struct SessionContextCache {
     file_memory_snapshots: HashMap<String, FrozenFileMemorySnapshot>,
     system_prompt_snapshots: HashMap<String, FrozenSystemPromptSnapshot>,
     injected_retrieval_items: HashMap<String, HashSet<u64>>,
+    project_environment_snapshots: HashMap<String, ProjectEnvironmentSnapshot>,
+    project_command_cache: HashMap<String, Vec<String>>,
     recency: VecDeque<String>,
     capacity: usize,
 }
@@ -149,6 +159,8 @@ impl SessionContextCache {
             file_memory_snapshots: HashMap::new(),
             system_prompt_snapshots: HashMap::new(),
             injected_retrieval_items: HashMap::new(),
+            project_environment_snapshots: HashMap::new(),
+            project_command_cache: HashMap::new(),
             recency: VecDeque::new(),
             capacity: capacity.max(1),
         }
@@ -163,6 +175,8 @@ impl SessionContextCache {
                 self.file_memory_snapshots.remove(&evicted);
                 self.system_prompt_snapshots.remove(&evicted);
                 self.injected_retrieval_items.remove(&evicted);
+                self.project_environment_snapshots.remove(&evicted);
+                self.project_command_cache.remove(&evicted);
             }
         }
     }
@@ -175,6 +189,130 @@ impl FrozenFileMemorySnapshot {
             memory: std::fs::read_to_string(paths.memory_md()).ok(),
         }
     }
+}
+
+impl ProjectEnvironmentSnapshot {
+    fn detect(workspace: &Path, commands: Vec<String>) -> Self {
+        let git_branch = git_output(workspace, &["branch", "--show-current"]).and_then(|branch| {
+            if branch.is_empty() {
+                git_output(workspace, &["rev-parse", "--short", "HEAD"])
+                    .map(|head| format!("detached@{head}"))
+            } else {
+                Some(branch)
+            }
+        });
+        let dirty = git_output(
+            workspace,
+            &["status", "--porcelain", "--untracked-files=normal"],
+        )
+        .unwrap_or_default();
+        let dirty_lines = dirty.lines().map(str::to_string).collect::<Vec<_>>();
+        let dirty_total = dirty_lines.len();
+        let dirty_entries = dirty_lines.into_iter().take(20).collect();
+        Self {
+            git_branch,
+            dirty_entries,
+            dirty_total,
+            commands,
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut rendered = String::from("## Project Environment\n");
+        rendered.push_str(&format!(
+            "Git branch: {}\n",
+            self.git_branch
+                .as_deref()
+                .unwrap_or("(not a git repository)")
+        ));
+        if self.dirty_entries.is_empty() {
+            rendered.push_str("Dirty files: clean\n");
+        } else {
+            rendered.push_str("Dirty files (first 20):\n");
+            for entry in &self.dirty_entries {
+                rendered.push_str(entry);
+                rendered.push('\n');
+            }
+            let omitted = self.dirty_total.saturating_sub(self.dirty_entries.len());
+            if omitted > 0 {
+                rendered.push_str(&format!("... {omitted} more dirty entries omitted\n"));
+            }
+        }
+        if self.commands.is_empty() {
+            rendered.push_str("Detected project commands: none\n");
+        } else {
+            rendered.push_str("Detected project commands:\n");
+            for command in &self.commands {
+                rendered.push_str(&format!("- `{command}`\n"));
+            }
+        }
+        rendered.trim_end().to_string()
+    }
+}
+
+fn git_output(workspace: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn detect_project_commands(workspace: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    if workspace.join("Cargo.toml").is_file() {
+        commands.push("cargo test".to_string());
+        commands.push("cargo build".to_string());
+    }
+
+    let package_json = workspace.join("package.json");
+    if let Ok(content) = std::fs::read_to_string(package_json) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(scripts) = value.get("scripts").and_then(serde_json::Value::as_object) {
+                let runner = if workspace.join("pnpm-lock.yaml").is_file() {
+                    "pnpm"
+                } else if workspace.join("yarn.lock").is_file() {
+                    "yarn"
+                } else {
+                    "npm"
+                };
+                for name in ["test", "lint", "build"] {
+                    if scripts.contains_key(name) {
+                        let command = match (runner, name) {
+                            ("npm", "test") => "npm test".to_string(),
+                            ("npm", name) => format!("npm run {name}"),
+                            (runner, name) => format!("{runner} {name}"),
+                        };
+                        commands.push(command);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(makefile) = std::fs::read_to_string(workspace.join("Makefile")) {
+        let targets = makefile
+            .lines()
+            .filter(|line| !line.starts_with(['\t', ' ']) && !line.starts_with('#'))
+            .filter_map(|line| line.split_once(':').map(|(target, _)| target.trim()))
+            .collect::<HashSet<_>>();
+        if targets.contains("test") {
+            commands.push("make test".to_string());
+        }
+        if targets.contains("build") {
+            commands.push("make build".to_string());
+        } else if targets.contains("all") {
+            commands.push("make".to_string());
+        }
+    }
+
+    commands.sort();
+    commands.dedup();
+    commands
 }
 
 impl ContextBuilder {
@@ -207,6 +345,44 @@ impl ContextBuilder {
             capability_brief: None,
             skill_index_summary: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub(crate) fn incremental_project_environment(&self, session_key: &str) -> Option<String> {
+        let cached_commands = {
+            let mut cache = self
+                .session_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cache.touch(session_key);
+            cache.project_command_cache.get(session_key).cloned()
+        };
+        let commands = cached_commands.unwrap_or_else(|| {
+            let detected = detect_project_commands(&self.paths.workspace());
+            let mut cache = self
+                .session_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cache.touch(session_key);
+            cache
+                .project_command_cache
+                .entry(session_key.to_string())
+                .or_insert_with(|| detected.clone())
+                .clone()
+        });
+        let snapshot = ProjectEnvironmentSnapshot::detect(&self.paths.workspace(), commands);
+        let mut cache = self
+            .session_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cache.touch(session_key);
+        if cache.project_environment_snapshots.get(session_key) == Some(&snapshot) {
+            return None;
+        }
+        let rendered = snapshot.render();
+        cache
+            .project_environment_snapshots
+            .insert(session_key.to_string(), snapshot);
+        Some(rendered)
     }
 
     pub fn set_skill_manager(&mut self, manager: SkillManager) {
@@ -711,6 +887,14 @@ impl ContextBuilder {
         if let Some(plan) = session_key.and_then(blockcell_tools::plan::take_changed_plan_context) {
             runtime_rules.push('\n');
             runtime_rules.push_str(&plan);
+            runtime_rules.push('\n');
+        }
+
+        if let Some(environment) =
+            session_key.and_then(|key| self.incremental_project_environment(key))
+        {
+            runtime_rules.push('\n');
+            runtime_rules.push_str(&environment);
             runtime_rules.push('\n');
         }
 
@@ -1629,6 +1813,120 @@ description: deploy demo
     }
 
     #[test]
+    fn project_environment_context_is_incremental_and_commands_are_session_cached() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-project-environment-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        let workspace = paths.workspace();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("package.json"),
+            r#"{"scripts":{"test":"vitest","build":"vite build"}}"#,
+        )
+        .unwrap();
+        let builder = ContextBuilder::new(paths, Config::default());
+        let session_key = format!("cli:environment-{}", uuid::Uuid::new_v4());
+        let build = || {
+            builder.build_messages_for_session_mode_with_channel(
+                &session_key,
+                &[],
+                "fix the project",
+                &[],
+                InteractionMode::Coding,
+                None,
+                &HashSet::new(),
+                &HashSet::new(),
+                "cli",
+                false,
+                &[],
+                &[],
+            )
+        };
+
+        let first = build();
+        let first_context = test_chat_message_text(&first[first.len() - 2]);
+        assert!(first_context.contains("## Project Environment"));
+        assert!(first_context.contains("Git branch: main"));
+        assert!(first_context.contains("Cargo.toml"));
+        assert!(first_context.contains("cargo test"));
+        assert!(first_context.contains("npm test"));
+        assert!(first_context.contains("npm run build"));
+
+        let second = build();
+        let second_context = test_chat_message_text(&second[second.len() - 2]);
+        assert!(!second_context.contains("## Project Environment"));
+
+        std::fs::write(workspace.join("src.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            workspace.join("package.json"),
+            r#"{"scripts":{"test":"vitest","build":"vite build","lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        let changed = build();
+        let changed_context = test_chat_message_text(&changed[changed.len() - 2]);
+        assert!(changed_context.contains("## Project Environment"));
+        assert!(changed_context.contains("src.rs"));
+        assert!(!changed_context.contains("npm run lint"));
+    }
+
+    #[test]
+    fn project_environment_limits_dirty_files_to_twenty() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-project-environment-limit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        let workspace = paths.workspace();
+        let status = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&workspace)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        for index in 0..25 {
+            std::fs::write(workspace.join(format!("dirty-{index:02}.txt")), "x").unwrap();
+        }
+        let builder = ContextBuilder::new(paths, Config::default());
+        let session_key = format!("cli:environment-limit-{}", uuid::Uuid::new_v4());
+
+        let messages = builder.build_messages_for_session_mode_with_channel(
+            &session_key,
+            &[],
+            "edit files",
+            &[],
+            InteractionMode::Coding,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            false,
+            &[],
+            &[],
+        );
+        let context = test_chat_message_text(&messages[messages.len() - 2]);
+
+        assert_eq!(context.matches("?? dirty-").count(), 20);
+        assert!(context.contains("more dirty entries omitted"));
+    }
+
+    #[test]
     fn changed_retrieval_content_is_reinjected() {
         let builder = ContextBuilder::new(
             Paths::with_base(std::env::temp_dir().join(format!(
@@ -1704,6 +2002,7 @@ description: deploy demo
             builder.frozen_file_memory_snapshot(session_key);
             builder.frozen_system_prompt(session_key, InteractionMode::General, None, &[], &[]);
             builder.filter_incremental_retrieval(Some(session_key), vec![item.clone()]);
+            builder.incremental_project_environment(session_key);
         };
 
         populate("session-a");
@@ -1722,8 +2021,18 @@ description: deploy demo
         assert!(!cache.file_memory_snapshots.contains_key("session-b"));
         assert!(!cache.system_prompt_snapshots.contains_key("session-b"));
         assert!(!cache.injected_retrieval_items.contains_key("session-b"));
+        assert!(!cache
+            .project_environment_snapshots
+            .contains_key("session-b"));
+        assert!(!cache.project_command_cache.contains_key("session-b"));
         assert!(cache.file_memory_snapshots.contains_key("session-a"));
         assert!(cache.file_memory_snapshots.contains_key("session-c"));
+        assert!(cache
+            .project_environment_snapshots
+            .contains_key("session-a"));
+        assert!(cache
+            .project_environment_snapshots
+            .contains_key("session-c"));
     }
 
     #[test]

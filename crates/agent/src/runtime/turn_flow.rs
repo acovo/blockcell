@@ -131,6 +131,15 @@ impl AgentRuntime {
                     plan
                 )));
             }
+            if let Some(environment) = self
+                .context_builder
+                .incremental_project_environment(&msg.session_key())
+            {
+                current_messages.push(ChatMessage::user(&format!(
+                    "<runtime-context>\n{}\n</runtime-context>",
+                    environment
+                )));
+            }
             let response = self.chat_with_provider(&current_messages, &tools).await?;
 
             if response.tool_calls.is_empty() {

@@ -680,6 +680,15 @@ impl AgentRuntime {
                     plan
                 )));
             }
+            if let Some(environment) = self
+                .context_builder
+                .incremental_project_environment(&persist_session_key)
+            {
+                current_messages.push(ChatMessage::user(&format!(
+                    "<runtime-context>\n{}\n</runtime-context>",
+                    environment
+                )));
+            }
 
             debug!(
                 iteration = ?tool_call_counts,
