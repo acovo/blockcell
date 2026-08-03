@@ -79,6 +79,12 @@ async fn forked_agent_cancels_pending_provider() {
 #[cfg(unix)]
 #[tokio::test]
 async fn forked_agent_cancellation_kills_running_shell_tool() {
+    if blockcell_tools::sandbox::native_backend(
+        blockcell_tools::sandbox::SandboxPolicy::WorkspaceWrite,
+    ) == blockcell_tools::sandbox::SandboxBackend::ApprovalRequired
+    {
+        return;
+    }
     let temp = tempfile::tempdir().expect("temp dir");
     let provider_pool = blockcell_providers::ProviderPool::from_single_provider(
         "test-model",
@@ -381,6 +387,39 @@ async fn forked_write_rejects_paths_outside_workspace_scope() {
     let error = result.expect_err("out-of-scope write should be denied");
     assert!(error.to_string().contains("workspace_scope"));
     assert!(!tmp.path().join("tests/outside.rs").exists());
+}
+
+#[tokio::test]
+async fn typed_shell_requires_approval_when_native_sandbox_is_unavailable() {
+    if blockcell_tools::sandbox::native_backend(
+        blockcell_tools::sandbox::SandboxPolicy::WorkspaceWrite,
+    ) != blockcell_tools::sandbox::SandboxBackend::ApprovalRequired
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let working_dir = Some(tmp.path().to_path_buf());
+    let can_use_tool: CanUseToolFn = Arc::new(|_, _| ToolPermission::Allow);
+    let scope = vec![WorkspaceScopeEntry::directory(tmp.path().join("src"))];
+
+    let result = execute_forked_tool(
+        "shell",
+        &json!({"command": "echo should-not-run"}),
+        &can_use_tool,
+        &[],
+        &None,
+        &None,
+        &None,
+        &None,
+        &[],
+        &None,
+        &working_dir,
+        &scope,
+    )
+    .await;
+
+    let error = result.expect_err("typed shell must not silently bypass a missing sandbox");
+    assert!(error.to_string().contains("approval required"));
 }
 
 #[tokio::test]

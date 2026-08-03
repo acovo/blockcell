@@ -39,6 +39,7 @@ pub mod plan;
 mod process;
 pub mod registry;
 pub mod registry_builder;
+pub mod sandbox;
 pub mod security_scan;
 pub mod send_message;
 pub mod session_recall;

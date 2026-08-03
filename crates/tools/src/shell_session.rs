@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use blockcell_core::{Error, Result};
 use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -12,38 +11,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
 
+pub use crate::sandbox::SandboxPolicy;
 use crate::{Tool, ToolContext, ToolSchema};
 
 const MAX_SESSION_OUTPUT_BYTES: usize = 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SandboxPolicy {
-    ReadOnly,
-    WorkspaceWrite,
-    FullAccess,
-}
-
-impl SandboxPolicy {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read-only",
-            Self::WorkspaceWrite => "workspace-write",
-            Self::FullAccess => "full-access",
-        }
-    }
-
-    fn parse(value: Option<&str>) -> Result<Self> {
-        match value.unwrap_or("workspace-write") {
-            "read-only" => Ok(Self::ReadOnly),
-            "workspace-write" => Ok(Self::WorkspaceWrite),
-            "full-access" => Ok(Self::FullAccess),
-            other => Err(Error::Validation(format!(
-                "Invalid sandbox_policy '{other}'; expected read-only, workspace-write, or full-access"
-            ))),
-        }
-    }
-}
 
 pub struct ShellTool;
 
@@ -119,9 +90,10 @@ impl ShellSessionManager {
         sandbox_policy: SandboxPolicy,
     ) -> Result<String> {
         #[cfg(unix)]
-        let (mut command, command_input, child_control) = build_interactive_shell()?;
+        let (mut command, command_input, child_control) =
+            build_interactive_shell(workspace, sandbox_policy)?;
         #[cfg(windows)]
-        let mut command = build_interactive_shell();
+        let mut command = build_interactive_shell(workspace, sandbox_policy)?;
         command
             .current_dir(workspace)
             .stdin(Stdio::piped())
@@ -398,7 +370,7 @@ impl Tool for ShellTool {
                     "sandbox_policy": {
                         "type": "string",
                         "enum": ["read-only", "workspace-write", "full-access"],
-                        "description": "Sandbox policy fixed when creating a session. The initial implementation carries this policy through the lifecycle but does not enforce OS isolation yet."
+                        "description": "Sandbox policy fixed when creating a session. read-only/workspace-write use native OS isolation; unavailable platforms require approval before full-access execution."
                     }
                 }
             }),
@@ -548,7 +520,10 @@ where
 }
 
 #[cfg(unix)]
-fn build_interactive_shell() -> Result<(
+fn build_interactive_shell(
+    workspace: &Path,
+    sandbox_policy: SandboxPolicy,
+) -> Result<(
     Command,
     tokio::net::UnixStream,
     std::os::unix::net::UnixStream,
@@ -563,8 +538,12 @@ fn build_interactive_shell() -> Result<(
     let command_input =
         tokio::net::UnixStream::from_std(parent_control).map_err(blockcell_core::Error::Io)?;
     let control_fd = child_control.as_raw_fd();
-    let mut command = Command::new("bash");
-    command.arg("--noprofile").arg("--norc").arg("/dev/fd/3");
+    let (mut command, _) = crate::sandbox::sandboxed_shell_command(
+        "bash",
+        &["--noprofile", "--norc", "/dev/fd/3"],
+        sandbox_policy,
+        &[workspace.to_path_buf()],
+    )?;
     // SAFETY: dup2 only remaps the inherited command channel in the child just
     // before exec; no allocation or shared-state access occurs in the closure.
     unsafe {
@@ -579,10 +558,14 @@ fn build_interactive_shell() -> Result<(
 }
 
 #[cfg(windows)]
-fn build_interactive_shell() -> Command {
-    let mut command = Command::new("cmd.exe");
-    command.arg("/Q");
-    command
+fn build_interactive_shell(workspace: &Path, sandbox_policy: SandboxPolicy) -> Result<Command> {
+    crate::sandbox::sandboxed_shell_command(
+        "cmd.exe",
+        &["/Q"],
+        sandbox_policy,
+        &[workspace.to_path_buf()],
+    )
+    .map(|(command, _)| command)
 }
 
 fn build_command_payload(command: &str, marker: &str) -> String {
@@ -635,7 +618,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("temp workspace");
         let manager = ShellSessionManager::new();
         let session_id = manager
-            .create(workspace.path(), SandboxPolicy::WorkspaceWrite)
+            .create(workspace.path(), SandboxPolicy::FullAccess)
             .await
             .expect("create shell session");
 
@@ -662,7 +645,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("temp workspace");
         let manager = ShellSessionManager::new();
         let session_id = manager
-            .create(workspace.path(), SandboxPolicy::ReadOnly)
+            .create(workspace.path(), SandboxPolicy::FullAccess)
             .await
             .expect("create shell session");
 
@@ -723,7 +706,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("temp workspace");
         let manager = ShellSessionManager::new();
         let session_id = manager
-            .create(workspace.path(), SandboxPolicy::WorkspaceWrite)
+            .create(workspace.path(), SandboxPolicy::FullAccess)
             .await
             .expect("create shell session");
 
@@ -739,5 +722,23 @@ mod tests {
         assert!(!completed.running);
         assert_eq!(completed.exit_code, Some(7));
         assert_eq!(pid, None);
+    }
+
+    #[tokio::test]
+    async fn unavailable_native_sandbox_requests_approval_instead_of_silent_bypass() {
+        if crate::sandbox::native_backend(SandboxPolicy::WorkspaceWrite)
+            != crate::sandbox::SandboxBackend::ApprovalRequired
+        {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let manager = ShellSessionManager::new();
+
+        let error = manager
+            .create(workspace.path(), SandboxPolicy::WorkspaceWrite)
+            .await
+            .expect_err("unavailable sandbox must not silently run unrestricted");
+
+        assert!(error.to_string().contains("approval required"));
     }
 }

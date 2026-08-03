@@ -30,7 +30,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
 
 // --- submodules extracted from the original monolithic forked/agent.rs ---
 mod event;

@@ -187,6 +187,7 @@ pub(crate) fn truncate_output(content: String, max_chars: usize) -> String {
 pub(crate) async fn execute_shell_command(
     command: &str,
     command_working_dir: Option<PathBuf>,
+    workspace_scope: &[WorkspaceScopeEntry],
 ) -> Result<String, ForkedAgentError> {
     if is_dangerous_shell_command(command) {
         return Err(ForkedAgentError::ToolError(
@@ -194,15 +195,30 @@ pub(crate) async fn execute_shell_command(
         ));
     }
 
-    let mut cmd = if cfg!(windows) {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(command);
-        cmd
+    let writable_roots = if workspace_scope.is_empty() {
+        command_working_dir.iter().cloned().collect::<Vec<_>>()
     } else {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(command);
-        cmd
+        workspace_scope
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>()
     };
+    #[cfg(windows)]
+    let (mut cmd, _) = blockcell_tools::sandbox::sandboxed_shell_command(
+        "cmd",
+        &["/C", command],
+        blockcell_tools::sandbox::SandboxPolicy::WorkspaceWrite,
+        &writable_roots,
+    )
+    .map_err(|error| ForkedAgentError::ToolError(error.to_string()))?;
+    #[cfg(not(windows))]
+    let (mut cmd, _) = blockcell_tools::sandbox::sandboxed_shell_command(
+        "sh",
+        &["-c", command],
+        blockcell_tools::sandbox::SandboxPolicy::WorkspaceWrite,
+        &writable_roots,
+    )
+    .map_err(|error| ForkedAgentError::ToolError(error.to_string()))?;
 
     if let Some(dir) = command_working_dir {
         cmd.current_dir(dir);
@@ -497,7 +513,7 @@ pub(crate) async fn execute_forked_tool(
                 .transpose()?
                 .or_else(|| working_dir.clone());
 
-            execute_shell_command(command, command_working_dir).await
+            execute_shell_command(command, command_working_dir, workspace_scope).await
         },
 
         "file_edit" | "edit_file" => {
