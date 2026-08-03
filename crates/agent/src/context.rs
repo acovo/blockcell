@@ -368,6 +368,13 @@ impl ContextBuilder {
         (items, skipped_previous)
     }
 
+    pub(crate) fn clear_injected_retrieval_for_session(&self, session_key: &str) {
+        self.injected_retrieval_items
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_key);
+    }
+
     pub fn resolve_active_skill(
         &self,
         user_input: &str,
@@ -1512,6 +1519,33 @@ description: deploy demo
         assert!(repeated.is_empty());
         assert!(skipped);
         assert_eq!(updated, vec![changed]);
+    }
+
+    #[test]
+    fn compact_reset_allows_retrieval_items_to_be_injected_again() {
+        let builder = ContextBuilder::new(
+            Paths::with_base(std::env::temp_dir().join(format!(
+                "blockcell-context-compact-retrieval-reset-test-{}",
+                uuid::Uuid::new_v4()
+            ))),
+            Config::default(),
+        );
+        let item = crate::retrieval::RetrievedItem::new(
+            RetrievalSource::CanonicalKnowledge,
+            "Remember the deployment rollback gate.",
+        );
+
+        let (first, _) =
+            builder.filter_incremental_retrieval(Some("cli:compact"), vec![item.clone()]);
+        let (repeated, _) =
+            builder.filter_incremental_retrieval(Some("cli:compact"), vec![item.clone()]);
+        builder.clear_injected_retrieval_for_session("cli:compact");
+        let (after_compact, _) =
+            builder.filter_incremental_retrieval(Some("cli:compact"), vec![item.clone()]);
+
+        assert_eq!(first, vec![item.clone()]);
+        assert!(repeated.is_empty());
+        assert_eq!(after_compact, vec![item]);
     }
 
     #[test]

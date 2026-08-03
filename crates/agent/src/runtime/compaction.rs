@@ -176,6 +176,8 @@ impl AgentRuntime {
             warn!(error = %e, phase, "[layer4] 无法保存 compacted history");
         }
         self.finalize_trackers_after_compact(history);
+        self.context_builder
+            .clear_injected_retrieval_for_session(persist_session_key);
         true
     }
 
