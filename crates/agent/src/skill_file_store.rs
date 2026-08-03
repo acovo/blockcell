@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use blockcell_core::{Error, Paths, Result};
@@ -17,6 +18,16 @@ use crate::write_guard::{WriteGuard, WriteGuardError, WriteGuardRAII, WriteTarge
 const SKILL_MD_CHAR_LIMIT: usize = 64_000;
 const AUX_FILE_CHAR_LIMIT: usize = 128_000;
 const SKILLS_PROMPT_SNAPSHOT_FILE: &str = ".skills_prompt_snapshot.json";
+static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn snapshot_dir_name(skill_name: &str, stamp: &str) -> String {
+    let sequence = SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}_{stamp}_{sequence:020}_{}",
+        snapshot_skill_key(skill_name),
+        Uuid::new_v4()
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -494,13 +505,10 @@ impl SkillFileStore {
     }
 
     fn new_snapshot_dir(&self, skill_name: &str) -> Result<PathBuf> {
-        let stamp = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
-        let dir = self.snapshots_dir.join(format!(
-            "{}_{}_{}",
-            snapshot_skill_key(skill_name),
-            stamp,
-            Uuid::new_v4()
-        ));
+        let stamp = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+        let dir = self
+            .snapshots_dir
+            .join(snapshot_dir_name(skill_name, &stamp));
         fs::create_dir_all(&dir)?;
         Ok(dir)
     }
@@ -1025,6 +1033,19 @@ mod tests {
             Uuid::new_v4()
         ));
         Paths::with_base(base)
+    }
+
+    #[test]
+    fn snapshot_names_are_monotonic_within_same_millisecond() {
+        let stamp = "20260803T120000.123Z";
+
+        let first = snapshot_dir_name("restore_skill", stamp);
+        let second = snapshot_dir_name("restore_skill", stamp);
+
+        assert!(
+            first < second,
+            "snapshot names must preserve creation order"
+        );
     }
 
     #[test]
