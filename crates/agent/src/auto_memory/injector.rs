@@ -94,8 +94,7 @@ impl MemoryInjector {
 
     /// 加载记忆文件
     ///
-    /// 首次安装时，如果记忆文件不存在，先调用 ensure_memory_dir() 创建模板文件，
-    /// 然后重新尝试加载，确保首次安装也能正确注入记忆上下文。
+    /// 兼容读取已存在的旧 Layer 5 文件；不会创建新的旧格式模板。
     pub async fn load_memories(&mut self, memory_dir: &Path) -> std::io::Result<()> {
         for memory_type in MemoryType::all() {
             let path = memory_dir.join(memory_type.filename());
@@ -108,27 +107,7 @@ impl MemoryInjector {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // 首次安装时文件不存在，创建模板文件后重新加载
-                    // memory_dir 是 config_dir/memory，ensure_memory_dir 需要 config_dir
-                    let config_dir = memory_dir.parent().unwrap_or(memory_dir);
-                    if let Err(ensure_err) = super::memory_type::ensure_memory_dir(config_dir).await
-                    {
-                        tracing::warn!(
-                            memory_type = memory_type.name(),
-                            error = %ensure_err,
-                            "[MemoryInjector] Failed to ensure memory dir for first install"
-                        );
-                        continue;
-                    }
-                    // 重新尝试读取刚创建的模板文件
-                    // 模板文件内容不应注入到 prompt，跳过
-                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                        if !content.trim().is_empty()
-                            && content.trim() != memory_type.template().trim()
-                        {
-                            self.cache.insert(memory_type, content);
-                        }
-                    }
+                    continue;
                 }
                 Err(e) => {
                     // 权限错误、磁盘错误等需要警告

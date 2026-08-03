@@ -201,17 +201,7 @@ pub fn get_memory_file_path(config_dir: &Path, memory_type: MemoryType) -> PathB
 /// 确保记忆目录存在
 pub async fn ensure_memory_dir(config_dir: &Path) -> std::io::Result<()> {
     let memory_dir = config_dir.join("memory");
-    tokio::fs::create_dir_all(&memory_dir).await?;
-
-    // 为每种类型创建初始文件（如果不存在）
-    for memory_type in MemoryType::all() {
-        let file_path = get_memory_file_path(config_dir, memory_type);
-        if !tokio::fs::try_exists(&file_path).await? {
-            tokio::fs::write(&file_path, memory_type.template()).await?;
-        }
-    }
-
-    Ok(())
+    tokio::fs::create_dir_all(&memory_dir).await
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -384,6 +374,27 @@ mod tests {
             let template = mt.template();
             assert!(template.contains("---")); // YAML frontmatter
             assert!(template.contains("# ")); // Markdown header
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_memory_dir_does_not_create_legacy_layer5_templates() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "blockcell-layer5-dir-only-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        ensure_memory_dir(&config_dir)
+            .await
+            .expect("ensure memory directory");
+
+        assert!(config_dir.join("memory").is_dir());
+        for memory_type in MemoryType::all() {
+            assert!(
+                !get_memory_file_path(&config_dir, memory_type).exists(),
+                "legacy {} template should not be created",
+                memory_type.filename()
+            );
         }
     }
 
