@@ -50,21 +50,14 @@ with `skill_manage` action="patch" — don't wait to be asked.
 ### Skill maintenance
 Skills that aren't maintained become liabilities. Periodically review skills you use
 and patch them when you find stale instructions or missing steps.
-
-### Memory vs Skill boundary
-- Memory: declarative facts (preferences, environment, conventions)
-- Skill: procedural knowledge (steps, workflows, pitfalls)
-- "User prefers concise responses" → memory
-- "Deploy to K8s requires pushing image first" → skill
 "#;
 
 /// Memory 使用指导 — 参考 Hermes MEMORY_GUIDANCE
 ///
 /// 注入到系统提示词中, 引导 Agent 正确使用 Memory 系统。
-const MEMORY_GUIDANCE: &str = r#"
-## Memory Guidance
-
-You have a memory system for storing durable facts about the user and environment.
+const MEMORY_GUIDANCE_BODY: &str = r#"
+### Durable memory
+Use memory for durable facts about the user and environment.
 
 ### What to save
 - User preferences and habits (communication style, language, formatting)
@@ -83,6 +76,7 @@ You have a memory system for storing durable facts about the user and environmen
 - Skill: procedural knowledge (steps, workflows, pitfalls)
 - "User prefers concise responses" → memory
 - "Deploy to K8s requires pushing image first" → skill
+- Procedures and workflows belong in skills, not memory.
 "#;
 
 pub struct ContextBuilder {
@@ -462,17 +456,10 @@ impl ContextBuilder {
             prompt.push_str(
                 "BlockCell may review successful interactions after the response to learn durable user preferences, stable project facts, reusable workflows, and prompt-only learned skills.\n",
             );
-            prompt.push_str(
-                "- Save only durable facts that will still matter later: user preferences, recurring corrections, stable project facts, environment details, tool quirks, and conventions.\n",
-            );
-            prompt.push_str(
-                "- Do not save task progress, temporary TODOs, completed-work logs, one-off outcomes, or short-lived status as durable memory.\n",
-            );
+            prompt.push_str(MEMORY_GUIDANCE_BODY);
+            prompt.push('\n');
             prompt.push_str(
                 "- Write memories as declarative facts, not commands to yourself. Example: 'User prefers concise responses' is good; 'Always respond concisely' is not.\n",
-            );
-            prompt.push_str(
-                "- Procedures and workflows belong in skills, not memory. When a complex method succeeds, a tricky error is fixed, or the user corrects your approach, state the reusable workflow naturally and concisely so Ghost can review it later.\n",
             );
             prompt.push_str(
                 "- If the user references prior conversations or you suspect relevant history exists, use `session_search` before asking the user to repeat context.\n",
@@ -501,20 +488,13 @@ impl ContextBuilder {
             if available_tool_names.is_empty() {
                 prompt.push_str("- There are no callable tools available in the current agent scope for this interaction. Do not claim tools outside the current scope.\n");
             } else {
-                prompt.push_str(&format!(
-                    "- Current callable tools in this interaction: {}\n",
-                    available_tool_names.join(", ")
-                ));
-                prompt.push_str("- When the user asks which tools/capabilities you have, answer only from the current callable tool list above. Do not mention globally registered tools that are not in the current agent scope.\n");
+                prompt.push_str("- The current callable tools are defined by the attached tool schemas. When asked about capabilities, answer only from those schemas.\n");
             }
             for rule in tool_prompt_rules {
                 prompt.push_str(rule);
                 if !rule.ends_with('\n') {
                     prompt.push('\n');
                 }
-            }
-            if tool_prompt_rules.is_empty() {
-                prompt.push_str("- **MCP (Model Context Protocol)**: blockcell **已内置 MCP 客户端支持**，可连接任意 MCP 服务器（SQLite、GitHub、文件系统、数据库等）。MCP 工具会以 `<serverName>__<toolName>` 格式出现在工具列表中。若用户询问 MCP 功能或当前工具列表中无 MCP 工具，说明尚未配置 MCP 服务器，请引导用户使用 `blockcell mcp add <template>` 快捷添加，或直接编辑 `~/.blockcell/mcp.json` / `~/.blockcell/mcp.d/*.json`。例如：`blockcell mcp add sqlite --db-path /tmp/test.db`，重启后即可使用。\n");
             }
             prompt.push('\n');
         }
@@ -556,8 +536,9 @@ impl ContextBuilder {
         }
 
         // 注入 Memory 使用指导 (与 Hermes MEMORY_GUIDANCE 对齐)
-        if self.memory_store.is_some() {
-            prompt.push_str(MEMORY_GUIDANCE);
+        if self.memory_store.is_some() && (!self.ghost_learning_enabled || is_chat) {
+            prompt.push_str("## Memory Guidance\n");
+            prompt.push_str(MEMORY_GUIDANCE_BODY);
             prompt.push('\n');
         }
 
@@ -1556,8 +1537,41 @@ description: deploy demo
         assert!(prompt.contains("use `session_search`"));
         assert!(prompt.contains("load it with `skill_view`"));
         assert!(prompt.contains("patch it with `skill_manage(action=\"patch\")`"));
-        assert!(prompt.contains("Do not save task progress"));
+        assert!(prompt.contains("Task progress or temporary state"));
         assert!(!prompt.contains("skill candidates"));
+    }
+
+    #[test]
+    fn learning_guidance_and_tool_metadata_are_not_duplicated() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-context-guidance-dedup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        let mut config = Config::default();
+        config.agents.ghost.learning.enabled = true;
+        let mut builder = ContextBuilder::new(paths, config);
+        builder.set_memory_store(Arc::new(EmptyMemoryStore));
+
+        let prompt = builder.build_system_prompt_for_mode_with_channel(
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "",
+            &["read_file".to_string(), "write_file".to_string()],
+            &["- Canonical MCP rule.".to_string()],
+        );
+
+        assert_eq!(prompt.matches("### Memory vs Skill boundary").count(), 1);
+        assert_eq!(prompt.matches("## Ghost Learning").count(), 1);
+        assert!(!prompt.contains("## Memory Guidance"));
+        assert!(!prompt.contains("Current callable tools in this interaction"));
+        assert!(!prompt.contains("read_file, write_file"));
+        assert_eq!(prompt.matches("Canonical MCP rule.").count(), 1);
+        assert!(!prompt.contains("blockcell mcp add sqlite"));
     }
 
     #[test]
