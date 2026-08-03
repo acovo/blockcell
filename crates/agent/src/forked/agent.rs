@@ -45,6 +45,33 @@ const PROVIDER_RETRY_MAX_ATTEMPTS: usize = 3;
 const PROVIDER_RETRY_INITIAL_DELAY_MS: u64 = 100;
 const PROVIDER_RETRY_MAX_DELAY_MS: u64 = 2000;
 
+/// A file or directory that a typed agent is allowed to modify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceScopeEntry {
+    pub path: PathBuf,
+    pub recursive: bool,
+}
+
+impl WorkspaceScopeEntry {
+    pub fn file(path: PathBuf) -> Self {
+        Self {
+            path,
+            recursive: false,
+        }
+    }
+
+    pub fn directory(path: PathBuf) -> Self {
+        Self {
+            path,
+            recursive: true,
+        }
+    }
+
+    pub fn allows(&self, path: &Path) -> bool {
+        path == self.path || (self.recursive && path.starts_with(&self.path))
+    }
+}
+
 /// Forked Agent 参数
 ///
 /// ## 必须设置 provider_pool
@@ -104,6 +131,8 @@ pub struct ForkedAgentParams {
     pub one_shot: bool,
     /// 工作目录（用于 worktree 隔离）
     pub working_dir: Option<PathBuf>,
+    /// Files/directories this agent may modify.
+    pub workspace_scope: Vec<WorkspaceScopeEntry>,
     /// 事件发送通道（可选，用于向父级转发进度事件如 tool_call_start、token 等）
     pub event_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// 进度通道（可选，用于通过 TaskManager 转发工具调用事件到外部渠道）
@@ -171,6 +200,7 @@ impl ForkedAgentParams {
             disallowed_tools: Vec::new(),
             one_shot: false,
             working_dir: None,
+            workspace_scope: Vec::new(),
             event_tx: None,
             progress_tx: None,
             tool_schemas: Vec::new(),
@@ -322,6 +352,7 @@ pub struct ForkedAgentParamsBuilder {
     disallowed_tools: Option<Vec<String>>,
     one_shot: bool,
     working_dir: Option<PathBuf>,
+    workspace_scope: Vec<WorkspaceScopeEntry>,
     event_tx: Option<tokio::sync::broadcast::Sender<String>>,
     progress_tx: Option<tokio::sync::mpsc::Sender<crate::agent_progress::AgentProgress>>,
     tool_schemas: Option<Vec<serde_json::Value>>,
@@ -442,6 +473,12 @@ impl ForkedAgentParamsBuilder {
     /// 设置工作目录（用于 worktree 隔离）
     pub fn working_dir(mut self, dir: PathBuf) -> Self {
         self.working_dir = Some(dir);
+        self
+    }
+
+    /// Restrict file mutations to the supplied paths.
+    pub fn workspace_scope(mut self, scope: Vec<WorkspaceScopeEntry>) -> Self {
+        self.workspace_scope = scope;
         self
     }
 
@@ -578,6 +615,7 @@ impl ForkedAgentParamsBuilder {
             disallowed_tools: self.disallowed_tools.unwrap_or_default(),
             one_shot: self.one_shot,
             working_dir: self.working_dir,
+            workspace_scope: self.workspace_scope,
             event_tx: self.event_tx,
             progress_tx: self.progress_tx,
             tool_schemas: self.tool_schemas.unwrap_or_default(),

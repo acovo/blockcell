@@ -4666,6 +4666,20 @@ async fn test_spawn_typed_agent_e2e() {
     assert!(params.one_shot);
 }
 
+#[test]
+fn typed_agent_results_are_normalized_for_parent_injection() {
+    let normalized = super::normalize_typed_agent_result(
+        "coder",
+        r#"{"files_changed":["src/lib.rs"],"summary":"fixed","tests_run":[{"command":"cargo test","status":"passed"}],"status":"completed"}"#,
+    );
+    let value: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+
+    assert_eq!(value["files_changed"], serde_json::json!(["src/lib.rs"]));
+    assert_eq!(value["summary"], "fixed");
+    assert_eq!(value["status"], "completed");
+    assert!(value["tests_run"].is_array());
+}
+
 // ========== 端到端测试: execute_fork_mode ==========
 
 /// 测试 execute_fork_mode 的上下文继承

@@ -116,6 +116,7 @@ pub fn default_read_only_fork_disallowed_tools() -> Vec<String> {
         "agent",
         "spawn",
         "exec",
+        "shell",
         "edit_file",
         "file_edit",
         "write_file",
@@ -262,11 +263,11 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                 }
             }
         }),
-        // exec
+        // shell
         json!({
             "type": "function",
             "function": {
-                "name": "exec",
+                "name": "shell",
                 "description": "Execute a shell command. Use for explicit verification commands such as cargo check or targeted test runs.",
                 "parameters": {
                     "type": "object",
@@ -279,6 +280,22 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                             "type": "string",
                             "description": "Optional working directory for the command. Relative paths resolve within the agent working directory when isolated."
                         }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        // legacy exec compatibility
+        json!({
+            "type": "function",
+            "function": {
+                "name": "exec",
+                "description": "Compatibility alias for shell command execution.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "working_dir": {"type": "string"}
                     },
                     "required": ["command"]
                 }

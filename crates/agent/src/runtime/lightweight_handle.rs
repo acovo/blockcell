@@ -318,6 +318,7 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
         agent_type: &str,
         prompt: String,
         description: Option<String>,
+        workspace_scope: Vec<String>,
     ) -> Result<String> {
         use crate::forked::{
             run_forked_agent, CacheSafeParams, ForkedAgentParams, SubagentOverrides,
@@ -338,6 +339,21 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                 .next()
                 .unwrap_or("unknown")
         );
+        let workspace = self.paths.workspace();
+        let workspace_scope_entries = resolve_typed_workspace_scope(&workspace, &workspace_scope);
+        if agent_type == "coder" {
+            if workspace_scope_entries.is_empty() {
+                return Err(blockcell_core::Error::Validation(
+                    "coder agent requires a non-empty workspace_scope".to_string(),
+                ));
+            }
+            let paths = workspace_scope_entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>();
+            self.task_manager
+                .try_acquire_workspace_scope(&task_id, &paths)?;
+        }
 
         let parent_session_id = self
             .get_main_session_target()
@@ -399,7 +415,15 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
         let initial_prompt = def.initial_prompt.clone();
         let background = def.background;
         let color = def.color.clone();
-        let prompt_clone = prompt.clone();
+        let prompt_clone = if workspace_scope.is_empty() {
+            prompt.clone()
+        } else {
+            format!(
+                "{}\n\nAssigned workspace_scope (all writes must stay inside it):\n- {}",
+                prompt,
+                workspace_scope.join("\n- ")
+            )
+        };
         let identity_clone = identity.clone();
         let task_id_clone = task_id.clone();
         let agent_type_for_log = agent_type.to_string();
@@ -424,7 +448,6 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
         // Worktree isolation support
         // 检查是否需要 worktree 隔离（基于 AgentTypeDefinition.isolation 配置）
         let needs_worktree = Self::requires_worktree(def);
-        let workspace = self.paths.workspace().to_path_buf();
         let already_in_worktree = Self::is_in_worktree(&workspace).await;
         let worktree_path = if needs_worktree && !already_in_worktree {
             match Self::create_worktree(&workspace, &task_id).await {
@@ -484,6 +507,7 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                         .fork_label("typed")
                         .agent_type(Some(agent_type_for_label))
                         .task_id(Some(task_id_clone.clone()))
+                        .workspace_scope(workspace_scope_entries)
                         .disallowed_tools(disallowed_tools)
                         .one_shot(one_shot)
                         .overrides(overrides)
@@ -543,6 +567,7 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                     let content = output
                         .final_content
                         .unwrap_or_else(|| "Task completed with no output".to_string());
+                    let content = normalize_typed_agent_result(&agent_type_for_log, &content);
                     let was_cancelled = task_manager
                         .get_task(&task_id_clone)
                         .await

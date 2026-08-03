@@ -239,6 +239,19 @@ pub(crate) async fn execute_shell_command(
     .to_string())
 }
 
+fn ensure_write_in_workspace_scope(
+    path: &Path,
+    workspace_scope: &[WorkspaceScopeEntry],
+) -> Result<(), ForkedAgentError> {
+    if workspace_scope.is_empty() || workspace_scope.iter().any(|entry| entry.allows(path)) {
+        return Ok(());
+    }
+    Err(ForkedAgentError::ToolError(format!(
+        "Write path '{}' is outside the assigned workspace_scope",
+        path.display()
+    )))
+}
+
 /// 在 skills_dir + external_skills_dirs 中查找 Skill 目录 (与主工具 find_skill_dir 对齐)
 ///
 /// 搜索顺序: skills_dir/{name} → skills_dir/{category}/{name} → 各 external_dir 同理
@@ -315,6 +328,7 @@ pub(crate) async fn execute_forked_tool(
     external_skills_dirs: &[PathBuf],
     skill_mutex: &Option<SkillMutexHandle>,
     working_dir: &Option<PathBuf>,
+    workspace_scope: &[WorkspaceScopeEntry],
 ) -> Result<String, ForkedAgentError> {
     // Check disallowed tools list
     if disallowed_tools.iter().any(|d| d == tool_name) {
@@ -468,7 +482,7 @@ pub(crate) async fn execute_forked_tool(
             }
         },
 
-        "exec" => {
+        "exec" | "shell" => {
             let command = input
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -503,6 +517,7 @@ pub(crate) async fn execute_forked_tool(
             validate_edit_content(old_string, new_string, MAX_EDIT_SIZE)?;
 
             let resolved = resolve_forked_path(file_path, working_dir)?;
+            ensure_write_in_workspace_scope(&resolved, workspace_scope)?;
 
             // 读取文件
             let content = tokio::fs::read_to_string(&resolved)
@@ -560,6 +575,7 @@ pub(crate) async fn execute_forked_tool(
             }
 
             let resolved = resolve_forked_path(file_path, working_dir)?;
+            ensure_write_in_workspace_scope(&resolved, workspace_scope)?;
 
             // 确保父目录存在（create_dir_all 会处理已存在的情况）
             if let Some(parent) = resolved.parent() {

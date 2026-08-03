@@ -148,6 +148,8 @@ pub struct TaskManager {
     abort_tokens: Arc<StdMutex<HashMap<String, AbortToken>>>,
     /// Persistent shell session IDs mapped to their process-group leaders.
     shell_processes: Arc<StdMutex<HashMap<String, u32>>>,
+    /// Claimed workspace paths for concurrently running coding agents.
+    workspace_locks: Arc<StdMutex<HashMap<PathBuf, String>>>,
     /// Progress callback channel for reporting agent execution progress.
     progress_tx: Option<mpsc::Sender<AgentProgress>>,
     /// 任务完成事件广播通道，用于Lead Agent订阅子Agent完成事件
@@ -178,7 +180,69 @@ pub const EVICT_GRACE_PERIOD_SECS: i64 = 30;
 
 mod persistence;
 
+#[cfg(test)]
+mod workspace_scope_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_workspace_scopes_fail_fast_until_owner_releases() {
+        let manager = TaskManager::new();
+        let root = PathBuf::from("/tmp/blockcell-scope-test");
+
+        manager
+            .try_acquire_workspace_scope("task-a", &[root.join("src")])
+            .expect("first scope should lock");
+        let conflict = manager
+            .try_acquire_workspace_scope("task-b", &[root.join("src/lib.rs")])
+            .expect_err("nested scope should conflict");
+        assert!(conflict.to_string().contains("task-a"));
+
+        manager.release_workspace_scope("task-a");
+        manager
+            .try_acquire_workspace_scope("task-b", &[root.join("src/lib.rs")])
+            .expect("released scope should be reusable");
+    }
+}
+
 impl TaskManager {
+    /// Atomically claim a set of file/directory paths for a background coder.
+    pub fn try_acquire_workspace_scope(
+        &self,
+        task_id: &str,
+        scope: &[PathBuf],
+    ) -> Result<(), Error> {
+        let mut locks = self
+            .workspace_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for requested in scope {
+            if let Some((path, owner)) = locks.iter().find(|(path, _)| {
+                requested.as_path() == path.as_path()
+                    || requested.starts_with(path)
+                    || path.starts_with(requested)
+            }) {
+                return Err(Error::Tool(format!(
+                    "workspace_scope 冲突: {} 已由任务 {} 锁定",
+                    path.display(),
+                    owner
+                )));
+            }
+        }
+        for path in scope {
+            locks.insert(path.clone(), task_id.to_string());
+        }
+        Ok(())
+    }
+
+    /// Release every workspace path owned by a task.
+    pub fn release_workspace_scope(&self, task_id: &str) {
+        let mut locks = self
+            .workspace_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        locks.retain(|_, owner| owner != task_id);
+    }
+
     pub fn new() -> Self {
         let (completed_events_tx, _) = broadcast::channel(100);
         Self {
@@ -187,6 +251,7 @@ impl TaskManager {
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
             abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
             shell_processes: Arc::new(StdMutex::new(HashMap::new())),
+            workspace_locks: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: None,
             completed_events_tx,
             workspace_dir: None,
@@ -202,6 +267,7 @@ impl TaskManager {
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
             abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
             shell_processes: Arc::new(StdMutex::new(HashMap::new())),
+            workspace_locks: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: None,
             completed_events_tx,
             workspace_dir: Some(workspace_dir.to_path_buf()),
@@ -217,6 +283,7 @@ impl TaskManager {
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
             abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
             shell_processes: Arc::new(StdMutex::new(HashMap::new())),
+            workspace_locks: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: Some(progress_tx),
             completed_events_tx,
             workspace_dir: None,
@@ -235,6 +302,7 @@ impl TaskManager {
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
             abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
             shell_processes: Arc::new(StdMutex::new(HashMap::new())),
+            workspace_locks: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: Some(progress_tx),
             completed_events_tx,
             workspace_dir: Some(workspace_dir.to_path_buf()),
@@ -337,6 +405,7 @@ impl TaskManager {
     fn cleanup_task_runtime_state(&self, task_id: &str) {
         self.cancel_registered_abort_token(task_id);
         self.unregister_abort_token(task_id);
+        self.release_workspace_scope(task_id);
         let mut queues = match self.message_queues.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -704,6 +773,7 @@ impl TaskManager {
             );
         }
         self.unregister_abort_token(task_id);
+        self.release_workspace_scope(task_id);
 
         if let Some(task) = updated {
             self.emit_lifecycle_event(&task, "completed");
@@ -749,6 +819,7 @@ impl TaskManager {
             );
         }
         self.unregister_abort_token(task_id);
+        self.release_workspace_scope(task_id);
 
         if let Some(task) = updated {
             self.emit_lifecycle_event(&task, "failed");
@@ -847,6 +918,7 @@ impl TaskManager {
         if let Some(task) = updated {
             let token_cancelled = self.cancel_registered_abort_token(task_id);
             self.unregister_abort_token(task_id);
+            self.release_workspace_scope(task_id);
             if token_cancelled {
                 tracing::info!(task_id = %task_id, "Cancelled registered AbortToken for task");
             }
@@ -1139,6 +1211,7 @@ impl TaskManager {
             );
         }
         self.unregister_abort_token(task_id);
+        self.release_workspace_scope(task_id);
 
         // 持久化任务状态 + 发送生命周期事件
         if let Some(task) = &task_info {
@@ -1246,6 +1319,7 @@ impl TaskManager {
                 );
             }
             self.unregister_abort_token(task_id);
+            self.release_workspace_scope(task_id);
 
             self.emit_lifecycle_event(&task, "failed");
             self.persist_if_configured(&task).await;

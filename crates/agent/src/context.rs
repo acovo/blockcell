@@ -44,6 +44,12 @@ const CODING_MODE_PROMPT: &str = r#"
 ## Plan Discipline
 - For tasks with three or more steps, call `update_plan` before implementation.
 - Keep exactly one step in progress and update the plan whenever a step is completed.
+
+## Multi-Agent Orchestration
+- For complex coding tasks, use `agent(explore)` to map the code, then `agent(plan)`, and persist the accepted steps with `update_plan`.
+- Dispatch independent file scopes in parallel with `agent(coder)` and an explicit non-overlapping `workspace_scope`; collect their background task results before integration.
+- Finish with `agent(tester)` and `agent(reviewer)`. Route concrete review findings back to `agent(coder)` and repeat testing/review until both pass.
+- Do not parallelize work that touches the same file or has unresolved ordering dependencies.
 "#;
 
 #[derive(Debug, Clone)]
@@ -2359,6 +2365,10 @@ description: deploy demo
         assert!(prompt.contains("## Verification Discipline"));
         assert!(prompt.contains("## Plan Discipline"));
         assert!(prompt.contains("update_plan"));
+        assert!(prompt.contains("agent(explore)"));
+        assert!(prompt.contains("agent(coder)"));
+        assert!(prompt.contains("agent(tester)"));
+        assert!(prompt.contains("agent(reviewer)"));
         assert!(prompt.contains("reset --hard"));
     }
 }

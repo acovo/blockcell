@@ -126,6 +126,7 @@ pub trait RuntimeHandle: Send + Sync {
         agent_type: &str,
         prompt: String,
         description: Option<String>,
+        workspace_scope: Vec<String>,
     ) -> Result<String>;
 }
 

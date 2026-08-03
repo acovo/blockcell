@@ -277,7 +277,14 @@ fn test_filter_tool_schemas_wildcard_keeps_all_except_disallowed() {
 #[test]
 fn default_fork_capabilities_are_structurally_read_only() {
     let disallowed = default_read_only_fork_disallowed_tools();
-    for tool in ["exec", "edit_file", "file_edit", "write_file", "file_write"] {
+    for tool in [
+        "exec",
+        "shell",
+        "edit_file",
+        "file_edit",
+        "write_file",
+        "file_write",
+    ] {
         assert!(
             disallowed.iter().any(|name| name == tool),
             "{tool} must be denied in default fork mode"
@@ -307,6 +314,18 @@ fn test_forked_tool_schemas_prefer_relative_paths() {
     assert!(!serialized.contains("The absolute directory path to list"));
 }
 
+#[test]
+fn typed_agent_schemas_expose_shell_and_keep_exec_compatibility() {
+    let schemas = build_forked_tool_schemas(&[]);
+    let names = schemas
+        .iter()
+        .filter_map(|schema| tool_schema_name(schema))
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"shell"));
+    assert!(names.contains(&"exec"));
+}
+
 #[tokio::test]
 async fn test_execute_forked_write_file_creates_relative_file_in_working_dir() {
     let tmp = tempfile::tempdir().unwrap();
@@ -325,6 +344,7 @@ async fn test_execute_forked_write_file_creates_relative_file_in_working_dir() {
         &[],
         &None,
         &working_dir,
+        &[],
     )
     .await;
 
@@ -333,6 +353,34 @@ async fn test_execute_forked_write_file_creates_relative_file_in_working_dir() {
         .await
         .unwrap();
     assert_eq!(written, "temp");
+}
+
+#[tokio::test]
+async fn forked_write_rejects_paths_outside_workspace_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let working_dir = Some(tmp.path().to_path_buf());
+    let can_use_tool: CanUseToolFn = Arc::new(|_, _| ToolPermission::Allow);
+    let scope = vec![WorkspaceScopeEntry::directory(tmp.path().join("src"))];
+
+    let result = execute_forked_tool(
+        "write_file",
+        &json!({"file_path": "tests/outside.rs", "content": "no"}),
+        &can_use_tool,
+        &[],
+        &None,
+        &None,
+        &None,
+        &None,
+        &[],
+        &None,
+        &working_dir,
+        &scope,
+    )
+    .await;
+
+    let error = result.expect_err("out-of-scope write should be denied");
+    assert!(error.to_string().contains("workspace_scope"));
+    assert!(!tmp.path().join("tests/outside.rs").exists());
 }
 
 #[tokio::test]
@@ -353,6 +401,7 @@ async fn test_execute_forked_read_file_missing_is_recoverable() {
         &[],
         &None,
         &working_dir,
+        &[],
     )
     .await;
 

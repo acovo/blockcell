@@ -81,6 +81,7 @@ mod tool_exec;
 mod turn_flow;
 mod wiring;
 
+pub(crate) use fork_spawn::{normalize_typed_agent_result, resolve_typed_workspace_scope};
 pub(crate) use ghost_boundary::*;
 pub use lightweight_handle::*;
 pub(crate) use message_task::*;
@@ -2542,8 +2543,9 @@ impl blockcell_tools::RuntimeHandle for AgentRuntime {
         agent_type: &str,
         prompt: String,
         description: Option<String>,
+        workspace_scope: Vec<String>,
     ) -> Result<String> {
-        self.spawn_typed_agent(agent_type, prompt, description)
+        self.spawn_typed_agent(agent_type, prompt, description, workspace_scope)
             .await
     }
 }

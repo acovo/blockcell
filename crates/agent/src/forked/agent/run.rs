@@ -429,6 +429,7 @@ pub async fn run_forked_agent(
                         &params.external_skills_dirs,
                         &params.skill_mutex,
                         &params.working_dir,
+                        &params.workspace_scope,
                     ) => result,
                 };
 

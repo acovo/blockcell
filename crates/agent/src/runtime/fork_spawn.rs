@@ -1,5 +1,73 @@
 use super::*;
 
+pub(crate) fn resolve_typed_workspace_scope(
+    workspace: &std::path::Path,
+    requested: &[String],
+) -> Vec<crate::forked::WorkspaceScopeEntry> {
+    requested
+        .iter()
+        .map(|raw| {
+            let path = workspace.join(raw.trim_end_matches(['/', '\\']));
+            if raw.ends_with(['/', '\\']) || path.is_dir() {
+                crate::forked::WorkspaceScopeEntry::directory(path)
+            } else {
+                crate::forked::WorkspaceScopeEntry::file(path)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn normalize_typed_agent_result(agent_type: &str, content: &str) -> String {
+    let trimmed = content.trim();
+    let json_text = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    let parsed = serde_json::from_str::<serde_json::Value>(json_text).ok();
+    let files_changed = parsed
+        .as_ref()
+        .and_then(|value| value.get("files_changed"))
+        .filter(|value| value.is_array())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let tests_run = parsed
+        .as_ref()
+        .and_then(|value| value.get("tests_run"))
+        .filter(|value| value.is_array())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let mut summary = parsed
+        .as_ref()
+        .and_then(|value| value.get("summary"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(trimmed)
+        .to_string();
+    if let Some(findings) = parsed
+        .as_ref()
+        .and_then(|value| value.get("findings"))
+        .filter(|value| value.as_array().is_some_and(|items| !items.is_empty()))
+    {
+        summary.push_str("\nfindings: ");
+        summary.push_str(&findings.to_string());
+    }
+    let status = parsed
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("completed");
+
+    serde_json::json!({
+        "files_changed": files_changed,
+        "summary": summary,
+        "tests_run": tests_run,
+        "status": status,
+        "agent_type": agent_type,
+    })
+    .to_string()
+}
+
 // Additional AgentRuntime methods for typed agent support
 impl AgentRuntime {
     /// Fork 模式执行（省略 subagent_type 触发）
@@ -166,6 +234,7 @@ impl AgentRuntime {
         agent_type: &str,
         prompt: String,
         description: Option<String>,
+        workspace_scope: Vec<String>,
     ) -> Result<String> {
         use crate::forked::{run_forked_agent, CacheSafeParams, ForkedAgentParams};
         use blockcell_core::types::ChatMessage;
@@ -185,6 +254,22 @@ impl AgentRuntime {
                 .next()
                 .unwrap_or("unknown")
         );
+
+        let workspace_scope_entries =
+            resolve_typed_workspace_scope(&self.paths.workspace(), &workspace_scope);
+        if agent_type == "coder" {
+            if workspace_scope_entries.is_empty() {
+                return Err(blockcell_core::Error::Validation(
+                    "coder agent requires a non-empty workspace_scope".to_string(),
+                ));
+            }
+            let paths = workspace_scope_entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>();
+            self.task_manager
+                .try_acquire_workspace_scope(&task_id, &paths)?;
+        }
 
         // 获取 parent session_id
         let parent_session_id = self
@@ -262,7 +347,15 @@ impl AgentRuntime {
         let initial_prompt = def.initial_prompt.clone();
         let background = def.background;
         let color = def.color.clone();
-        let prompt_clone = prompt.clone();
+        let prompt_clone = if workspace_scope.is_empty() {
+            prompt.clone()
+        } else {
+            format!(
+                "{}\n\nAssigned workspace_scope (all writes must stay inside it):\n- {}",
+                prompt,
+                workspace_scope.join("\n- ")
+            )
+        };
         let identity_clone = identity.clone();
         let task_id_clone = task_id.clone();
         let agent_type_str = agent_type.to_string();
@@ -345,6 +438,7 @@ impl AgentRuntime {
                         .fork_label("typed")
                         .agent_type(Some(agent_type_for_label))
                         .task_id(Some(task_id_clone.clone()))
+                        .workspace_scope(workspace_scope_entries)
                         .disallowed_tools(disallowed_tools)
                         .one_shot(one_shot)
                         .tool_schemas(tool_schemas)
@@ -405,6 +499,7 @@ impl AgentRuntime {
                     let content = output
                         .final_content
                         .unwrap_or_else(|| "Task completed with no output".to_string());
+                    let content = normalize_typed_agent_result(&agent_type_for_log, &content);
                     let was_cancelled = task_manager
                         .get_task(&task_id_clone)
                         .await

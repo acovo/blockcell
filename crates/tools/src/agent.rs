@@ -20,6 +20,10 @@ pub struct AgentToolParams {
     /// 强制 spawn，即使同类型任务已在运行
     #[serde(default)]
     pub force: bool,
+
+    /// Workspace-relative files or directories the typed agent may modify.
+    #[serde(default)]
+    pub workspace_scope: Vec<String>,
 }
 
 /// Agent 工具 - 启动专用子 Agent 处理复杂多步任务
@@ -66,6 +70,11 @@ Specify subagent_type for typed agents (background execution, returns task_id)."
                         "type": "boolean",
                         "default": false,
                         "description": "Force spawn even if a same-type agent task is already running. Use when the previous task result is stale or the user explicitly wants a new task."
+                    },
+                    "workspace_scope": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Workspace-relative files or directories assigned to this typed agent. Directory scopes should end with '/'. Required for coder agents; overlapping coder scopes fail fast."
                     }
                 },
                 "required": ["prompt"]
@@ -117,6 +126,39 @@ Specify subagent_type for typed agents (background execution, returns task_id)."
                     )));
                 }
             }
+
+            if type_str == "coder" {
+                let scope = params
+                    .get("workspace_scope")
+                    .and_then(Value::as_array)
+                    .filter(|entries| !entries.is_empty())
+                    .ok_or_else(|| {
+                        Error::Validation("coder agent 必须提供非空 workspace_scope".to_string())
+                    })?;
+                for entry in scope {
+                    let raw = entry
+                        .as_str()
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| {
+                            Error::Validation("workspace_scope 只能包含非空字符串".to_string())
+                        })?;
+                    let path = std::path::Path::new(raw);
+                    if path.is_absolute()
+                        || path.components().any(|component| {
+                            matches!(
+                                component,
+                                std::path::Component::ParentDir
+                                    | std::path::Component::RootDir
+                                    | std::path::Component::Prefix(_)
+                            )
+                        })
+                    {
+                        return Err(Error::Validation(format!(
+                            "workspace_scope 必须是 workspace 内的安全相对路径: {raw}"
+                        )));
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -166,7 +208,7 @@ Specify subagent_type for typed agents (background execution, returns task_id)."
         }
 
         // ===== 检查是否有同类型的 Running 任务 =====
-        if !parsed.force {
+        if !parsed.force && agent_type != "coder" {
             if let Some(ref tm) = ctx.task_manager {
                 let running_tasks = tm.list_tasks_json(Some("running".to_string())).await;
                 if let Some(tasks_array) = running_tasks.as_array() {
@@ -211,7 +253,12 @@ Specify subagent_type for typed agents (background execution, returns task_id)."
         }
 
         let result = runtime_handle
-            .spawn_typed_agent(&agent_type, parsed.prompt, parsed.description)
+            .spawn_typed_agent(
+                &agent_type,
+                parsed.prompt,
+                parsed.description,
+                parsed.workspace_scope,
+            )
             .await?;
 
         Ok(json!({
@@ -264,6 +311,7 @@ mod tests {
         assert!(props.contains_key("prompt"));
         assert!(props.contains_key("description"));
         assert!(props.contains_key("force"));
+        assert!(props.contains_key("workspace_scope"));
     }
 
     #[test]
@@ -287,7 +335,6 @@ mod tests {
         for agent_type in [
             "explore",
             "plan",
-            "coder",
             "reviewer",
             "tester",
             "verification",
@@ -298,6 +345,13 @@ mod tests {
                 .validate(&json!({"prompt": "test", "subagent_type": agent_type}))
                 .is_ok());
         }
+        assert!(tool
+            .validate(&json!({
+                "prompt": "test",
+                "subagent_type": "coder",
+                "workspace_scope": ["src/"]
+            }))
+            .is_ok());
         // 自定义类型 (长度有效) - validate 只做基本格式检查
         assert!(tool
             .validate(&json!({"prompt": "test", "subagent_type": "code-reviewer"}))
@@ -326,6 +380,29 @@ mod tests {
     }
 
     #[test]
+    fn coder_requires_safe_workspace_scope() {
+        let tool = AgentTool;
+
+        assert!(tool
+            .validate(&json!({"prompt": "edit", "subagent_type": "coder"}))
+            .is_err());
+        assert!(tool
+            .validate(&json!({
+                "prompt": "edit",
+                "subagent_type": "coder",
+                "workspace_scope": ["src/", "tests/example.rs"]
+            }))
+            .is_ok());
+        assert!(tool
+            .validate(&json!({
+                "prompt": "escape",
+                "subagent_type": "coder",
+                "workspace_scope": ["../outside"]
+            }))
+            .is_err());
+    }
+
+    #[test]
     fn test_agent_params_deserialization() {
         // 最小参数
         let params: AgentToolParams =
@@ -333,6 +410,7 @@ mod tests {
         assert_eq!(params.prompt, "test prompt");
         assert!(params.subagent_type.is_none());
         assert!(params.description.is_none());
+        assert!(params.workspace_scope.is_empty());
 
         // 完整参数
         let params: AgentToolParams = serde_json::from_value(json!({
