@@ -21,6 +21,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 regex = { workspace = true }
+glob = { workspace = true }
+ignore = { workspace = true }
 reqwest = { workspace = true }
 scraper = { workspace = true }
 htmd = { workspace = true }

@@ -12,6 +12,7 @@ use crate::audio_transcribe::AudioTranscribeTool;
 use crate::browser::BrowseTool;
 use crate::camera::CameraCaptureTool;
 use crate::chart_generate::ChartGenerateTool;
+use crate::code_search::{GlobTool, GrepTool};
 use crate::community_hub::CommunityHubTool;
 use crate::cron::CronTool;
 use crate::data_process::DataProcessTool;
@@ -99,6 +100,8 @@ impl ToolRegistry {
         registry.register(Arc::new(WriteFileTool));
         registry.register(Arc::new(EditFileTool));
         registry.register(Arc::new(ListDirTool));
+        registry.register(Arc::new(GrepTool));
+        registry.register(Arc::new(GlobTool));
 
         // Exec tool
         registry.register(Arc::new(ExecTool));
