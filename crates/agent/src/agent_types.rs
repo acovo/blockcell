@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::agent_prompts::{
-    EXPLORE_SYSTEM_PROMPT, GENERAL_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT, VERIFICATION_SYSTEM_PROMPT,
-    VIPER_SYSTEM_PROMPT,
+    CODER_SYSTEM_PROMPT, EXPLORE_SYSTEM_PROMPT, GENERAL_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT,
+    REVIEWER_SYSTEM_PROMPT, TESTER_SYSTEM_PROMPT, VERIFICATION_SYSTEM_PROMPT, VIPER_SYSTEM_PROMPT,
 };
 
 /// Agent 定义来源
@@ -208,6 +208,87 @@ impl AgentTypeDefinition {
             source: AgentSource::BuiltIn,
             filename: None,
             base_dir: None,
+        }
+    }
+
+    /// Create a coding implementation agent type definition.
+    pub fn coder() -> Self {
+        Self {
+            agent_type: "coder".to_string(),
+            when_to_use: "Implementation specialist for a clearly bounded coding subtask and explicit file list. Writes code, runs focused verification, and returns a structured change summary.".to_string(),
+            disallowed_tools: ["agent", "spawn", "exec"]
+                .iter()
+                .map(|tool| tool.to_string())
+                .collect(),
+            max_turns: Some(50),
+            system_prompt_template: Some(CODER_SYSTEM_PROMPT.to_string()),
+            one_shot: true,
+            permission_mode: PermissionMode::Bubble,
+            isolation: None,
+            tools: Some(
+                [
+                    "list_dir",
+                    "read_file",
+                    "grep",
+                    "glob",
+                    "edit_file",
+                    "write_file",
+                    "shell",
+                ]
+                .iter()
+                .map(|tool| tool.to_string())
+                .collect(),
+            ),
+            background: true,
+            color: Some("green".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Create a read-only code review agent type definition.
+    pub fn reviewer() -> Self {
+        Self {
+            agent_type: "reviewer".to_string(),
+            when_to_use: "Read-only code reviewer for checking a completed diff. Returns severity-ordered findings with file and line references.".to_string(),
+            disallowed_tools: ["agent", "spawn", "write_file", "edit_file", "exec"]
+                .iter()
+                .map(|tool| tool.to_string())
+                .collect(),
+            max_turns: Some(25),
+            system_prompt_template: Some(REVIEWER_SYSTEM_PROMPT.to_string()),
+            one_shot: true,
+            permission_mode: PermissionMode::Inherit,
+            isolation: None,
+            tools: Some(
+                ["list_dir", "read_file", "grep", "glob", "shell"]
+                    .iter()
+                    .map(|tool| tool.to_string())
+                    .collect(),
+            ),
+            background: true,
+            color: Some("yellow".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Create a test execution agent type definition.
+    pub fn tester() -> Self {
+        Self {
+            agent_type: "tester".to_string(),
+            when_to_use: "Test execution specialist that runs requested tests, lint, and builds without modifying code. Returns structured pass/fail diagnostics.".to_string(),
+            disallowed_tools: ["agent", "spawn", "write_file", "edit_file", "exec"]
+                .iter()
+                .map(|tool| tool.to_string())
+                .collect(),
+            max_turns: Some(20),
+            system_prompt_template: Some(TESTER_SYSTEM_PROMPT.to_string()),
+            one_shot: true,
+            permission_mode: PermissionMode::Inherit,
+            isolation: None,
+            tools: Some(vec!["read_file".to_string(), "shell".to_string()]),
+            background: true,
+            color: Some("blue".to_string()),
+            ..Default::default()
         }
     }
 
@@ -437,6 +518,9 @@ impl blockcell_tools::AgentTypeRegistryOps for AgentTypeRegistry {
 /// Built-in agent types provide specialized behaviors for common tasks:
 /// - `explore`: Fast read-only codebase exploration
 /// - `plan`: Architecture and implementation planning
+/// - `coder`: Bounded code implementation and focused verification
+/// - `reviewer`: Read-only review with severity-ordered findings
+/// - `tester`: Test, lint, and build execution
 /// - `verification`: Testing and validation specialist
 /// - `viper`: Implementation agent for writing production code
 /// - `general`: General-purpose agent for complex multi-step tasks
@@ -444,6 +528,9 @@ pub fn built_in_agent_types() -> Vec<AgentTypeDefinition> {
     vec![
         AgentTypeDefinition::explore(),
         AgentTypeDefinition::plan(),
+        AgentTypeDefinition::coder(),
+        AgentTypeDefinition::reviewer(),
+        AgentTypeDefinition::tester(),
         AgentTypeDefinition::verification(),
         AgentTypeDefinition::viper(),
         AgentTypeDefinition::general(),
@@ -510,7 +597,37 @@ mod tests {
     #[test]
     fn test_built_in_agent_types_count() {
         let types = built_in_agent_types();
-        assert_eq!(types.len(), 5);
+        assert_eq!(types.len(), 8);
+    }
+
+    #[test]
+    fn coding_agent_types_have_role_specific_tool_whitelists() {
+        let coder = AgentTypeDefinition::coder();
+        let reviewer = AgentTypeDefinition::reviewer();
+        let tester = AgentTypeDefinition::tester();
+
+        assert_eq!(coder.agent_type, "coder");
+        assert!(coder
+            .tools
+            .as_ref()
+            .unwrap()
+            .contains(&"edit_file".to_string()));
+        assert!(coder.tools.as_ref().unwrap().contains(&"shell".to_string()));
+
+        assert_eq!(reviewer.agent_type, "reviewer");
+        assert!(!reviewer
+            .tools
+            .as_ref()
+            .unwrap()
+            .contains(&"edit_file".to_string()));
+        assert!(reviewer
+            .tools
+            .as_ref()
+            .unwrap()
+            .contains(&"shell".to_string()));
+
+        assert_eq!(tester.agent_type, "tester");
+        assert_eq!(tester.tools.as_ref().unwrap(), &vec!["read_file", "shell"]);
     }
 
     #[test]
@@ -524,7 +641,10 @@ mod tests {
     #[test]
     fn test_agent_type_registry_new() {
         let registry = AgentTypeRegistry::new();
-        assert_eq!(registry.type_names().len(), 5);
+        assert_eq!(registry.type_names().len(), 8);
+        assert!(registry.get("coder").is_some());
+        assert!(registry.get("reviewer").is_some());
+        assert!(registry.get("tester").is_some());
         assert!(registry.get("explore").is_some());
         assert!(registry.get("plan").is_some());
         assert!(registry.get("verification").is_some());
@@ -545,7 +665,16 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["explore", "general", "plan", "verification", "viper"]
+            vec![
+                "coder",
+                "explore",
+                "general",
+                "plan",
+                "reviewer",
+                "tester",
+                "verification",
+                "viper"
+            ]
         );
         assert_eq!(iter_names, names);
         assert_eq!(trait_names, names);

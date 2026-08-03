@@ -41,6 +41,7 @@ impl Tool for AgentTool {
             name: "agent".to_string(),
             description: "Launch a new agent to handle complex, multi-step tasks autonomously. \
 Available built-in types: explore (codebase exploration), plan (implementation planning), \
+coder (bounded code implementation), reviewer (read-only code review), tester (test execution), \
 verification (testing/validation), viper (production code), general (complex tasks). \
 Custom types may also be available from ~/.blockcell/workspace/agents/ or .blockcell/agents/. \
 Omit subagent_type for fork mode (inherits parent context, shares prompt cache, synchronous). \
@@ -233,6 +234,9 @@ mod tests {
         let desc = schema.description;
         assert!(desc.contains("explore"));
         assert!(desc.contains("plan"));
+        assert!(desc.contains("coder"));
+        assert!(desc.contains("reviewer"));
+        assert!(desc.contains("tester"));
         assert!(desc.contains("verification"));
         assert!(desc.contains("viper"));
         assert!(desc.contains("general"));
@@ -280,7 +284,16 @@ mod tests {
     fn test_agent_validate_subagent_type() {
         let tool = AgentTool;
         // 有效内置类型
-        for agent_type in ["explore", "plan", "verification", "viper", "general"] {
+        for agent_type in [
+            "explore",
+            "plan",
+            "coder",
+            "reviewer",
+            "tester",
+            "verification",
+            "viper",
+            "general",
+        ] {
             assert!(tool
                 .validate(&json!({"prompt": "test", "subagent_type": agent_type}))
                 .is_ok());
