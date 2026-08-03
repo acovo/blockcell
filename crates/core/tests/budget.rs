@@ -127,3 +127,17 @@ fn reset_clears_accumulated_usage() {
     assert_eq!(snapshot.tokens_remaining, 100);
     assert_eq!(snapshot.cost_remaining_micro_usd, 1_000_000);
 }
+
+#[test]
+fn current_context_window_is_separate_from_cumulative_usage() {
+    let tracker = BudgetTracker::new(&BudgetConfig::default());
+    tracker.record_usage(1_000, 200, 0);
+    tracker.record_context_window(750, 1_000, 800);
+
+    let context = tracker.context_window_snapshot();
+    assert_eq!(context.tokens_used, 750);
+    assert_eq!(context.token_limit, 1_000);
+    assert_eq!(context.tokens_remaining, 250);
+    assert_eq!(context.compact_threshold_tokens, 800);
+    assert_eq!(tracker.snapshot().total_tokens_used, 1_200);
+}

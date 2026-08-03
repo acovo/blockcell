@@ -26,6 +26,7 @@ pub use agent_identity::{AgentIdentity, AgentRole};
 pub use agent_result::{AgentResult, ContentBlock, FileAction, ResultStatus, UsageMetrics};
 pub use budget::{
     BudgetConfig, BudgetExhaustedError, BudgetSnapshot, BudgetTracker, BudgetTrackerHandle,
+    ContextWindowSnapshot,
 };
 
 pub use capability::{

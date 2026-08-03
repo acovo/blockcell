@@ -2154,6 +2154,7 @@ fn test_coding_mode_uses_shell_and_code_tools_without_legacy_exec() {
         "exec",
         "update_plan",
         "file_ops",
+        "get_context_remaining",
     ]
     .into_iter()
     .map(str::to_string)
@@ -2173,6 +2174,7 @@ fn test_coding_mode_uses_shell_and_code_tools_without_legacy_exec() {
         "edit_file",
         "grep",
         "glob",
+        "get_context_remaining",
         "shell",
         "update_plan",
     ] {
@@ -4850,6 +4852,24 @@ async fn token_budget_is_tracked_per_session_key() {
 
     assert_eq!(first, "within budget");
     assert_eq!(second, "within budget");
+}
+
+#[test]
+fn current_context_estimate_is_tracked_per_session_for_tool_introspection() {
+    let runtime = test_runtime();
+    runtime.record_context_window_estimate("cli:context-a", 750, 1_000, 0.8);
+    runtime.record_context_window_estimate("cli:context-b", 100, 1_000, 0.8);
+
+    let first = runtime
+        .budget_tracker_for_session("cli:context-a")
+        .context_window_snapshot();
+    let second = runtime
+        .budget_tracker_for_session("cli:context-b")
+        .context_window_snapshot();
+
+    assert_eq!(first.tokens_remaining, 250);
+    assert_eq!(first.compact_threshold_tokens, 800);
+    assert_eq!(second.tokens_remaining, 900);
 }
 
 fn tool_policy_rule(

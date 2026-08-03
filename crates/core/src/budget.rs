@@ -21,6 +21,17 @@ pub struct BudgetSnapshot {
     pub usage_ratio: f64,
 }
 
+/// Snapshot of the currently assembled model context, independent from
+/// cumulative billed token usage across the session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextWindowSnapshot {
+    pub tokens_used: u64,
+    pub token_limit: u64,
+    pub tokens_remaining: u64,
+    pub compact_threshold_tokens: u64,
+}
+
 /// Error returned when a token or cost budget has been exhausted.
 #[derive(Debug, Clone)]
 pub struct BudgetExhaustedError {
@@ -73,6 +84,9 @@ pub struct BudgetTracker {
     input_tokens: AtomicU64,
     output_tokens: AtomicU64,
     cost_micro_usd: AtomicU64,
+    context_tokens: AtomicU64,
+    context_token_limit: AtomicU64,
+    compact_threshold_tokens: AtomicU64,
     warning_threshold: f64,
 }
 
@@ -93,6 +107,9 @@ impl BudgetTracker {
             input_tokens: AtomicU64::new(0),
             output_tokens: AtomicU64::new(0),
             cost_micro_usd: AtomicU64::new(0),
+            context_tokens: AtomicU64::new(0),
+            context_token_limit: AtomicU64::new(0),
+            compact_threshold_tokens: AtomicU64::new(0),
             warning_threshold,
         }
     }
@@ -145,6 +162,33 @@ impl BudgetTracker {
         }
     }
 
+    /// Record the latest assembled context estimate for model self-inspection.
+    pub fn record_context_window(
+        &self,
+        tokens_used: u64,
+        token_limit: u64,
+        compact_threshold_tokens: u64,
+    ) -> ContextWindowSnapshot {
+        self.context_tokens.store(tokens_used, Ordering::Relaxed);
+        self.context_token_limit
+            .store(token_limit, Ordering::Relaxed);
+        self.compact_threshold_tokens
+            .store(compact_threshold_tokens, Ordering::Relaxed);
+        self.context_window_snapshot()
+    }
+
+    /// Return the latest current-context estimate without changing cumulative usage.
+    pub fn context_window_snapshot(&self) -> ContextWindowSnapshot {
+        let tokens_used = self.context_tokens.load(Ordering::Relaxed);
+        let token_limit = self.context_token_limit.load(Ordering::Relaxed);
+        ContextWindowSnapshot {
+            tokens_used,
+            token_limit,
+            tokens_remaining: token_limit.saturating_sub(tokens_used),
+            compact_threshold_tokens: self.compact_threshold_tokens.load(Ordering::Relaxed),
+        }
+    }
+
     /// Return true if any active budget limit has been reached.
     pub fn is_exhausted(&self) -> bool {
         let snapshot = self.snapshot();
@@ -192,6 +236,9 @@ impl BudgetTracker {
         self.input_tokens.store(0, Ordering::Relaxed);
         self.output_tokens.store(0, Ordering::Relaxed);
         self.cost_micro_usd.store(0, Ordering::Relaxed);
+        self.context_tokens.store(0, Ordering::Relaxed);
+        self.context_token_limit.store(0, Ordering::Relaxed);
+        self.compact_threshold_tokens.store(0, Ordering::Relaxed);
     }
 }
 

@@ -571,6 +571,12 @@ impl AgentRuntime {
             let estimated_tokens = estimate_messages_tokens(&current_messages);
             // Update Layer 4 token usage metrics
             let trigger_compact = if let Some(memory_system) = self.memory_system.as_ref() {
+                self.record_context_window_estimate(
+                    &persist_session_key,
+                    estimated_tokens,
+                    memory_system.config().token_budget,
+                    memory_system.config().layer4.compact_threshold_ratio,
+                );
                 crate::memory_event!(
                     layer4,
                     token_usage,
@@ -1264,6 +1270,12 @@ impl AgentRuntime {
                 let estimated_tokens = estimate_messages_tokens(&current_messages);
                 // Update Layer 4 token usage metrics
                 let trigger_compact = if let Some(memory_system) = self.memory_system.as_ref() {
+                    self.record_context_window_estimate(
+                        &persist_session_key,
+                        estimated_tokens,
+                        memory_system.config().token_budget,
+                        memory_system.config().layer4.compact_threshold_ratio,
+                    );
                     crate::memory_event!(
                         layer4,
                         token_usage,

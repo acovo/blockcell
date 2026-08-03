@@ -33,6 +33,23 @@ impl AgentRuntime {
             .clone()
     }
 
+    pub(crate) fn record_context_window_estimate(
+        &self,
+        session_key: &str,
+        tokens_used: usize,
+        token_limit: usize,
+        compact_threshold_ratio: f64,
+    ) {
+        let compact_threshold_tokens =
+            (token_limit as f64 * compact_threshold_ratio.clamp(0.0, 1.0)) as u64;
+        self.budget_tracker_for_session(session_key)
+            .record_context_window(
+                tokens_used as u64,
+                token_limit as u64,
+                compact_threshold_tokens,
+            );
+    }
+
     pub(crate) fn record_llm_budget(
         &self,
         session_key: &str,

@@ -9,6 +9,7 @@ pub mod camera;
 pub mod chart_generate;
 pub mod code_search;
 pub mod community_hub;
+pub mod context_remaining;
 pub mod cron;
 pub mod data_process;
 pub mod email;
@@ -129,6 +130,9 @@ pub trait RuntimeHandle: Send + Sync {
         description: Option<String>,
         workspace_scope: Vec<String>,
     ) -> Result<String>;
+
+    /// Return the latest assembled context-window estimate for a persisted session.
+    fn context_window_snapshot(&self, session_key: &str) -> blockcell_core::ContextWindowSnapshot;
 }
 
 /// Opaque handle to the runtime for typed agent execution.

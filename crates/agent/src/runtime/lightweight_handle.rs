@@ -28,6 +28,7 @@ pub struct LightweightRuntimeHandle {
     memory_file_store: Option<blockcell_tools::MemoryFileStoreHandle>,
     skill_file_store: Option<blockcell_tools::SkillFileStoreHandle>,
     system_prompt_snapshots: crate::context::SystemPromptSnapshotReader,
+    budget_trackers: Arc<Mutex<HashMap<String, BudgetTrackerHandle>>>,
 }
 
 impl LightweightRuntimeHandle {
@@ -49,6 +50,7 @@ impl LightweightRuntimeHandle {
             memory_file_store: runtime.memory_file_store.clone(),
             skill_file_store: runtime.skill_file_store.clone(),
             system_prompt_snapshots: runtime.context_builder.system_prompt_snapshot_reader(),
+            budget_trackers: runtime.budget_trackers.clone(),
         }
     }
 
@@ -186,6 +188,17 @@ impl LightweightRuntimeHandle {
 
 #[async_trait::async_trait]
 impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
+    fn context_window_snapshot(&self, session_key: &str) -> blockcell_core::ContextWindowSnapshot {
+        let mut trackers = self
+            .budget_trackers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        trackers
+            .entry(session_key.to_string())
+            .or_insert_with(|| Arc::new(BudgetTracker::new(&self._config.budget)))
+            .context_window_snapshot()
+    }
+
     async fn execute_fork_mode(&self, prompt: String) -> Result<String> {
         use crate::forked::{
             run_forked_agent, CacheSafeParams, ForkedAgentParams, SubagentOverrides,

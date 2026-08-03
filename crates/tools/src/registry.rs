@@ -14,6 +14,7 @@ use crate::camera::CameraCaptureTool;
 use crate::chart_generate::ChartGenerateTool;
 use crate::code_search::{GlobTool, GrepTool};
 use crate::community_hub::CommunityHubTool;
+use crate::context_remaining::GetContextRemainingTool;
 use crate::cron::CronTool;
 use crate::data_process::DataProcessTool;
 use crate::email::EmailTool;
@@ -104,6 +105,7 @@ impl ToolRegistry {
         registry.register(Arc::new(GrepTool));
         registry.register(Arc::new(GlobTool));
         registry.register(Arc::new(UpdatePlanTool));
+        registry.register(Arc::new(GetContextRemainingTool));
 
         // Exec tool
         registry.register(Arc::new(ExecTool));

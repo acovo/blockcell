@@ -1379,6 +1379,7 @@ const CODING_DEFAULT_TOOL_NAMES: &[&str] = &[
     "shell",
     "update_plan",
     "file_ops",
+    "get_context_remaining",
 ];
 
 fn apply_coding_tool_defaults(
@@ -2547,6 +2548,11 @@ impl blockcell_tools::RuntimeHandle for AgentRuntime {
     ) -> Result<String> {
         self.spawn_typed_agent(agent_type, prompt, description, workspace_scope)
             .await
+    }
+
+    fn context_window_snapshot(&self, session_key: &str) -> blockcell_core::ContextWindowSnapshot {
+        self.budget_tracker_for_session(session_key)
+            .context_window_snapshot()
     }
 }
 
