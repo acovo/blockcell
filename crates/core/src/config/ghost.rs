@@ -10,7 +10,13 @@ pub struct GhostLearningConfig {
     /// 旧版总开关。未配置 captureEnabled 时作为捕获开关的兼容来源。
     #[serde(default = "default_ghost_learning_enabled")]
     pub enabled: bool,
-    /// 旧版影子模式。新三开关未显式配置时等价于：捕获开启、写入影子目录、召回关闭。
+    /// **Deprecated compatibility alias.** 新三开关未显式配置时等价于：
+    /// 捕获开启、写入影子目录、召回关闭。请改用 `captureEnabled`、
+    /// `writeEnabled` 和 `recallEnabled`。
+    #[deprecated(
+        since = "0.1.8",
+        note = "use captureEnabled, writeEnabled, and recallEnabled"
+    )]
     #[serde(default = "default_ghost_learning_shadow_mode")]
     pub shadow_mode: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +59,7 @@ fn default_ghost_recall_token_budget() -> u32 {
     1200
 }
 
+#[allow(deprecated)]
 impl Default for GhostLearningConfig {
     fn default() -> Self {
         Self {
@@ -74,15 +81,21 @@ impl GhostLearningConfig {
         self.capture_enabled.unwrap_or(self.enabled)
     }
 
+    #[doc(hidden)]
+    #[allow(deprecated)]
+    pub fn legacy_shadow_mode(&self) -> bool {
+        self.shadow_mode
+    }
+
     /// true 表示写入正式知识文件；false 表示仅写入 shadow 命名空间。
     pub fn write_enabled(&self) -> bool {
         self.write_enabled
-            .unwrap_or(self.enabled && !self.shadow_mode)
+            .unwrap_or(self.enabled && !self.legacy_shadow_mode())
     }
 
     pub fn recall_enabled(&self) -> bool {
         self.recall_enabled
-            .unwrap_or(self.enabled && !self.shadow_mode)
+            .unwrap_or(self.enabled && !self.legacy_shadow_mode())
     }
 }
 
@@ -168,5 +181,20 @@ mod tests {
         assert!(!config.capture_enabled());
         assert!(config.write_enabled());
         assert!(config.recall_enabled());
+    }
+
+    #[test]
+    fn legacy_shadow_mode_compatibility_remains_serializable() {
+        let config: GhostLearningConfig = json5::from_str(
+            r#"{
+                enabled: true,
+                shadowMode: true
+            }"#,
+        )
+        .expect("parse legacy shadow mode");
+
+        assert!(config.legacy_shadow_mode());
+        let serialized = serde_json::to_value(&config).expect("serialize ghost learning config");
+        assert_eq!(serialized["shadowMode"], serde_json::json!(true));
     }
 }

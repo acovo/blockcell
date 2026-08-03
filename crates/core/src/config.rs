@@ -1038,7 +1038,7 @@ mod tests {
     fn test_embedded_ghost_learning_defaults_are_safe() {
         let cfg = GhostConfig::default();
         assert!(cfg.learning.enabled);
-        assert!(cfg.learning.shadow_mode);
+        assert!(cfg.learning.legacy_shadow_mode());
         assert_eq!(cfg.learning.recall_max_items, 4);
     }
 

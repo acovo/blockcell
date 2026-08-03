@@ -573,8 +573,11 @@ Ghost learning 受 `config.agents.ghost.learning` 控制。
 
 关键语义：
 
-- `enabled`：是否启用嵌入式学习。
-- `shadow_mode`：是否只观察不注入 recall。
+- `enabled`：旧版总开关；未配置 `captureEnabled` 时仍作为兼容来源。
+- `captureEnabled`：是否捕获学习事件。
+- `writeEnabled`：是否写入正式知识文件；关闭时写入 shadow 命名空间。
+- `recallEnabled`：是否在运行时注入 recall。
+- `shadowMode`：已弃用，仅用于旧配置兼容；请改用上述三个显式开关。
 - `recall_max_items`：recall 最大条数。
 - `recall_token_budget`：recall token 预算。
 - review interval / policy 参数：控制周期性复盘。
@@ -653,8 +656,8 @@ git diff --check
 
 排查顺序：
 
-1. 检查 `config.agents.ghost.learning.enabled`。
-2. 检查是否处于 `shadow_mode`。
+1. 检查 `config.agents.ghost.learning.captureEnabled`（旧配置回退到 `enabled`）。
+2. 检查 `writeEnabled` 和 `recallEnabled`；旧配置中的 `shadowMode` 已弃用，仅保留兼容语义。
 3. 检查 `USER.md` 和 `memory/MEMORY.md` 是否有写入。
 4. 检查 `GhostLedger` 是否有 episode。
 5. 检查 review run 是否失败。

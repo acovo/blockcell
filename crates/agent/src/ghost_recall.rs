@@ -362,7 +362,9 @@ mod tests {
         .expect("write memory md");
         let mut config = Config::default();
         config.agents.ghost.learning.enabled = true;
-        config.agents.ghost.learning.shadow_mode = false;
+        config.agents.ghost.learning.capture_enabled = Some(true);
+        config.agents.ghost.learning.write_enabled = Some(true);
+        config.agents.ghost.learning.recall_enabled = Some(true);
         config.agents.ghost.learning.recall_max_items = 2;
         config.agents.ghost.learning.recall_token_budget = 160;
 
@@ -386,7 +388,9 @@ mod tests {
             .expect("write memory md");
         let mut config = Config::default();
         config.agents.ghost.learning.enabled = true;
-        config.agents.ghost.learning.shadow_mode = false;
+        config.agents.ghost.learning.capture_enabled = Some(true);
+        config.agents.ghost.learning.write_enabled = Some(true);
+        config.agents.ghost.learning.recall_enabled = Some(true);
         config.agents.ghost.learning.recall_max_items = 2;
         config.agents.ghost.learning.recall_token_budget = 160;
 

@@ -382,14 +382,14 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let config = GhostLearningConfig {
                     enabled: true,
-                    shadow_mode: false,
-                    capture_enabled: None,
-                    write_enabled: None,
-                    recall_enabled: None,
+                    capture_enabled: Some(true),
+                    write_enabled: Some(true),
+                    recall_enabled: Some(true),
                     turn_review_interval: i,
                     method_tool_threshold: i,
                     recall_max_items: 10,
                     recall_token_budget: 1000,
+                    ..GhostLearningConfig::default()
                 };
                 let new_policy = GhostLearningPolicy::from_config(&config);
                 *p.lock().unwrap() = new_policy;

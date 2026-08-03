@@ -2651,7 +2651,9 @@ fn test_runtime_with_embedded_ghost_learning() -> AgentRuntime {
     config.agents.defaults.model = "test/mock".to_string();
     config.agents.defaults.provider = Some("test".to_string());
     config.agents.ghost.learning.enabled = true;
-    config.agents.ghost.learning.shadow_mode = true;
+    config.agents.ghost.learning.capture_enabled = Some(true);
+    config.agents.ghost.learning.write_enabled = Some(false);
+    config.agents.ghost.learning.recall_enabled = Some(false);
 
     let base = std::env::temp_dir().join(format!(
         "blockcell-ghost-learning-runtime-{}",
@@ -2667,7 +2669,9 @@ fn test_runtime_with_boundary_flush_provider(provider: Arc<BoundaryFlushProvider
     config.agents.defaults.model = "test/mock".to_string();
     config.agents.defaults.provider = Some("test".to_string());
     config.agents.ghost.learning.enabled = true;
-    config.agents.ghost.learning.shadow_mode = true;
+    config.agents.ghost.learning.capture_enabled = Some(true);
+    config.agents.ghost.learning.write_enabled = Some(false);
+    config.agents.ghost.learning.recall_enabled = Some(false);
 
     let base = std::env::temp_dir().join(format!(
         "blockcell-boundary-flush-runtime-{}",
@@ -2686,7 +2690,9 @@ fn test_runtime_with_ghost_review_provider(
     config.agents.defaults.model = "test/mock".to_string();
     config.agents.defaults.provider = Some("test".to_string());
     config.agents.ghost.learning.enabled = true;
-    config.agents.ghost.learning.shadow_mode = shadow_mode;
+    config.agents.ghost.learning.capture_enabled = Some(true);
+    config.agents.ghost.learning.write_enabled = Some(!shadow_mode);
+    config.agents.ghost.learning.recall_enabled = Some(!shadow_mode);
 
     let base = std::env::temp_dir().join(format!(
         "blockcell-ghost-review-runtime-{}",
@@ -2706,7 +2712,9 @@ fn test_runtime_with_file_memory_recall(provider: Arc<dyn Provider>) -> (AgentRu
     config.agents.defaults.model = "test/mock".to_string();
     config.agents.defaults.provider = Some("test".to_string());
     config.agents.ghost.learning.enabled = true;
-    config.agents.ghost.learning.shadow_mode = false;
+    config.agents.ghost.learning.capture_enabled = Some(true);
+    config.agents.ghost.learning.write_enabled = Some(true);
+    config.agents.ghost.learning.recall_enabled = Some(true);
     config.agents.ghost.learning.recall_max_items = 4;
     config.agents.ghost.learning.recall_token_budget = 240;
 
