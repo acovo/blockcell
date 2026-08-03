@@ -79,6 +79,44 @@ fn collect_event_types(events: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn identical_tool_call_failures_trip_after_three_attempts() {
+    let call = ToolCallRequest {
+        id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path": "missing.rs"}),
+        thought_signature: None,
+    };
+    let mut tracker = ConsecutiveToolFailureTracker::default();
+
+    assert!(!tracker.record(&call, true));
+    assert!(!tracker.record(&call, true));
+    assert!(tracker.record(&call, true));
+}
+
+#[test]
+fn changed_arguments_or_success_reset_consecutive_tool_failures() {
+    let first = ToolCallRequest {
+        id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path": "first.rs"}),
+        thought_signature: None,
+    };
+    let changed = ToolCallRequest {
+        id: "call-2".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path": "second.rs"}),
+        thought_signature: None,
+    };
+    let mut tracker = ConsecutiveToolFailureTracker::default();
+
+    assert!(!tracker.record(&first, true));
+    assert!(!tracker.record(&first, true));
+    assert!(!tracker.record(&changed, true));
+    assert!(!tracker.record(&changed, false));
+    assert!(!tracker.record(&changed, true));
+}
+
 fn contains_event_subsequence(events: &[String], expected: &[&str]) -> bool {
     let mut cursor = 0usize;
     for event in events {

@@ -88,6 +88,33 @@ pub(crate) use subagent::*;
 
 const TOOL_ROUND_THROTTLE_MS: u64 = 600;
 const TOOL_ROUND_THROTTLE_AFTER_RATE_LIMIT_MS: u64 = 2_500;
+const MAX_IDENTICAL_TOOL_FAILURES: u32 = 3;
+
+#[derive(Default)]
+struct ConsecutiveToolFailureTracker {
+    last_signature: Option<String>,
+    consecutive_failures: u32,
+}
+
+impl ConsecutiveToolFailureTracker {
+    fn record(&mut self, call: &ToolCallRequest, failed: bool) -> bool {
+        if !failed {
+            self.last_signature = None;
+            self.consecutive_failures = 0;
+            return false;
+        }
+
+        let signature = format!("{}\0{}", call.name, call.arguments);
+        if self.last_signature.as_deref() == Some(signature.as_str()) {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        } else {
+            self.last_signature = Some(signature);
+            self.consecutive_failures = 1;
+        }
+
+        self.consecutive_failures >= MAX_IDENTICAL_TOOL_FAILURES
+    }
+}
 const ACTIVATE_SKILL_TOOL_NAME: &str = "activate_skill";
 
 /// Review 模式枚举

@@ -85,7 +85,7 @@ fn default_temperature() -> f32 {
 }
 
 fn default_max_tool_iterations() -> u32 {
-    30
+    200
 }
 
 fn default_llm_max_retries() -> u32 {
@@ -215,4 +215,14 @@ pub struct ResolvedAgentConfig {
     pub name: Option<String>,
     pub defaults: AgentDefaults,
     pub intent_profile: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_tool_iteration_budget_supports_long_coding_tasks() {
+        assert_eq!(AgentDefaults::default().max_tool_iterations, 200);
+    }
 }

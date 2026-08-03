@@ -632,6 +632,7 @@ impl AgentRuntime {
         let mut llm_failed_after_retries = false;
         let mut message_tool_sent_media = false;
         let mut tool_fail_counts: HashMap<String, u32> = HashMap::new();
+        let mut consecutive_failure_tracker = ConsecutiveToolFailureTracker::default();
         let mut resource_missing_hints_sent: HashSet<String> = HashSet::new();
         let mut should_throttle_next_tool_round = false;
         let mut saw_rate_limit_this_turn = false;
@@ -1052,6 +1053,14 @@ impl AgentRuntime {
 
                     // Track tool failures with transient/permanent classification (#6)
                     let is_error = tool_result_indicates_error(&result);
+                    if consecutive_failure_tracker.record(tool_call, is_error) {
+                        over_iteration = true;
+                        warn!(
+                            tool = %tool_call.name,
+                            arguments = %tool_call.arguments,
+                            "Stopping agent loop after three identical tool-call failures"
+                        );
+                    }
                     if is_error {
                         let failure_kind = classify_tool_failure(&result);
                         match failure_kind {

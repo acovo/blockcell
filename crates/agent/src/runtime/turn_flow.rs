@@ -110,7 +110,7 @@ impl AgentRuntime {
         active_skill_dir: Option<PathBuf>,
     ) -> Result<PromptSkillLoopOutput> {
         let allowed_tool_names = tool_names.iter().cloned().collect::<HashSet<_>>();
-        let max_iterations = self.config.agents.defaults.max_tool_iterations.clamp(1, 30);
+        let max_iterations = self.config.agents.defaults.max_tool_iterations.max(1);
         let tools_max_iterations = self
             .config
             .agents
@@ -118,6 +118,7 @@ impl AgentRuntime {
             .max_tool_iterations_by_tool
             .clone();
         let mut tool_call_counts: HashMap<String, u32> = HashMap::new();
+        let mut consecutive_failure_tracker = ConsecutiveToolFailureTracker::default();
         let mut over_iteration: bool = false;
         let mut current_messages = messages;
         let mut trace_messages = Vec::new();
@@ -180,6 +181,15 @@ impl AgentRuntime {
                         })
                         .to_string()
                     };
+                if consecutive_failure_tracker
+                    .record(&tool_call, tool_result_indicates_error(&tool_result))
+                {
+                    over_iteration = true;
+                    warn!(
+                        tool = %tool_call.name,
+                        "Stopping prompt skill loop after three identical tool-call failures"
+                    );
+                }
                 let mut tool_message = ChatMessage::tool_result(&tool_call.id, &tool_result);
                 tool_message.name = Some(tool_call.name.clone());
                 current_messages.push(tool_message.clone());
