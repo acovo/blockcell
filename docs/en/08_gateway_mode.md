@@ -34,7 +34,7 @@ After it starts, you’ll see logs like:
 
 ```
 [2025-02-18 08:00:00] Gateway starting...
-[2025-02-18 08:00:00] API server: http://0.0.0.0:18790
+[2025-02-18 08:00:00] API server: http://localhost:18790
 [2025-02-18 08:00:00] WebUI: http://localhost:18791
 [2025-02-18 08:00:00] Telegram: connected (polling)
 [2025-02-18 08:00:00] Discord: connected (WebSocket)
@@ -106,19 +106,22 @@ curl -X POST http://localhost:18790/v1/chat \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -d '{
-    "message": "Check Moutai’s stock price today"
+    "content": "Check Moutai’s stock price today",
+    "chat_id": "finance-demo"
   }'
 ```
 
-Response:
+Gateway queues the message asynchronously, so a successful request returns `202 Accepted`:
 
 ```json
 {
-  "reply": "Moutai (600519) today: 1,680.00 CNY, change: +1.23%",
-  "task_id": "msg_abc123",
-  "tools_used": ["finance_api"]
+  "status": "accepted",
+  "message": "Message queued for processing",
+  "session_id": "finance-demo"
 }
 ```
+
+The final reply is delivered asynchronously through WebSocket or the originating message channel; it is not returned in this HTTP response.
 
 ### `GET /v1/health` — health check
 
@@ -129,8 +132,9 @@ curl http://localhost:18790/v1/health
 ```json
 {
   "status": "ok",
-  "uptime": 3600,
-  "version": "0.x.x"
+  "model": "deepseek-v4-pro",
+  "uptime_secs": 3600,
+  "version": "0.1.7"
 }
 ```
 
@@ -145,19 +149,11 @@ curl http://localhost:18790/v1/tasks \
 
 ```json
 {
-  "summary": {
-    "running": 1,
-    "completed": 42,
-    "failed": 0
-  },
-  "tasks": [
-    {
-      "id": "task_xyz",
-      "label": "Analyze Moutai earnings",
-      "status": "running",
-      "started_at": "2025-02-18T08:30:00Z"
-    }
-  ]
+  "queued": 0,
+  "running": 1,
+  "completed": 42,
+  "failed": 0,
+  "tasks": []
 }
 ```
 
@@ -166,19 +162,28 @@ curl http://localhost:18790/v1/tasks \
 The WebSocket endpoint supports real-time, bidirectional communication:
 
 ```javascript
-const ws = new WebSocket('ws://localhost:18790/v1/ws');
+const token = 'YOUR_TOKEN';
+const tokenHex = Array.from(new TextEncoder().encode(token), byte =>
+  byte.toString(16).padStart(2, '0')
+).join('');
+const ws = new WebSocket(
+  'ws://localhost:18790/v1/ws',
+  [`blockcell-auth.${tokenHex}`],
+);
 
 // send a message
 ws.send(JSON.stringify({
-  "message": "Check Bitcoin price"
+  type: 'chat',
+  content: 'Check Bitcoin price',
+  chat_id: 'finance-demo',
 }));
 
 // receive streaming replies
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
-  if (data.type === 'chunk') {
-    process.stdout.write(data.content);
-  } else if (data.type === 'done') {
+  if (data.type === 'token') {
+    process.stdout.write(data.delta);
+  } else if (data.type === 'message_done') {
     console.log('\nDone');
   } else if (data.type === 'skills_updated') {
     console.log('Skills updated:', data.new_skills);
@@ -244,14 +249,16 @@ In the current implementation, if `gateway.apiToken` is empty, Gateway **auto-ge
 Include the token in the `Authorization` header:
 
 ```bash
-curl -H "Authorization: Bearer YOUR_TOKEN" http://YOUR_HOST:18790/v1/chat
+curl -H "Authorization: Bearer YOUR_TOKEN" http://YOUR_HOST:18790/v1/tasks
 ```
 
-Or use a query parameter (useful for WebSocket):
+Browser WebSockets cannot set an arbitrary Authorization header. Encode the token as UTF-8 hexadecimal and carry it in the negotiated WebSocket subprotocol:
 
 ```
-ws://YOUR_HOST:18790/v1/ws?token=YOUR_TOKEN
+blockcell-auth.<UTF-8 hexadecimal token>
 ```
+
+See the complete JavaScript connection example in the WebSocket section above. Non-browser clients may instead send the standard `Authorization: Bearer ...` header in the upgrade request. Do not put the token in the URL query: Gateway does not read it, and URLs are commonly recorded in access logs.
 
 WebUI authentication is now separate from the API token:
 
@@ -330,16 +337,31 @@ sudo systemctl status blockcell
 ### With Docker
 
 ```dockerfile
-FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y curl
-RUN curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads/main/install.sh | sh
-COPY config.json5 /root/.blockcell/config.json5
+FROM --platform=linux/amd64 ubuntu:22.04
+RUN apt-get update && apt-get install -y curl ca-certificates tar \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads/main/install.sh \
+    | BLOCKCELL_INSTALL_METHOD=release BLOCKCELL_INSTALL_DIR=/usr/local/bin sh
 EXPOSE 18790 18791
 CMD ["blockcell", "gateway"]
 ```
 
+The container's `~/.blockcell/config.json5` must bind both services to all container interfaces; otherwise Docker port publishing cannot reach them:
+
+```json5
+{
+  gateway: {
+    host: "0.0.0.0",
+    port: 18790,
+    webuiHost: "0.0.0.0",
+    webuiPort: 18791,
+  },
+}
+```
+
 ```bash
 docker build -t blockcell .
+# The host ~/.blockcell/config.json5 must contain the container binding settings above
 docker run -d \
   -p 18790:18790 \
   -p 18791:18791 \
@@ -382,16 +404,18 @@ Gateway mode turns blockcell into a standard HTTP service, making integration st
 ```python
 import requests
 
-def ask_ai(question: str) -> str:
+def enqueue_ai(question: str, session_id: str) -> dict:
     response = requests.post(
         "http://localhost:18790/v1/chat",
         headers={"Authorization": "Bearer YOUR_TOKEN"},
-        json={"message": question}
+        json={"content": question, "chat_id": session_id}
     )
-    return response.json()["reply"]
+    response.raise_for_status()
+    return response.json()
 
-answer = ask_ai("Check Moutai’s stock price today")
-print(answer)
+# This returns queue status; receive the final reply over WebSocket or a message channel
+accepted = enqueue_ai("Check Moutai’s stock price today", "finance-demo")
+print(accepted["session_id"])
 ```
 
 ### Call from Node.js
@@ -399,19 +423,21 @@ print(answer)
 ```javascript
 const fetch = require('node-fetch');
 
-async function askAI(question) {
+async function enqueueAI(question, sessionId) {
   const response = await fetch('http://localhost:18790/v1/chat', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': 'Bearer YOUR_TOKEN'
     },
-    body: JSON.stringify({ message: question })
+    body: JSON.stringify({ content: question, chat_id: sessionId })
   });
-  const data = await response.json();
-  return data.reply;
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
 }
 ```
+
+The HTTP endpoint only confirms that the message was queued. Use the WebSocket protocol above to receive the final reply.
 
 ---
 

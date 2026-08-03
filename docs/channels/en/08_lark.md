@@ -104,17 +104,17 @@ After starting, you'll see output like:
 
 ```
   Server
-  HTTP/WS:  http://0.0.0.0:18790
+  HTTP/WS:  http://localhost:18790
   WebUI:   http://localhost:18791/
-  API:     POST http://0.0.0.0:18790/v1/chat  |  GET /v1/health  |  GET /v1/ws
+  API:     POST http://localhost:18790/v1/chat  |  GET /v1/health  |  GET /v1/ws
 
   ✓ Gateway ready. Press Ctrl+C to stop.
 ```
 
-Where `0.0.0.0:18790` is the internal address Blockcell listens on, Lark webhook path is:
+Gateway listens on local loopback by default. The Lark webhook path is:
 
 ```
-http://0.0.0.0:18790/webhook/lark   ← Internal address (Lark cannot access directly)
+http://127.0.0.1:18790/webhook/lark ← Local address (Lark cannot access directly)
 https://your-domain.com/webhook/lark ← Needs to be exposed to public via Nginx reverse proxy
 ```
 

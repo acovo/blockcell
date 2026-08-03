@@ -397,7 +397,7 @@ Edit `agents.defaults.model` in `config.json5`, then restart `blockcell agent`.
 In the chat, blockcell shows the tool name and parameters for each tool call. For more detailed logs:
 
 ```bash
-blockcell logs --tail 50
+blockcell logs show --lines 50
 ```
 
 ---

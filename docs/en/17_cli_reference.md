@@ -34,7 +34,7 @@ Recommended for first-time users. `setup` walks you through provider setup and o
 | `--provider <NAME>` | Provider name (`deepseek` / `openai` / `kimi` / `anthropic` / `gemini` / `zhipu` / `qwen` / `xai` / `mistral` / `minimax` / `groq` / `siliconflow` / `openrouter` / `ollama`) |
 | `--api-key <KEY>` | API key for the selected provider |
 | `--model <MODEL>` | Model override |
-| `--channel <NAME>` | Optional channel to configure (`telegram` / `feishu` / `wecom` / `dingtalk` / `lark` / `none`) |
+| `--channel <NAME>` | Optional channel to configure (`telegram` / `feishu` / `wecom` / `dingtalk` / `lark` / `qq` / `napcat` / `none`; `skip` is also accepted) |
 | `--skip-provider-test` | Skip provider validation after saving |
 
 **Examples:**
@@ -450,7 +450,7 @@ blockcell channels owner clear --channel telegram --account bot2
 
 ---
 
-## `cron` — manage scheduled jobs
+## `cron` — view scheduled jobs
 
 ```bash
 blockcell cron <SUBCOMMAND>
@@ -459,72 +459,15 @@ blockcell cron <SUBCOMMAND>
 ### `cron list`
 
 ```bash
-blockcell cron list [--all]
+blockcell cron list [--all] [--agent <ID>]
 ```
 
 | Option | Description |
 |------|------|
 | `--all` | Include disabled jobs |
+| `--agent <ID>` | Query one agent; defaults to `default` |
 
-### `cron add`
-
-Create a scheduled job.
-
-```bash
-blockcell cron add --name <NAME> --message <TEXT> [schedule options] [delivery options]
-```
-
-| Option | Description |
-|------|------|
-| `--name <NAME>` | Job name |
-| `--message <TEXT>` | Message to send |
-| `--every <SECONDS>` | Run every N seconds |
-| `--cron <EXPR>` | Cron expression |
-| `--at <ISO_TIME>` | Run once at a specific time |
-| `--deliver` | Deliver the output to a channel |
-| `--to <CHAT_ID>` | Target chat ID |
-| `--channel <NAME>` | Target channel |
-
-**Examples:**
-
-```bash
-blockcell cron add --name daily_report --message "Generate the daily market report" \
-  --cron "0 9 * * 1-5" --deliver --channel telegram --to 123456789
-
-blockcell cron add --name check --message "Check system status" --every 60
-```
-
-### `cron pause` / `cron resume`
-
-```bash
-blockcell cron pause <JOB_ID>
-blockcell cron resume <JOB_ID>
-```
-
-### `cron enable`
-
-```bash
-blockcell cron enable <JOB_ID>
-blockcell cron enable <JOB_ID> --disable
-```
-
-### `cron run`
-
-Run a scheduled job immediately.
-
-```bash
-blockcell cron run <JOB_ID> [--force]
-```
-
-| Option | Description |
-|------|------|
-| `--force` | Run even if the job is disabled |
-
-### `cron remove`
-
-```bash
-blockcell cron remove <JOB_ID>
-```
+The current CLI is read-only for Cron. Create, pause, resume, run, or delete jobs through the WebUI or the conversational/tool workflow.
 
 ---
 

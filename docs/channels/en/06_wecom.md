@@ -103,7 +103,7 @@ blockcell gateway
 After starting, Gateway will listen on the local port (default `18790`). If in callback mode, WeCom's Webhook path is:
 
 ```
-http://0.0.0.0:18790/webhook/wecom   ← Internal address (WeCom cannot access directly)
+http://127.0.0.1:18790/webhook/wecom ← Local address (WeCom cannot access directly)
 https://your-domain.com/webhook/wecom ← Needs to be exposed to public via Nginx reverse proxy
 ```
 

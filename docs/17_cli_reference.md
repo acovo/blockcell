@@ -30,7 +30,7 @@ blockcell setup [OPTIONS]
 | `--provider <NAME>` | 指定 LLM provider（deepseek/openai/kimi/anthropic/gemini/zhipu/qwen/xai/mistral/minimax/groq/siliconflow/openrouter/ollama） |
 | `--api-key <KEY>` | 指定 provider 的 API key |
 | `--model <MODEL>` | 指定模型名（如 deepseek-v4-pro、kimi-k2.6、claude-opus-4-8） |
-| `--channel <NAME>` | 可选渠道配置（telegram/feishu/wecom/dingtalk/lark/none；`skip` 也兼容） |
+| `--channel <NAME>` | 可选渠道配置（telegram/feishu/wecom/dingtalk/lark/qq/napcat/none；`skip` 也兼容） |
 | `--skip-provider-test` | 跳过保存后的 provider 配置验证 |
 
 **支持的 provider:**
@@ -55,7 +55,9 @@ blockcell setup [OPTIONS]
 - `wecom` - 企业微信
 - `dingtalk` - 钉钉
 - `lark` - Lark
-- `skip` - 跳过渠道配置（仅使用 WebUI）
+- `qq` - QQ 官方机器人
+- `napcat` - NapCatQQ / OneBot 11
+- `none` / `skip` - 跳过渠道配置（仅使用 WebUI）
 
 **示例：**
 ```bash

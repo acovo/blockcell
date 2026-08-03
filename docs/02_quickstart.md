@@ -499,7 +499,7 @@ blockcell doctor
 在对话中，AI 每次调用工具都会显示工具名称和参数。如果想看更详细的日志：
 
 ```bash
-blockcell logs --tail 50
+blockcell logs show --lines 50
 ```
 
 ---

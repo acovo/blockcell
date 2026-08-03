@@ -34,7 +34,7 @@ blockcell gateway
 
 ```
 [2025-02-18 08:00:00] Gateway starting...
-[2025-02-18 08:00:00] API server: http://0.0.0.0:18790
+[2025-02-18 08:00:00] API server: http://localhost:18790
 [2025-02-18 08:00:00] WebUI: http://localhost:18791
 [2025-02-18 08:00:00] Telegram: connected (polling)
 [2025-02-18 08:00:00] Discord: connected (WebSocket)
@@ -106,18 +106,21 @@ curl -X POST http://localhost:18790/v1/chat \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer 你的token" \
   -d '{
-    "message": "帮我查一下茅台今天的股价"
+    "content": "帮我查一下茅台今天的股价",
+    "chat_id": "finance-demo"
   }'
 ```
 
-响应：
+Gateway 会异步排队处理消息，因此成功响应状态码是 `202 Accepted`：
 ```json
 {
-  "reply": "茅台（600519）今日股价：1,680.00 元，涨跌幅：+1.23%",
-  "task_id": "msg_abc123",
-  "tools_used": ["finance_api"]
+  "status": "accepted",
+  "message": "Message queued for processing",
+  "session_id": "finance-demo"
 }
 ```
+
+最终回复通过 WebSocket 或原始消息渠道异步返回，不会直接出现在这个 HTTP 响应中。
 
 ### `GET /v1/health` — 健康检查
 
@@ -128,8 +131,9 @@ curl http://localhost:18790/v1/health
 ```json
 {
   "status": "ok",
-  "uptime": 3600,
-  "version": "0.x.x"
+  "model": "deepseek-v4-pro",
+  "uptime_secs": 3600,
+  "version": "0.1.7"
 }
 ```
 
@@ -144,19 +148,11 @@ curl http://localhost:18790/v1/tasks \
 
 ```json
 {
-  "summary": {
-    "running": 1,
-    "completed": 42,
-    "failed": 0
-  },
-  "tasks": [
-    {
-      "id": "task_xyz",
-      "label": "分析茅台财报",
-      "status": "running",
-      "started_at": "2025-02-18T08:30:00Z"
-    }
-  ]
+  "queued": 0,
+  "running": 1,
+  "completed": 42,
+  "failed": 0,
+  "tasks": []
 }
 ```
 
@@ -165,19 +161,28 @@ curl http://localhost:18790/v1/tasks \
 WebSocket 接口支持实时双向通信：
 
 ```javascript
-const ws = new WebSocket('ws://localhost:18790/v1/ws');
+const token = '你的token';
+const tokenHex = Array.from(new TextEncoder().encode(token), byte =>
+  byte.toString(16).padStart(2, '0')
+).join('');
+const ws = new WebSocket(
+  'ws://localhost:18790/v1/ws',
+  [`blockcell-auth.${tokenHex}`],
+);
 
 // 发送消息
 ws.send(JSON.stringify({
-  "message": "帮我查一下比特币价格"
+  type: 'chat',
+  content: '帮我查一下比特币价格',
+  chat_id: 'finance-demo',
 }));
 
 // 接收回复（流式）
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
-  if (data.type === 'chunk') {
-    process.stdout.write(data.content);
-  } else if (data.type === 'done') {
+  if (data.type === 'token') {
+    process.stdout.write(data.delta);
+  } else if (data.type === 'message_done') {
     console.log('\n完成');
   } else if (data.type === 'skills_updated') {
     console.log('技能已更新:', data.new_skills);
@@ -243,14 +248,16 @@ WebUI 的主要功能：
 调用 API 时，在 Header 里带上 token：
 
 ```bash
-curl -H "Authorization: Bearer 你的token" http://你的服务器:18790/v1/chat
+curl -H "Authorization: Bearer 你的token" http://你的服务器:18790/v1/tasks
 ```
 
-或者用 Query 参数（适合 WebSocket）：
+浏览器 WebSocket 不能设置任意 Authorization Header。请把 token 编码成 UTF-8 十六进制，并通过 WebSocket 子协议传递：
 
 ```
-ws://你的服务器:18790/v1/ws?token=你的token
+blockcell-auth.<token 的 UTF-8 十六进制>
 ```
+
+完整 JavaScript 连接示例见上文“WebSocket 连接”。非浏览器客户端也可以在升级请求中使用标准 `Authorization: Bearer ...` Header。不要把 token 放在 URL Query 中，当前 Gateway 不读取该参数，而且 URL 容易进入访问日志。
 
 WebUI 登录密码与 API token 现在**分离**：
 
@@ -329,16 +336,31 @@ sudo systemctl status blockcell
 ### 使用 Docker
 
 ```dockerfile
-FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y curl
-RUN curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads/main/install.sh | sh
-COPY config.json5 /root/.blockcell/config.json5
+FROM --platform=linux/amd64 ubuntu:22.04
+RUN apt-get update && apt-get install -y curl ca-certificates tar \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads/main/install.sh \
+    | BLOCKCELL_INSTALL_METHOD=release BLOCKCELL_INSTALL_DIR=/usr/local/bin sh
 EXPOSE 18790 18791
 CMD ["blockcell", "gateway"]
 ```
 
+容器使用的 `~/.blockcell/config.json5` 至少需要让两个服务监听所有容器网卡，否则 Docker 端口映射无法访问：
+
+```json5
+{
+  gateway: {
+    host: "0.0.0.0",
+    port: 18790,
+    webuiHost: "0.0.0.0",
+    webuiPort: 18791,
+  },
+}
+```
+
 ```bash
 docker build -t blockcell .
+# 宿主机 ~/.blockcell/config.json5 需要包含上面的容器监听配置
 docker run -d \
   -p 18790:18790 \
   -p 18791:18791 \
@@ -381,17 +403,18 @@ Gateway 模式让 blockcell 成为一个标准的 HTTP 服务，可以很方便�
 ```python
 import requests
 
-def ask_ai(question: str) -> str:
+def enqueue_ai(question: str, session_id: str) -> dict:
     response = requests.post(
         "http://localhost:18790/v1/chat",
         headers={"Authorization": "Bearer 你的token"},
-        json={"message": question}
+        json={"content": question, "chat_id": session_id}
     )
-    return response.json()["reply"]
+    response.raise_for_status()
+    return response.json()
 
-# 使用
-answer = ask_ai("帮我查一下茅台今天的股价")
-print(answer)
+# 返回排队状态；最终回复通过 WebSocket 或消息渠道接收
+accepted = enqueue_ai("帮我查一下茅台今天的股价", "finance-demo")
+print(accepted["session_id"])
 ```
 
 ### 在 Node.js 中调用
@@ -399,19 +422,21 @@ print(answer)
 ```javascript
 const fetch = require('node-fetch');
 
-async function askAI(question) {
+async function enqueueAI(question, sessionId) {
   const response = await fetch('http://localhost:18790/v1/chat', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': 'Bearer 你的token'
     },
-    body: JSON.stringify({ message: question })
+    body: JSON.stringify({ content: question, chat_id: sessionId })
   });
-  const data = await response.json();
-  return data.reply;
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
 }
 ```
+
+HTTP 接口只确认消息已进入队列；需要结合上文的 WebSocket 协议接收最终回复。
 
 ---
 

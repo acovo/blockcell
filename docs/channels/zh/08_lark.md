@@ -104,17 +104,17 @@ blockcell gateway
 
 ```
   Server
-  HTTP/WS:  http://0.0.0.0:18790
+  HTTP/WS:  http://localhost:18790
   WebUI:   http://localhost:18791/
-  API:     POST http://0.0.0.0:18790/v1/chat  |  GET /v1/health  |  GET /v1/ws
+  API:     POST http://localhost:18790/v1/chat  |  GET /v1/health  |  GET /v1/ws
 
   ✓ Gateway ready. Press Ctrl+C to stop.
 ```
 
-其中 `0.0.0.0:18790` 是 Blockcell 监听的内网地址，Lark webhook 路径为：
+Gateway 默认只监听本机 loopback。Lark webhook 路径为：
 
 ```
-http://0.0.0.0:18790/webhook/lark   ← 内网地址（Lark 无法直接访问）
+http://127.0.0.1:18790/webhook/lark ← 本机地址（Lark 无法直接访问）
 https://your-domain.com/webhook/lark ← 需要通过 Nginx 反向代理暴露到公网
 ```
 

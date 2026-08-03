@@ -241,7 +241,7 @@ blockcell gateway
 - **回调模式**：企业微信的 Webhook 路径为：
 
 ```
-http://0.0.0.0:18790/webhook/wecom   ← 内网地址（企业微信无法直接访问）
+http://127.0.0.1:18790/webhook/wecom ← 本机地址（企业微信无法直接访问）
 https://your-domain.com/webhook/wecom ← 需要通过 Nginx 反向代理暴露到公网
 ```
 
