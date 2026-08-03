@@ -65,7 +65,7 @@ struct ShellSession {
     child: Child,
     stdin: ChildStdin,
     #[cfg(unix)]
-    command_input: tokio::net::UnixStream,
+    command_input: tokio::fs::File,
     output: Arc<Mutex<SharedOutput>>,
     active: Option<ActiveCommand>,
     sandbox_policy: SandboxPolicy,
@@ -523,20 +523,28 @@ where
 fn build_interactive_shell(
     workspace: &Path,
     sandbox_policy: SandboxPolicy,
-) -> Result<(
-    Command,
-    tokio::net::UnixStream,
-    std::os::unix::net::UnixStream,
-)> {
-    use std::os::fd::AsRawFd;
+) -> Result<(Command, tokio::fs::File, std::fs::File)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
 
-    let (parent_control, child_control) =
-        std::os::unix::net::UnixStream::pair().map_err(blockcell_core::Error::Io)?;
-    parent_control
-        .set_nonblocking(true)
-        .map_err(blockcell_core::Error::Io)?;
-    let command_input =
-        tokio::net::UnixStream::from_std(parent_control).map_err(blockcell_core::Error::Io)?;
+    let mut pipe_fds = [-1; 2];
+    // SAFETY: pipe initializes both entries on success; ownership is immediately
+    // transferred to File values below.
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == -1 {
+        return Err(blockcell_core::Error::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: pipe succeeded, so both descriptors are valid and uniquely owned.
+    let child_control = unsafe { std::fs::File::from_raw_fd(pipe_fds[0]) };
+    // SAFETY: pipe succeeded, so both descriptors are valid and uniquely owned.
+    let parent_control = unsafe { std::fs::File::from_raw_fd(pipe_fds[1]) };
+    for fd in [child_control.as_raw_fd(), parent_control.as_raw_fd()] {
+        // SAFETY: fcntl only reads or updates descriptor flags for a valid fd.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+        {
+            return Err(blockcell_core::Error::Io(std::io::Error::last_os_error()));
+        }
+    }
+    let command_input = tokio::fs::File::from_std(parent_control);
     let control_fd = child_control.as_raw_fd();
     let (mut command, _) = crate::sandbox::sandboxed_shell_command(
         "bash",
@@ -548,7 +556,11 @@ fn build_interactive_shell(
     // before exec; no allocation or shared-state access occurs in the closure.
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(control_fd, 3) == -1 {
+            if control_fd != 3 && libc::dup2(control_fd, 3) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let flags = libc::fcntl(3, libc::F_GETFD);
+            if flags == -1 || libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -611,6 +623,25 @@ mod tests {
             schema.parameters["properties"]["sandbox_policy"]["enum"],
             serde_json::json!(["read-only", "workspace-write", "full-access"])
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_shell_uses_pipe_for_command_channel() {
+        use std::os::fd::AsRawFd;
+
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let (_command, _parent_writer, child_reader) =
+            build_interactive_shell(workspace.path(), SandboxPolicy::FullAccess)
+                .expect("build interactive shell");
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+
+        // SAFETY: fstat initializes the provided stat buffer for a valid owned fd.
+        let result = unsafe { libc::fstat(child_reader.as_raw_fd(), stat.as_mut_ptr()) };
+        assert_eq!(result, 0, "fstat command channel");
+        // SAFETY: fstat succeeded, so the stat structure is initialized.
+        let stat = unsafe { stat.assume_init() };
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
     }
 
     #[tokio::test]
