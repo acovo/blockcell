@@ -88,6 +88,7 @@ pub struct ContextBuilder {
     prompt_budget: blockcell_core::config::PromptBudgetConfig,
     file_memory_snapshots: Mutex<HashMap<String, FrozenFileMemorySnapshot>>,
     system_prompt_snapshots: Mutex<HashMap<String, String>>,
+    injected_retrieval_items: Mutex<HashMap<String, HashSet<u64>>>,
     memory_store: Option<MemoryStoreHandle>,
     /// Layer 5 记忆注入器 (7 层记忆系统)
     memory_injector: Option<MemoryInjector>,
@@ -135,6 +136,7 @@ impl ContextBuilder {
             prompt_budget: config.memory.effective_prompt_budget(),
             file_memory_snapshots: Mutex::new(HashMap::new()),
             system_prompt_snapshots: Mutex::new(HashMap::new()),
+            injected_retrieval_items: Mutex::new(HashMap::new()),
             memory_store: None,
             memory_injector: None,
             capability_brief: None,
@@ -334,6 +336,30 @@ impl ContextBuilder {
                 )
             })
             .clone()
+    }
+
+    fn filter_incremental_retrieval(
+        &self,
+        session_key: Option<&str>,
+        mut items: Vec<crate::retrieval::RetrievedItem>,
+    ) -> (Vec<crate::retrieval::RetrievedItem>, bool) {
+        let Some(session_key) = session_key else {
+            return (items, false);
+        };
+        let mut sessions = self
+            .injected_retrieval_items
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seen = sessions.entry(session_key.to_string()).or_default();
+        let original_len = items.len();
+        items.retain(|item| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            item.source.hash(&mut hasher);
+            item.content.hash(&mut hasher);
+            seen.insert(hasher.finish())
+        });
+        let skipped_previous = items.len() < original_len;
+        (items, skipped_previous)
     }
 
     pub fn resolve_active_skill(
@@ -621,6 +647,13 @@ impl ContextBuilder {
                 snapshot,
                 20,
             ) {
+                let (items, skipped_previous) =
+                    self.filter_incremental_retrieval(session_key, items);
+                if skipped_previous {
+                    runtime_rules.push_str(
+                        "\nPreviously provided memory remains valid; only new or changed memory is included below.\n",
+                    );
+                }
                 let (profile, retrieved): (Vec<_>, Vec<_>) = items
                     .into_iter()
                     .partition(|item| item.source == RetrievalSource::UserProfile);
@@ -1385,6 +1418,81 @@ description: deploy demo
     }
 
     #[test]
+    fn retrieved_context_is_incremental_within_each_session() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-context-incremental-retrieval-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        let fact = "Release verification requires a canary-first rollout.";
+        std::fs::write(paths.memory_md(), fact).expect("write memory");
+        let mut config = Config::default();
+        config.agents.ghost.learning.recall_enabled = Some(true);
+        let builder = ContextBuilder::new(paths, config);
+
+        let build = |session_key: &str| {
+            builder.build_messages_for_session_mode_with_channel(
+                session_key,
+                &[],
+                "release verification canary",
+                &[],
+                InteractionMode::General,
+                None,
+                &HashSet::new(),
+                &HashSet::new(),
+                "cli",
+                false,
+                &[],
+                &[],
+            )
+        };
+
+        let first = build("cli:incremental-a");
+        let repeated = build("cli:incremental-a");
+        let other_session = build("cli:incremental-b");
+        let first_context = test_chat_message_text(&first[first.len() - 2]);
+        let repeated_context = test_chat_message_text(&repeated[repeated.len() - 2]);
+        let other_context = test_chat_message_text(&other_session[other_session.len() - 2]);
+
+        assert!(first_context.contains(fact));
+        assert!(!repeated_context.contains(fact));
+        assert!(repeated_context.contains("Previously provided memory remains valid"));
+        assert!(other_context.contains(fact));
+    }
+
+    #[test]
+    fn changed_retrieval_content_is_reinjected() {
+        let builder = ContextBuilder::new(
+            Paths::with_base(std::env::temp_dir().join(format!(
+                "blockcell-context-changed-retrieval-test-{}",
+                uuid::Uuid::new_v4()
+            ))),
+            Config::default(),
+        );
+        let initial = crate::retrieval::RetrievedItem::new(
+            RetrievalSource::CanonicalKnowledge,
+            "Deploy with a canary rollout.",
+        );
+        let changed = crate::retrieval::RetrievedItem::new(
+            RetrievalSource::CanonicalKnowledge,
+            "Deploy with a canary rollout and rollback gate.",
+        );
+
+        let (first, _) =
+            builder.filter_incremental_retrieval(Some("cli:changed"), vec![initial.clone()]);
+        let (repeated, skipped) =
+            builder.filter_incremental_retrieval(Some("cli:changed"), vec![initial]);
+        let (updated, _) =
+            builder.filter_incremental_retrieval(Some("cli:changed"), vec![changed.clone()]);
+
+        assert_eq!(first.len(), 1);
+        assert!(repeated.is_empty());
+        assert!(skipped);
+        assert_eq!(updated, vec![changed]);
+    }
+
+    #[test]
     fn configured_prompt_total_caps_complete_system_prompt() {
         let base = std::env::temp_dir().join(format!(
             "blockcell-context-budget-test-{}",
@@ -1500,7 +1608,8 @@ description: deploy demo
         let same_prompt = test_chat_message_text(&same_session[same_session.len() - 2]);
         let next_prompt = test_chat_message_text(&next_session[next_session.len() - 2]);
         assert!(first_prompt.contains("Initial durable memory."));
-        assert!(same_prompt.contains("Initial durable memory."));
+        assert!(!same_prompt.contains("Initial durable memory."));
+        assert!(same_prompt.contains("Previously provided memory remains valid"));
         assert!(!same_prompt.contains("Updated durable memory."));
         assert!(next_prompt.contains("Updated durable memory."));
     }
