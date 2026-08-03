@@ -41,6 +41,7 @@ pub mod security_scan;
 pub mod send_message;
 pub mod session_recall;
 pub mod session_search;
+pub mod shell_session;
 pub mod skill_manage;
 pub mod skills;
 pub mod spawn;
@@ -423,6 +424,10 @@ pub trait TaskManagerOps: Send + Sync {
     async fn send_message(&self, task_id: &str, message: String) -> Result<()>;
     /// Check if a task is a ONE_SHOT type (cannot receive SendMessage).
     async fn is_one_shot_task(&self, task_id: &str) -> bool;
+    /// Register a persistent shell process so runtime shutdown can clean it up.
+    fn register_shell_process(&self, session_id: &str, pid: u32);
+    /// Remove a shell process registration after the session closes.
+    fn unregister_shell_process(&self, session_id: &str);
 }
 
 #[derive(Clone)]

@@ -78,6 +78,7 @@ impl AgentRuntime {
                         &mut active_message_tasks,
                         &mut active_abort_tokens,
                     ).await;
+                    self.task_manager.shutdown_shell_processes();
                     break;
                 }
                 done = task_done_rx.recv() => {

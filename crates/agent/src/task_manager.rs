@@ -146,6 +146,8 @@ pub struct TaskManager {
     message_queues: Arc<StdMutex<HashMap<String, VecDeque<String>>>>,
     /// Cooperative cancellation tokens for typed/background agent tasks.
     abort_tokens: Arc<StdMutex<HashMap<String, AbortToken>>>,
+    /// Persistent shell session IDs mapped to their process-group leaders.
+    shell_processes: Arc<StdMutex<HashMap<String, u32>>>,
     /// Progress callback channel for reporting agent execution progress.
     progress_tx: Option<mpsc::Sender<AgentProgress>>,
     /// 任务完成事件广播通道，用于Lead Agent订阅子Agent完成事件
@@ -184,6 +186,7 @@ impl TaskManager {
             event_emitters: Arc::new(StdMutex::new(HashMap::new())),
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
             abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            shell_processes: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: None,
             completed_events_tx,
             workspace_dir: None,
@@ -198,6 +201,7 @@ impl TaskManager {
             event_emitters: Arc::new(StdMutex::new(HashMap::new())),
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
             abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            shell_processes: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: None,
             completed_events_tx,
             workspace_dir: Some(workspace_dir.to_path_buf()),
@@ -212,6 +216,7 @@ impl TaskManager {
             event_emitters: Arc::new(StdMutex::new(HashMap::new())),
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
             abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            shell_processes: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: Some(progress_tx),
             completed_events_tx,
             workspace_dir: None,
@@ -229,6 +234,7 @@ impl TaskManager {
             event_emitters: Arc::new(StdMutex::new(HashMap::new())),
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
             abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            shell_processes: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: Some(progress_tx),
             completed_events_tx,
             workspace_dir: Some(workspace_dir.to_path_buf()),
@@ -266,6 +272,49 @@ impl TaskManager {
             Err(poisoned) => poisoned.into_inner(),
         };
         tokens.remove(task_id);
+    }
+
+    pub fn register_shell_process(&self, session_id: &str, pid: u32) {
+        let mut processes = match self.shell_processes.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        processes.insert(session_id.to_string(), pid);
+    }
+
+    pub fn unregister_shell_process(&self, session_id: &str) {
+        let mut processes = match self.shell_processes.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        processes.remove(session_id);
+    }
+
+    pub fn registered_shell_process_count(&self) -> usize {
+        match self.shell_processes.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+
+    pub fn shutdown_shell_processes(&self) {
+        let processes = {
+            let mut processes = match self.shell_processes.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            processes.drain().map(|(_, pid)| pid).collect::<Vec<_>>()
+        };
+        #[cfg(unix)]
+        for pid in processes {
+            // SAFETY: shell sessions register process-group leaders created by
+            // the shell tool, so a negative PID only targets that group.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = processes;
     }
 
     fn cancel_registered_abort_token(&self, task_id: &str) -> bool {
@@ -1315,6 +1364,14 @@ impl TaskManagerOps for OriginScopedTaskManager {
             .await
             .is_some_and(|task| task.one_shot)
     }
+
+    fn register_shell_process(&self, session_id: &str, pid: u32) {
+        self.inner.register_shell_process(session_id, pid);
+    }
+
+    fn unregister_shell_process(&self, session_id: &str) {
+        self.inner.unregister_shell_process(session_id);
+    }
 }
 
 #[async_trait]
@@ -1355,12 +1412,30 @@ impl TaskManagerOps for TaskManager {
     async fn is_one_shot_task(&self, task_id: &str) -> bool {
         self.is_one_shot_task(task_id).await
     }
+
+    fn register_shell_process(&self, session_id: &str, pid: u32) {
+        self.register_shell_process(session_id, pid);
+    }
+
+    fn unregister_shell_process(&self, session_id: &str) {
+        self.unregister_shell_process(session_id);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn shell_process_registration_can_be_cleaned_up() {
+        let manager = TaskManager::new();
+
+        manager.register_shell_process("shell-session", 12345);
+        assert_eq!(manager.registered_shell_process_count(), 1);
+        manager.unregister_shell_process("shell-session");
+        assert_eq!(manager.registered_shell_process_count(), 0);
+    }
 
     #[tokio::test]
     async fn test_cleanup_loop_exits_on_shutdown_signal() {

@@ -88,7 +88,7 @@ fn is_dangerous_rm(normalized: &str) -> bool {
     false
 }
 
-fn is_dangerous_command(command: &str) -> bool {
+pub(crate) fn is_dangerous_command(command: &str) -> bool {
     let normalized = normalize_whitespace(command);
     if is_dangerous_rm(&normalized) {
         return true;

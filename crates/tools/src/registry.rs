@@ -36,6 +36,7 @@ use crate::office_write::OfficeWriteTool;
 use crate::send_message::SendMessageTool;
 use crate::session_recall::SessionRecallTool;
 use crate::session_search::SessionSearchTool;
+use crate::shell_session::ShellTool;
 use crate::skills::{ListSkillsTool, SkillManageTool, SkillViewTool};
 use crate::spawn::SpawnTool;
 use crate::stream_subscribe::StreamSubscribeTool;
@@ -101,6 +102,7 @@ impl ToolRegistry {
 
         // Exec tool
         registry.register(Arc::new(ExecTool));
+        registry.register(Arc::new(ShellTool));
         registry.register(Arc::new(ExecLocalTool));
         registry.register(Arc::new(ExecSkillScriptTool));
 
