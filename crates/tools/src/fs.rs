@@ -33,6 +33,16 @@ impl Tool for ReadFileTool {
                     "path": {
                         "type": "string",
                         "description": "Path to the file to read. Supports text files and Office formats (xlsx, xls, docx, pptx)."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional 1-based first line to return"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional maximum number of lines to return"
                     }
                 },
                 "required": ["path"]
@@ -48,6 +58,22 @@ impl Tool for ReadFileTool {
         if params.get("path").and_then(|v| v.as_str()).is_none() {
             return Err(Error::Validation(
                 "Missing required parameter: path".to_string(),
+            ));
+        }
+        if params
+            .get("offset")
+            .is_some_and(|value| value.as_u64().is_none_or(|offset| offset == 0))
+        {
+            return Err(Error::Validation(
+                "offset must be a positive integer".to_string(),
+            ));
+        }
+        if params
+            .get("limit")
+            .is_some_and(|value| value.as_u64().is_none_or(|limit| limit == 0))
+        {
+            return Err(Error::Validation(
+                "limit must be a positive integer".to_string(),
             ));
         }
         Ok(())
@@ -76,19 +102,60 @@ impl Tool for ReadFileTool {
                     .await
                     .map_err(|e| Error::Tool(format!("Failed to read office file: {}", e)))??;
 
-            return Ok(json!({
-                "path": path.display().to_string(),
-                "format": path.extension().and_then(|e| e.to_str()).unwrap_or("unknown"),
-                "content": content
-            }));
+            return Ok(read_result(
+                &path,
+                content,
+                params.get("offset").and_then(Value::as_u64),
+                params.get("limit").and_then(Value::as_u64),
+                Some(
+                    path.extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("unknown"),
+                ),
+            ));
         }
 
         let content = tokio::fs::read_to_string(&path).await?;
-        Ok(json!({
-            "path": path.display().to_string(),
-            "content": content
-        }))
+        Ok(read_result(
+            &path,
+            content,
+            params.get("offset").and_then(Value::as_u64),
+            params.get("limit").and_then(Value::as_u64),
+            None,
+        ))
     }
+}
+
+fn read_result(
+    path: &std::path::Path,
+    content: String,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    format: Option<&str>,
+) -> Value {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let start_index = offset.unwrap_or(1).saturating_sub(1) as usize;
+    let start_index = start_index.min(total_lines);
+    let end_index = limit
+        .map(|limit| start_index.saturating_add(limit as usize).min(total_lines))
+        .unwrap_or(total_lines);
+    let selected_content = if offset.is_none() && limit.is_none() {
+        content.clone()
+    } else {
+        lines[start_index..end_index].join("\n")
+    };
+    let mut result = json!({
+        "path": path.display().to_string(),
+        "content": selected_content,
+        "start_line": if start_index < total_lines { start_index + 1 } else { 0 },
+        "end_line": end_index,
+        "total_lines": total_lines,
+    });
+    if let Some(format) = format {
+        result["format"] = json!(format);
+    }
+    result
 }
 
 // ============ write_file ============
@@ -165,7 +232,7 @@ impl Tool for EditFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "edit_file".to_string(),
-            description: "Edit a local file by replacing `old_text` with `new_text`. REQUIRED: always provide `path`, `old_text`, and `new_text`; do not call this tool with `{}`. IMPORTANT: before calling this tool, read the target file and copy the exact existing text into `old_text` verbatim. `old_text` must match the file content exactly, including whitespace, indentation, and line breaks, and it must appear only once. Prefer a longer unique contiguous snippet rather than a short fragment.".to_string(),
+            description: "Edit a local file with one replacement or an atomic `edits` array; do not call this tool with `{}`. Accepts `old_text`/`new_text` and `old_string`/`new_string` aliases. Every old value must be a unique exact match; no file is written unless every edit succeeds.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -180,15 +247,37 @@ impl Tool for EditFileTool {
                     "new_text": {
                         "type": "string",
                         "description": "Text to replace old_text with"
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Alias for old_text"
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Alias for new_text"
+                    },
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "Ordered replacements applied atomically",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string"},
+                                "new_text": {"type": "string"},
+                                "old_string": {"type": "string"},
+                                "new_string": {"type": "string"}
+                            }
+                        }
                     }
                 },
-                "required": ["path", "old_text", "new_text"]
+                "required": ["path"]
             }),
         }
     }
 
     fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
-        Some("- **edit_file**: Always pass `path`, `old_text`, and `new_text`. Never call `edit_file` with `{}`. Before editing, call `read_file` on the target path and copy the exact existing text into `old_text` verbatim. `old_text` must match the file exactly, including spaces, indentation, and line breaks, and it must be unique in the file. If the edit fails with `old_text not found`, read the file again and choose a larger contiguous snippet around the target change.".to_string())
+        Some("- **edit_file**: Always pass `path` plus either one `old_text`/`new_text` pair (aliases: `old_string`/`new_string`) or an `edits` array. Read the target first. Multi-edit calls are atomic: every old value must match uniquely before the file is written.".to_string())
     }
 
     fn validate(&self, params: &Value) -> Result<()> {
@@ -197,23 +286,16 @@ impl Tool for EditFileTool {
                 "Missing required parameter: path".to_string(),
             ));
         }
-        if params.get("old_text").and_then(|v| v.as_str()).is_none() {
-            return Err(Error::Validation(
-                "Missing required parameter: old_text".to_string(),
-            ));
-        }
-        if params.get("new_text").and_then(|v| v.as_str()).is_none() {
-            return Err(Error::Validation(
-                "Missing required parameter: new_text".to_string(),
-            ));
+        let edits = parse_edits(params)?;
+        if edits.is_empty() {
+            return Err(Error::Validation("edits must not be empty".to_string()));
         }
         Ok(())
     }
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let path_str = params["path"].as_str().unwrap();
-        let old_text = params["old_text"].as_str().unwrap();
-        let new_text = params["new_text"].as_str().unwrap();
+        let edits = parse_edits(&params)?;
         let path = expand_path(path_str, &ctx.workspace);
 
         if !path.exists() {
@@ -223,30 +305,79 @@ impl Tool for EditFileTool {
             )));
         }
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        let original = tokio::fs::read_to_string(&path).await?;
+        let mut new_content = original.clone();
 
-        let count = content.matches(old_text).count();
-        if count == 0 {
-            return Err(Error::Tool(format!(
-                "bad parameter: old_text in {} not exists, please read_file firstly and then call this with correct old_text",
-                path.display()
-            )));
+        for (index, edit) in edits.iter().enumerate() {
+            let count = new_content.matches(edit.old_text).count();
+            if count == 0 {
+                let closest =
+                    crate::fuzzy_match::closest_line_context(&new_content, edit.old_text, 5)
+                        .unwrap_or_else(|| "<empty file>".to_string());
+                return Err(Error::Tool(format!(
+                    "edit {} failed: old_text not found in {}\nclosest matching context (±5 lines):\n{}",
+                    index + 1,
+                    path.display(),
+                    closest
+                )));
+            }
+            if count > 1 {
+                return Err(Error::Tool(format!(
+                    "edit {} failed: old_text appears {} times in file; provide more context so it is unique",
+                    index + 1,
+                    count
+                )));
+            }
+            new_content = new_content.replacen(edit.old_text, edit.new_text, 1);
         }
-        if count > 1 {
-            return Err(Error::Tool(format!(
-                "old_text appears {} times in file. Must be unique for safe editing.",
-                count
-            )));
-        }
-
-        let new_content = content.replacen(old_text, new_text, 1);
         tokio::fs::write(&path, &new_content).await?;
 
         Ok(json!({
             "path": path.display().to_string(),
-            "status": "edited"
+            "status": "edited",
+            "edits_applied": edits.len()
         }))
     }
+}
+
+struct Edit<'a> {
+    old_text: &'a str,
+    new_text: &'a str,
+}
+
+fn parse_edits(params: &Value) -> Result<Vec<Edit<'_>>> {
+    if let Some(edits) = params.get("edits") {
+        let edits = edits
+            .as_array()
+            .filter(|edits| !edits.is_empty())
+            .ok_or_else(|| Error::Validation("edits must be a non-empty array".to_string()))?;
+        return edits
+            .iter()
+            .enumerate()
+            .map(|(index, edit)| parse_edit(edit, Some(index + 1)))
+            .collect();
+    }
+    parse_edit(params, None).map(|edit| vec![edit])
+}
+
+fn parse_edit(params: &Value, index: Option<usize>) -> Result<Edit<'_>> {
+    let label = index
+        .map(|index| format!("edit {index}"))
+        .unwrap_or_else(|| "edit".to_string());
+    let old_text = params
+        .get("old_text")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("old_string").and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::Validation(format!("{label} requires non-empty old_text or old_string"))
+        })?;
+    let new_text = params
+        .get("new_text")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("new_string").and_then(Value::as_str))
+        .ok_or_else(|| Error::Validation(format!("{label} requires new_text or new_string")))?;
+    Ok(Edit { old_text, new_text })
 }
 
 pub struct ListDirTool;
@@ -329,6 +460,140 @@ mod tests {
     use super::*;
     use crate::PromptContext;
     use serde_json::json;
+    use tempfile::tempdir;
+
+    fn tool_context(workspace: &std::path::Path) -> ToolContext {
+        ToolContext {
+            workspace: workspace.to_path_buf(),
+            base: workspace.to_path_buf(),
+            builtin_skills_dir: None,
+            active_skill_dir: None,
+            session_key: "test-session".to_string(),
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: None,
+            chat_id: "test-chat".to_string(),
+            config: blockcell_core::Config::default(),
+            permissions: crate::PermissionSet::new(),
+            task_manager: None,
+            memory_store: None,
+            memory_file_store: None,
+            ghost_memory_lifecycle: None,
+            skill_file_store: None,
+            session_search: None,
+            outbound_tx: None,
+            spawn_handle: None,
+            capability_registry: None,
+            core_evolution: None,
+            event_emitter: None,
+            channel_contacts_file: None,
+            response_cache: None,
+            runtime_handle: None,
+            agent_identity: None,
+            skill_mutex: None,
+            agent_type_registry: None,
+            evolution_workflow_store: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_supports_one_based_offset_and_limit() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+
+        let result = ReadFileTool
+            .execute(
+                tool_context(dir.path()),
+                json!({"path": "sample.txt", "offset": 2, "limit": 2}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["content"], "two\nthree");
+        assert_eq!(result["start_line"], 2);
+        assert_eq!(result["end_line"], 3);
+        assert_eq!(result["total_lines"], 4);
+    }
+
+    #[tokio::test]
+    async fn edit_file_accepts_old_string_and_new_string_aliases() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        std::fs::write(&path, "before\n").unwrap();
+
+        EditFileTool
+            .execute(
+                tool_context(dir.path()),
+                json!({"path": "sample.txt", "old_string": "before", "new_string": "after"}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "after\n");
+    }
+
+    #[tokio::test]
+    async fn edit_file_applies_multiple_edits_atomically() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let result = EditFileTool
+            .execute(
+                tool_context(dir.path()),
+                json!({
+                    "path": "sample.txt",
+                    "edits": [
+                        {"old_text": "alpha", "new_text": "one"},
+                        {"old_string": "gamma", "new_string": "three"}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["edits_applied"], 2);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "one\nbeta\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn edit_file_reports_failed_edit_and_leaves_file_unchanged() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        let original = "header\nalpha value\nbeta value\ngamma value\nfooter\n";
+        std::fs::write(&path, original).unwrap();
+
+        let error = EditFileTool
+            .execute(
+                tool_context(dir.path()),
+                json!({
+                    "path": "sample.txt",
+                    "edits": [
+                        {"old_text": "header", "new_text": "changed"},
+                        {"old_text": "beta values", "new_text": "replacement"}
+                    ]
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("edit 2"), "{error}");
+        assert!(error.contains("beta value"), "{error}");
+        assert!(error.contains("closest"), "{error}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn enhanced_file_schemas_expose_ranges_aliases_and_edits() {
+        let read = ReadFileTool.schema();
+        let edit = EditFileTool.schema();
+        assert!(read.parameters["properties"].get("offset").is_some());
+        assert!(read.parameters["properties"].get("limit").is_some());
+        assert!(edit.parameters["properties"].get("old_string").is_some());
+        assert!(edit.parameters["properties"].get("new_string").is_some());
+        assert_eq!(edit.parameters["properties"]["edits"]["type"], "array");
+    }
 
     #[test]
     fn test_read_file_schema() {

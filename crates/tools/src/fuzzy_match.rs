@@ -553,6 +553,42 @@ fn line_similarity(a: &str, b: &str) -> f64 {
     common as f64 / max_len as f64
 }
 
+/// Find the line window most similar to `needle` and render it with surrounding context.
+pub fn closest_line_context(content: &str, needle: &str, radius: usize) -> Option<String> {
+    let content_lines: Vec<&str> = content.lines().collect();
+    let needle_lines: Vec<&str> = needle.lines().collect();
+    if content_lines.is_empty() || needle_lines.is_empty() {
+        return None;
+    }
+
+    let window_size = needle_lines.len().min(content_lines.len());
+    let mut best_start = 0usize;
+    let mut best_score = f64::NEG_INFINITY;
+    for start in 0..=content_lines.len() - window_size {
+        let score = content_lines[start..start + window_size]
+            .iter()
+            .zip(needle_lines.iter())
+            .map(|(candidate, expected)| line_similarity(candidate.trim(), expected.trim()))
+            .sum::<f64>()
+            / window_size as f64;
+        if score > best_score {
+            best_score = score;
+            best_start = start;
+        }
+    }
+
+    let context_start = best_start.saturating_sub(radius);
+    let context_end = (best_start + window_size + radius).min(content_lines.len());
+    Some(
+        content_lines[context_start..context_end]
+            .iter()
+            .enumerate()
+            .map(|(index, line)| format!("{}: {}", context_start + index + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 // ── 策略 9: 上下文感知 ──
 
 fn strategy_context_aware(content: &str, old_string: &str) -> Vec<MatchSpan> {
